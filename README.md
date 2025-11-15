@@ -42,7 +42,12 @@ python main.py
 ├── src/
 │   ├── config.py             # System configuration
 │   ├── utils.py              # Statistical utilities
-│   └── data_generator.py     # Sample data generation
+│   ├── data_generator.py     # Sample data generation
+│   └── agents/               # Multi-agent system
+│       ├── __init__.py
+│       ├── message_bus.py    # MessageBus, JSONLogger, Graph
+│       ├── operator_agent.py # RL trading execution
+│       └── supervisor_agent.py # Portfolio monitoring
 ├── data/                     # Generated data files
 ├── models/                   # Model checkpoints
 ├── traces/                   # Event traces
@@ -94,8 +99,9 @@ The system uses a hierarchical multi-agent design:
 
 ## 📖 Documentation
 
-- See `replit.md` for detailed project documentation
-- Original Jupyter notebook: `Agents_13112025.ipynb`
+- `replit.md` - Project overview and setup
+- `AGENTS.md` - Detailed agent system documentation
+- `Agents_13112025.ipynb` - Original Jupyter notebook (reference)
 
 ## ⚠️ Disclaimer
 
