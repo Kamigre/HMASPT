@@ -5,3 +5,11 @@ statsmodels>=0.14.0
 scipy>=1.11.0
 matplotlib>=3.7.0
 tqdm>=4.65.0
+
+# Optional ML dependencies for advanced features
+# Uncomment to enable TGNN and RL components:
+# torch>=2.0.0
+# torch-geometric>=2.3.0
+# gymnasium>=0.28.0
+# stable-baselines3>=2.0.0
+# faiss-cpu>=1.7.0
