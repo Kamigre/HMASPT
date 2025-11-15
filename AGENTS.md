@@ -110,17 +110,58 @@ print(f"Actions Taken: {len(summary['actions'])}")
 print(f"Explanation: {summary['explanation']}")
 ```
 
-### 4. SelectorAgent (Future)
+### 4. SelectorAgent (`src/agents/selector_agent.py`)
 
-**Status**: Planned - will use Temporal Graph Neural Networks (TGNN)
+**Purpose**: Identify cointegrated stock pairs using Temporal Graph Neural Networks.
 
-**Purpose**: Identify cointegrated stock pairs using graph-based learning.
+**Dependencies**: `torch`, `torch-geometric` (optional)
 
-**Planned Features**:
-- Temporal graph construction from price correlations
-- Memory-based TGNN for dynamic embeddings
-- Pair scoring and validation
-- Statistical tests (cointegration, half-life, ADF)
+**Features**:
+- **MemoryTGNN**: Temporal Graph Neural Network with memory
+  - GRU-based memory updates
+  - Residual GAT layers
+  - L2-normalized embeddings
+  - Pair scoring decoder
+
+- **SelectorAgent**: Pair selection and validation
+  - Temporal graph construction from correlations
+  - Node feature engineering (rolling windows)
+  - TGNN training with negative sampling
+  - Pair scoring and statistical validation
+  - Command handling (adjust threshold, rebuild features)
+
+**Usage**:
+```python
+from src.agents import SelectorAgent, MessageBus, MemoryTGNN
+
+bus = MessageBus()
+selector = SelectorAgent(
+    df=prices_df,
+    message_bus=bus,
+    corr_threshold=0.8,
+    holdout_years=1
+)
+
+# Build features and temporal graphs
+selector.build_node_features(windows=[5, 15, 30])
+graphs, val_df, test_df = selector.build_temporal_graphs()
+
+# Initialize and train TGNN model
+in_channels = len(selector.node_features.columns) - 2  # exclude date, ticker
+selector.model = MemoryTGNN(in_channels, hidden_channels=64, num_layers=2)
+
+optimizer = torch.optim.Adam(selector.model.parameters(), lr=0.001)
+selector.train_tgn_temporal_batches(optimizer, epochs=3)
+
+# Score and validate pairs
+scored_pairs = selector.score_all_pairs_holdout()
+validated_pairs = selector.validate_pairs(
+    scored_pairs.head(100),
+    validation_window=selector.val_period
+)
+
+print(f"Top pairs: {validated_pairs[validated_pairs['pass']].head(10)}")
+```
 
 ## System Workflow
 

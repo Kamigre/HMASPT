@@ -38,11 +38,13 @@ The project has been converted from a Jupyter notebook to a standalone Python ap
 
 ## Recent Changes
 
-**2025-11-15**: Initial import from GitHub
-- Converted Jupyter notebook to Python modules
-- Created sample data generator
-- Set up basic project structure
-- Installed core dependencies (numpy, pandas, scikit-learn, etc.)
+**2025-11-15**: Extracted all agents from Jupyter notebook
+- ✅ Converted Jupyter notebook to Python modules
+- ✅ Created sample data generator
+- ✅ Set up basic project structure
+- ✅ Installed core dependencies (numpy, pandas, scikit-learn, etc.)
+- ✅ Extracted all 4 agents: MessageBus, SelectorAgent, OperatorAgent, SupervisorAgent
+- ✅ Created comprehensive agent documentation (AGENTS.md)
 
 ## User Preferences
 

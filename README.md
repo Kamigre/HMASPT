@@ -46,6 +46,7 @@ python main.py
 │   └── agents/               # Multi-agent system
 │       ├── __init__.py
 │       ├── message_bus.py    # MessageBus, JSONLogger, Graph
+│       ├── selector_agent.py # TGNN pair selection
 │       ├── operator_agent.py # RL trading execution
 │       └── supervisor_agent.py # Portfolio monitoring
 ├── data/                     # Generated data files
