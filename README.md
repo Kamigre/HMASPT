@@ -1,19 +1,15 @@
 # HMASPT
 ## Hierarchical Multi-Agent System for Pairs Trading
 
-A sophisticated machine learning system for algorithmic pairs trading using Temporal Graph Neural Networks (TGNN) and Reinforcement Learning (RL).
-
 ## 🎯 Overview
 
 This system implements a multi-agent architecture for identifying and trading cointegrated stock pairs. It combines:
 
-- **Temporal Graph Neural Networks** to learn dynamic relationships between stocks
-- **Reinforcement Learning** for optimal trading policy
-- **Multi-agent coordination** for distributed decision-making
+- **Temporal Graph Neural Networks** to learn dynamic relationships between stocks.
+- **Reinforcement Learning** for optimal trading policy.
+- **Multi-agent coordination** for distributed decision-making.
 
 ## 🚀 Quick Start
-
-The application runs automatically in the Replit environment. It generates sample stock data and demonstrates the system initialization.
 
 To run manually:
 ```bash
@@ -22,17 +18,13 @@ python main.py
 
 ## 📊 Features
 
-### Current Features (Demo Version)
-- ✅ Sample stock data generation (20 tickers, 500 trading days)
+### Current Features
 - ✅ Statistical utilities (half-life, spread calculation)
 - ✅ Configuration system
 - ✅ Data persistence and logging
-
-### Advanced Features (Requires Additional Dependencies)
-- ⏳ Temporal Graph Neural Network for pair selection
-- ⏳ Reinforcement Learning trading environment
-- ⏳ Multi-agent coordination system
-- ⏳ Real-time trading simulation
+- ✅ Temporal Graph Neural Network for pair selection
+- ✅ Reinforcement Learning trading environment
+- ✅ Multi-agent coordination system
 
 ## 📁 Project Structure
 
@@ -42,7 +34,6 @@ python main.py
 ├── src/
 │   ├── config.py             # System configuration
 │   ├── utils.py              # Statistical utilities
-│   ├── data_generator.py     # Sample data generation
 │   └── agents/               # Multi-agent system
 │       ├── __init__.py
 │       ├── message_bus.py    # MessageBus, JSONLogger, Graph
