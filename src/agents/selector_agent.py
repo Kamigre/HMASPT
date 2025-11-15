@@ -13,22 +13,12 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch_geometric.nn import GATConv
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    print("Warning: PyTorch not installed. SelectorAgent will have limited functionality.")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
 
-try:
-    from statsmodels.tsa.stattools import adfuller
-    STATSMODELS_AVAILABLE = True
-except ImportError:
-    STATSMODELS_AVAILABLE = False
-    print("Warning: statsmodels not installed. Statistical validation will be limited.")
+from statsmodels.tsa.stattools import adfuller
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -37,139 +27,137 @@ from config import CONFIG
 from utils import half_life as compute_half_life, compute_spread
 from agents.message_bus import MessageBus
 
+class MemoryTGNN(nn.Module):
+    """
+    Temporal Graph Neural Network (TGNN) with memory.
+    
+    Purpose:
+    - Learn dynamic node embeddings that evolve over time
+    - Capture both structural relationships (edges) and temporal evolution
+    - Provide embeddings for pair selection scoring
+    
+    Components:
+    1. Input projection: stabilizes features
+    2. GRUCell: updates hidden state ("memory") for each node
+    3. Learnable gating to blend old and new memory
+    4. Residual GAT layers with LayerNorm and dropout
+    5. L2-normalized embeddings for scoring pairs
+    6. Decoder: scores pairs of nodes using concatenated embeddings
+    """
+    
+    def __init__(self, in_channels, hidden_channels=64, num_heads=1, num_layers=1, 
+                 dropout=0.1, blend_factor=0.3, device=None):
+        super().__init__()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.hidden_channels = hidden_channels
+        self.num_heads = num_heads
+        self.num_layers = max(1, num_layers)
+        self.dropout_p = dropout
+        self.blend_factor = blend_factor
 
-if TORCH_AVAILABLE:
-    class MemoryTGNN(nn.Module):
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_channels)
+        )
+
+        self.msg_gru = nn.GRUCell(hidden_channels, hidden_channels)
+
+        self.update_gate = nn.Sequential(
+            nn.Linear(2 * hidden_channels, hidden_channels),
+            nn.Sigmoid()
+        )
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for _ in range(self.num_layers):
+            self.convs.append(GATConv(hidden_channels, hidden_channels // num_heads, heads=num_heads))
+            self.norms.append(nn.LayerNorm(hidden_channels))
+
+        self.dropout = nn.Dropout(p=self.dropout_p)
+
+        self.proj_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_channels)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(2 * hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_p),
+            nn.Linear(hidden_channels, 1)
+        )
+
+        self.node_memory = None
+        self._reset_parameters()
+        self.to(self.device)
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x, edge_index, pair_index=None, memory=None, timestamps=None):
         """
-        Temporal Graph Neural Network (TGNN) with memory.
+        Forward pass for TGNN.
         
-        Purpose:
-        - Learn dynamic node embeddings that evolve over time
-        - Capture both structural relationships (edges) and temporal evolution
-        - Provide embeddings for pair selection scoring
-        
-        Components:
-        1. Input projection: stabilizes features
-        2. GRUCell: updates hidden state ("memory") for each node
-        3. Learnable gating to blend old and new memory
-        4. Residual GAT layers with LayerNorm and dropout
-        5. L2-normalized embeddings for scoring pairs
-        6. Decoder: scores pairs of nodes using concatenated embeddings
-        """
-        
-        def __init__(self, in_channels, hidden_channels=64, num_heads=1, num_layers=1, 
-                     dropout=0.1, blend_factor=0.3, device=None):
-            super().__init__()
-            self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-            self.hidden_channels = hidden_channels
-            self.num_heads = num_heads
-            self.num_layers = max(1, num_layers)
-            self.dropout_p = dropout
-            self.blend_factor = blend_factor
-
-            self.input_proj = nn.Sequential(
-                nn.Linear(in_channels, hidden_channels),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_channels)
-            )
-
-            self.msg_gru = nn.GRUCell(hidden_channels, hidden_channels)
-
-            self.update_gate = nn.Sequential(
-                nn.Linear(2 * hidden_channels, hidden_channels),
-                nn.Sigmoid()
-            )
-
-            self.convs = nn.ModuleList()
-            self.norms = nn.ModuleList()
-            for _ in range(self.num_layers):
-                self.convs.append(GATConv(hidden_channels, hidden_channels // num_heads, heads=num_heads))
-                self.norms.append(nn.LayerNorm(hidden_channels))
-
-            self.dropout = nn.Dropout(p=self.dropout_p)
-
-            self.proj_head = nn.Sequential(
-                nn.Linear(hidden_channels, hidden_channels),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_channels)
-            )
-
-            self.decoder = nn.Sequential(
-                nn.Linear(2 * hidden_channels, hidden_channels),
-                nn.ReLU(),
-                nn.Dropout(p=self.dropout_p),
-                nn.Linear(hidden_channels, 1)
-            )
-
-            self.node_memory = None
-            self._reset_parameters()
-            self.to(self.device)
-
-        def _reset_parameters(self):
-            for p in self.parameters():
-                if p.dim() > 1:
-                    nn.init.xavier_uniform_(p)
-
-        def forward(self, x, edge_index, pair_index=None, memory=None, timestamps=None):
-            """
-            Forward pass for TGNN.
+        Args:
+            x: Node features (num_nodes x in_channels)
+            edge_index: Graph edges (2 x num_edges)
+            pair_index: Optional pairs to score (2 x num_pairs)
+            memory: Optional previous node memory
+            timestamps: Optional temporal encoding
             
-            Args:
-                x: Node features (num_nodes x in_channels)
-                edge_index: Graph edges (2 x num_edges)
-                pair_index: Optional pairs to score (2 x num_pairs)
-                memory: Optional previous node memory
-                timestamps: Optional temporal encoding
-                
-            Returns:
-                - Embeddings for all nodes and updated memory, or
-                - Pair scores if pair_index is provided
-            """
-            x = x.to(self.device)
-            N = x.size(0)
-            edge_index = edge_index.to(self.device) if edge_index is not None else None
+        Returns:
+            - Embeddings for all nodes and updated memory, or
+            - Pair scores if pair_index is provided
+        """
+        x = x.to(self.device)
+        N = x.size(0)
+        edge_index = edge_index.to(self.device) if edge_index is not None else None
 
-            if memory is None:
-                memory = torch.zeros(N, self.hidden_channels, device=self.device)
+        if memory is None:
+            memory = torch.zeros(N, self.hidden_channels, device=self.device)
+        else:
+            memory = memory.to(self.device)
+
+        x_proj = self.input_proj(x)
+
+        if timestamps is not None:
+            tproj = torch.tanh(nn.Linear(timestamps.shape[-1], self.hidden_channels).to(self.device)(timestamps.to(self.device)))
+            x_proj = x_proj + tproj
+
+        new_mem = self.msg_gru(x_proj, memory)
+
+        gate_in = torch.cat([memory, new_mem], dim=1)
+        gate = self.update_gate(gate_in)
+        memory = (1.0 - gate) * memory + gate * new_mem
+
+        h = memory
+        for conv, norm in zip(self.convs, self.norms):
+            if edge_index is not None and edge_index.numel() > 0:
+                h_conv = conv(h, edge_index)
             else:
-                memory = memory.to(self.device)
+                h_conv = h
+            h = norm(h + self.dropout(F.relu(h_conv)))
 
-            x_proj = self.input_proj(x)
+        self.node_memory = memory
 
-            if timestamps is not None:
-                tproj = torch.tanh(nn.Linear(timestamps.shape[-1], self.hidden_channels).to(self.device)(timestamps.to(self.device)))
-                x_proj = x_proj + tproj
+        z = self.proj_head(h)
+        z = F.normalize(z, p=2, dim=1)
 
-            new_mem = self.msg_gru(x_proj, memory)
+        if pair_index is not None:
+            src_idx = pair_index[0].long().to(self.device)
+            dst_idx = pair_index[1].long().to(self.device)
+            pair_embed = torch.cat([z[src_idx], z[dst_idx]], dim=1)
+            logits = self.decoder(pair_embed).view(-1)
+            return logits
 
-            gate_in = torch.cat([memory, new_mem], dim=1)
-            gate = self.update_gate(gate_in)
-            memory = (1.0 - gate) * memory + gate * new_mem
+        return z, memory
 
-            h = memory
-            for conv, norm in zip(self.convs, self.norms):
-                if edge_index is not None and edge_index.numel() > 0:
-                    h_conv = conv(h, edge_index)
-                else:
-                    h_conv = h
-                h = norm(h + self.dropout(F.relu(h_conv)))
-
-            self.node_memory = memory
-
-            z = self.proj_head(h)
-            z = F.normalize(z, p=2, dim=1)
-
-            if pair_index is not None:
-                src_idx = pair_index[0].long().to(self.device)
-                dst_idx = pair_index[1].long().to(self.device)
-                pair_embed = torch.cat([z[src_idx], z[dst_idx]], dim=1)
-                logits = self.decoder(pair_embed).view(-1)
-                return logits
-
-            return z, memory
-
-        def model_memory(self):
-            return self.node_memory
+    def model_memory(self):
+        return self.node_memory
 
 
 @dataclass
@@ -488,9 +476,6 @@ class SelectorAgent:
         - Half-life < half_life_max
         - Sufficient crossings per year
         """
-        if not STATSMODELS_AVAILABLE:
-            print("Warning: statsmodels not installed. Validation will be limited.")
-            return pd.DataFrame()
 
         start, end = validation_window
         validated = []
