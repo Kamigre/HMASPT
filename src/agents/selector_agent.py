@@ -182,7 +182,7 @@ class SelectorAgent:
     model: Any = None
     scaler: Optional[MinMaxScaler] = None
     edge_index: Optional[Any] = None
-    device: str = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
     message_bus: Optional[MessageBus] = None
     trace_path: str = "traces/selector_trace.jsonl"
@@ -319,9 +319,9 @@ class SelectorAgent:
         Build weekly temporal graphs based on correlations between tickers.
         Uses all data except the last "holdout_years" for training.
         """
-        if not TORCH_AVAILABLE:
-            print("Warning: PyTorch not installed. Cannot build temporal graphs.")
-            return None, None, None
+
+        print("Warning: PyTorch not installed. Cannot build temporal graphs.")
+        return None, None, None
 
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
@@ -411,14 +411,170 @@ class SelectorAgent:
 
         return self.temporal_graphs, val_df, test_df
 
+    def train_tgn_temporal_batches(self, optimizer, batch_size=16, epochs=3, neg_sample_ratio=1):
+
+        """
+        Train the TGNN model across temporal graph snapshots using
+        binary cross entropy + contrastive negative sampling.
+
+        If self.decoder exists it will be used to compute logits from concatenated node embeddings.
+        Otherwise a small two-layer decoder is created and attached to self as self._train_decoder
+        and its params are added to the optimizer.
+        """
+
+        numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
+        if numeric_features.empty:
+            raise ValueError("No numeric columns found in node_features after filtering.")
+
+        # Convert to tensor safely
+        x = torch.from_numpy(numeric_features.values).float().to(self.device)
+
+        tickers = self.node_features["ticker"].unique().tolist()
+        num_nodes = len(tickers)
+        ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+
+        # Prepare decoder: prefer existing self.decoder, else create one and attach it to self
+        decoder = getattr(self, "decoder", None)
+        if decoder is None:
+            # create a small two-layer MLP that maps concatenated embeddings -> logit
+            # we will attach it to self so it can be saved/inspected later
+            # embedding dim (d) will be inferred on first forward
+            if not hasattr(self, "_train_decoder"):
+                self._train_decoder = None  # placeholder; will be initialized lazily
+            decoder = getattr(self, "_train_decoder", None)
+
+        bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+
+        self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
+        print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
+        memory = None  # lag-one memory state (Si-1)
+        for epoch in range(epochs):
+            if self.model is None:
+                raise RuntimeError("No model attached to SelectorAgent. Set self.model before training.")
+            self.model.train()
+            total_loss = 0.0
+            total_events = 0
+
+            for i, graph in enumerate(self.temporal_graphs):
+                # periodically allow Supervisor to intervene between snapshots
+                self._check_for_commands()
+
+                optimizer.zero_grad()
+
+                # detach/clones to avoid inplace warnings
+                edge_index = graph["edge_index"].detach().clone()  # shape [2, E]
+                # edge_attr may not be needed for link pred; keep if model requires it
+                edge_attr = graph.get("edge_attr", None)
+                if edge_attr is not None:
+                    edge_attr = edge_attr.detach().clone()
+
+                # Forward pass: expect embeddings (num_nodes x d), optionally memory_out
+                model_out = self.model(x, edge_index=edge_index, memory=memory)  # pass previous memory (lag-one)
+                # handle different return shapes
+                if isinstance(model_out, tuple) and len(model_out) >= 2:
+                    z, memory = model_out[0], model_out[1]
+                else:
+                    z = model_out
+                    # memory remains whatever model may have updated internally (if it doesn't return memory we keep previous memory)
+
+                # Detach memory to avoid backward-through-graph errors
+                if memory is not None:
+                    memory = memory.detach()
+
+                if z is None:
+                    raise RuntimeError("Model returned None embeddings. Expected node embeddings tensor.")
+
+                if z.dim() == 1:
+                    # make sure z is (num_nodes, d)
+                    raise RuntimeError("Embeddings have wrong shape; expected (num_nodes, d).")
+
+                # lazy initialize decoder if needed (we now know embedding dim)
+                if getattr(self, "_train_decoder", None) is None and getattr(self, "decoder", None) is None:
+                    d = z.size(1)
+                    self._train_decoder = nn.Sequential(
+                        nn.Linear(2 * d, d),
+                        nn.ReLU(),
+                        nn.Linear(d, 1)
+                    ).to(self.device)
+                    decoder = self._train_decoder
+                    # add new params to optimizer so they're updated
+                    optimizer.add_param_group({"params": self._train_decoder.parameters()})
+                elif getattr(self, "decoder", None) is None:
+                    decoder = self._train_decoder
+
+                # Prepare positive pairs from edge_index
+                if edge_index.numel() == 0:
+                    # no events in this snapshot
+                    continue
+
+                src = edge_index[0]  # shape (E,)
+                dst = edge_index[1]  # shape (E,)
+                E = src.size(0)
+                total_events += E
+
+                # gather node embeddings for pairs
+                z_src = z[src]  # (E, d)
+                z_dst = z[dst]  # (E, d)
+                pos_cat = torch.cat([z_src, z_dst], dim=1)  # (E, 2d)
+
+                # compute logits for positive pairs
+                logits_pos = decoder(pos_cat).view(-1)  # (E,)
+
+                # sample negatives: for each positive edge sample `neg_sample_ratio` negative destinations
+                # ensure negatives are not the true destination (simple rejection sampling)
+                neg_samples = []
+                num_neg = int(E * neg_sample_ratio)
+                if num_neg > 0:
+                    # sample random destination node indices (allow duplicates for speed)
+                    # perform in-device sampling
+                    rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
+                    # ensure rand_idx != src[:num_neg] by simple resample loop (cheap unless tiny graph)
+                    # align size by repeating src if needed
+                    src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
+                    # avoid exact matches
+                    mask_equal = rand_idx == src_for_neg
+                    while mask_equal.any():
+                        rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
+                        mask_equal = rand_idx == src_for_neg
+                    neg_src = z[src_for_neg]  # (num_neg, d)
+                    neg_dst = z[rand_idx]      # (num_neg, d)
+                    neg_cat = torch.cat([neg_src, neg_dst], dim=1)  # (num_neg, 2d)
+                    logits_neg = decoder(neg_cat).view(-1)  # (num_neg,)
+                else:
+                    logits_neg = torch.empty(0, device=self.device)
+
+                # Labels: positives = 1, negatives = 0
+                pos_labels = torch.ones_like(logits_pos, device=self.device)
+                if logits_neg.numel() > 0:
+                    neg_labels = torch.zeros_like(logits_neg, device=self.device)
+                    logits = torch.cat([logits_pos, logits_neg], dim=0)
+                    labels = torch.cat([pos_labels, neg_labels], dim=0)
+                else:
+                    logits = logits_pos
+                    labels = pos_labels
+
+                # compute loss (BCE with logits)
+                loss = bce_loss_fn(logits, labels)
+
+                # backward + step
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * (E if logits_neg.numel() == 0 else (E + logits_neg.numel()))
+                # Note: total_loss accumulates scaled sum to report an aggregate; you can change granularity as needed.
+
+            avg_loss = total_loss / max(total_events, 1)
+            self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
+            print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
+
+        self._log_event("tgn_training_complete", {"epochs": epochs})
+        print("✅ TGNN training complete.")
+
     def score_all_pairs_holdout(self):
         """
         Score all ticker pairs using memory propagation.
         Ensures all nodes have embeddings even if not in edges.
         """
-        if not TORCH_AVAILABLE:
-            print("Warning: PyTorch not installed. Cannot score pairs.")
-            return pd.DataFrame()
 
         if self.model is None:
             print("Warning: No model attached. Cannot score pairs.")
