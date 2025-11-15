@@ -289,7 +289,7 @@ class SelectorAgent:
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        df["eps_yoy_growth"] = df.get("eps_yoy_growth", 0.0).fillna(0.0)
+        df["eps_yoy_ growth"] = df.get("eps_yoy_growth", 0.0).fillna(0.0)
         df["peg_adj"] = df.get("peg_adj", 0.0).fillna(0.0)
 
         all_sectors = sorted(self.df["sector"].unique())
@@ -319,9 +319,6 @@ class SelectorAgent:
         Build weekly temporal graphs based on correlations between tickers.
         Uses all data except the last "holdout_years" for training.
         """
-
-        print("Warning: PyTorch not installed. Cannot build temporal graphs.")
-        return None, None, None
 
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
