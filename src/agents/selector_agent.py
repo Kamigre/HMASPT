@@ -1,165 +1,3 @@
-"""
-Selector Agent for identifying cointegrated stock pairs using Temporal Graph Neural Networks.
-Requires: torch, torch-geometric (optional)
-"""
-
-import os
-import json
-import datetime
-import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv
-
-from statsmodels.tsa.stattools import adfuller
-
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from config import CONFIG
-from utils import half_life as compute_half_life, compute_spread
-from agents.message_bus import MessageBus, JSONLogger
-
-class MemoryTGNN(nn.Module):
-    """
-    Temporal Graph Neural Network (TGNN) with memory.
-    
-    Purpose:
-    - Learn dynamic node embeddings that evolve over time
-    - Capture both structural relationships (edges) and temporal evolution
-    - Provide embeddings for pair selection scoring
-    
-    Components:
-    1. Input projection: stabilizes features
-    2. GRUCell: updates hidden state ("memory") for each node
-    3. Learnable gating to blend old and new memory
-    4. Residual GAT layers with LayerNorm and dropout
-    5. L2-normalized embeddings for scoring pairs
-    6. Decoder: scores pairs of nodes using concatenated embeddings
-    """
-    
-    def __init__(self, in_channels, hidden_channels=64, num_heads=1, num_layers=1, 
-                 dropout=0.1, blend_factor=0.3, device=None):
-        super().__init__()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.hidden_channels = hidden_channels
-        self.num_heads = num_heads
-        self.num_layers = max(1, num_layers)
-        self.dropout_p = dropout
-        self.blend_factor = blend_factor
-
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels)
-        )
-
-        self.msg_gru = nn.GRUCell(hidden_channels, hidden_channels)
-
-        self.update_gate = nn.Sequential(
-            nn.Linear(2 * hidden_channels, hidden_channels),
-            nn.Sigmoid()
-        )
-
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        for _ in range(self.num_layers):
-            self.convs.append(GATConv(hidden_channels, hidden_channels // num_heads, heads=num_heads))
-            self.norms.append(nn.LayerNorm(hidden_channels))
-
-        self.dropout = nn.Dropout(p=self.dropout_p)
-
-        self.proj_head = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels)
-        )
-
-        self.decoder = nn.Sequential(
-            nn.Linear(2 * hidden_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.Dropout(p=self.dropout_p),
-            nn.Linear(hidden_channels, 1)
-        )
-
-        self.node_memory = None
-        self._reset_parameters()
-        self.to(self.device)
-
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, x, edge_index, pair_index=None, memory=None, timestamps=None):
-        """
-        Forward pass for TGNN.
-        
-        Args:
-            x: Node features (num_nodes x in_channels)
-            edge_index: Graph edges (2 x num_edges)
-            pair_index: Optional pairs to score (2 x num_pairs)
-            memory: Optional previous node memory
-            timestamps: Optional temporal encoding
-            
-        Returns:
-            - Embeddings for all nodes and updated memory, or
-            - Pair scores if pair_index is provided
-        """
-        x = x.to(self.device)
-        N = x.size(0)
-        edge_index = edge_index.to(self.device) if edge_index is not None else None
-
-        if memory is None:
-            memory = torch.zeros(N, self.hidden_channels, device=self.device)
-        else:
-            memory = memory.to(self.device)
-
-        x_proj = self.input_proj(x)
-
-        if timestamps is not None:
-            tproj = torch.tanh(nn.Linear(timestamps.shape[-1], self.hidden_channels).to(self.device)(timestamps.to(self.device)))
-            x_proj = x_proj + tproj
-
-        new_mem = self.msg_gru(x_proj, memory)
-
-        gate_in = torch.cat([memory, new_mem], dim=1)
-        gate = self.update_gate(gate_in)
-        memory = (1.0 - gate) * memory + gate * new_mem
-
-        h = memory
-        for conv, norm in zip(self.convs, self.norms):
-            if edge_index is not None and edge_index.numel() > 0:
-                h_conv = conv(h, edge_index)
-            else:
-                h_conv = h
-            h = norm(h + self.dropout(F.relu(h_conv)))
-
-        self.node_memory = memory
-
-        z = self.proj_head(h)
-        z = F.normalize(z, p=2, dim=1)
-
-        if pair_index is not None:
-            src_idx = pair_index[0].long().to(self.device)
-            dst_idx = pair_index[1].long().to(self.device)
-            pair_embed = torch.cat([z[src_idx], z[dst_idx]], dim=1)
-            logits = self.decoder(pair_embed).view(-1)
-            return logits
-
-        return z, memory
-
-    def model_memory(self):
-        return self.node_memory
-
-
 @dataclass
 class SelectorAgent:
     """
@@ -201,22 +39,16 @@ class SelectorAgent:
         self._log_event("init", {"device": self.device, "corr_threshold": self.corr_threshold})
 
     def _log_event(self, event: str, details: Dict[str, Any]):
-        """Append a structured event to the JSONL trace file, log via logger, and publish to the bus."""
         entry = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "agent": "selector",
             "event": event,
             "details": details,
         }
-        # Log via JSONLogger
         if self.logger:
             self.logger.log("selector", event, details)
-        
-        # Append to JSONL trace
         with open(self.trace_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
-        
-        # Publish to message bus
         if self.message_bus:
             try:
                 self.message_bus.publish(entry)
@@ -224,7 +56,6 @@ class SelectorAgent:
                 pass
 
     def _check_for_commands(self):
-        """Non-blocking check for commands addressed to 'selector' and apply them."""
         if self.message_bus is None:
             return
         while True:
@@ -238,13 +69,6 @@ class SelectorAgent:
                 self._log_event("command_failed", {"command": cmd, "error": str(e)})
 
     def _apply_command(self, cmd: Dict[str, Any]):
-        """
-        Supported runtime commands:
-        - {"command": "adjust_threshold", "value": 0.8}
-        - {"command": "set_holdout_years", "value": 2}
-        - {"command": "rebuild_node_features", "windows": [5,15,30]}
-        - {"command": "dump_state", "path": "state.json"}
-        """
         c = cmd.get("command")
         if c == "adjust_threshold":
             self.corr_threshold = float(cmd.get("value", self.corr_threshold))
@@ -270,32 +94,41 @@ class SelectorAgent:
         else:
             self._log_event("unknown_command", {"command": cmd})
 
+    def _save_checkpoint(self, epoch, loss, path=None):
+        """
+        Saves a checkpoint with model weights and metadata.
+        Called automatically by early stopping in training.
+        """
+        if path is None:
+            directory = os.path.dirname(self.trace_path) or "."
+            path = os.path.join(directory, "selector_checkpoint.pt")
+
+        checkpoint = {
+            "epoch": epoch,
+            "loss": loss,
+            "model_state": self.model.state_dict() if self.model else None,
+            "scaler": self.scaler
+        }
+
+        torch.save(checkpoint, path)
+
+        self._log_event("checkpoint_saved", {
+            "epoch": epoch,
+            "loss": float(loss),
+            "path": path
+        })
+   
     def build_node_features(self, windows=[5, 15, 30]) -> pd.DataFrame:
-        """
-        Build rolling window features for each stock and encode categorical features.
-        
-        Rolling features capture temporal behavior:
-        - mean: trend over window
-        - std: volatility over window
-        - cum_return: cumulative log returns
-        
-        One-hot encodes sectors and standardizes all numeric features.
-        """
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
 
         for window in windows:
-            df[f"mean_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: x.rolling(window).mean()
-            )
-            df[f"std_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: x.rolling(window).std()
-            )
+            df[f"mean_{window}"] = df.groupby("ticker")["adj_close"].transform(lambda x: x.rolling(window).mean())
+            df[f"std_{window}"] = df.groupby("ticker")["adj_close"].transform(lambda x: x.rolling(window).std())
             df[f"cum_return_{window}"] = df.groupby("ticker")["adj_close"].transform(
                 lambda x: np.log(x / x.shift(1)).rolling(window).sum()
             )
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
         df["eps_yoy_ growth"] = df.get("eps_yoy_growth", 0.0).fillna(0.0)
         df["peg_adj"] = df.get("peg_adj", 0.0).fillna(0.0)
 
@@ -322,11 +155,6 @@ class SelectorAgent:
         return df
 
     def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
-        """
-        Build weekly temporal graphs based on correlations between tickers.
-        Uses all data except the last "holdout_years" for training.
-        """
-
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
         else:
@@ -365,8 +193,7 @@ class SelectorAgent:
             start_week = weeks[i]
             end_week = weeks[i + 1]
 
-            mask = (train_df["date"].dt.to_period("W") >= start_week) & \
-                  (train_df["date"].dt.to_period("W") <= end_week)
+            mask = (train_df["date"].dt.to_period("W") >= start_week) & (train_df["date"].dt.to_period("W") <= end_week)
             interval = train_df.loc[mask]
 
             if interval.empty:
@@ -440,7 +267,7 @@ class SelectorAgent:
 
         memory = None
 
-        # Early stopping variables
+        # Early stopping
         best_loss = float('inf')
         patience_counter = 0
         patience = 5
@@ -473,7 +300,6 @@ class SelectorAgent:
 
                 if z is None:
                     raise RuntimeError("Model returned None embeddings.")
-
                 if z.dim() == 1:
                     raise RuntimeError("Embeddings must have shape (num_nodes, d).")
 
@@ -489,7 +315,7 @@ class SelectorAgent:
                 elif getattr(self, "decoder", None) is None:
                     decoder = self._train_decoder
 
-                # Build positive samples
+                # Positive samples
                 if edge_index.numel() == 0:
                     continue
 
@@ -498,10 +324,7 @@ class SelectorAgent:
                 E = src.size(0)
                 total_events += E
 
-                z_src = z[src]
-                z_dst = z[dst]
-                pos_cat = torch.cat([z_src, z_dst], dim=1)
-
+                pos_cat = torch.cat([z[src], z[dst]], dim=1)
                 logits_pos = decoder(pos_cat).view(-1)
                 pos_labels = torch.ones_like(logits_pos)
 
@@ -515,10 +338,7 @@ class SelectorAgent:
                         rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
                         mask_equal = rand_idx == src_for_neg
 
-                    neg_src = z[src_for_neg]
-                    neg_dst = z[rand_idx]
-                    neg_cat = torch.cat([neg_src, neg_dst], dim=1)
-
+                    neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
                     logits_neg = decoder(neg_cat).view(-1)
                     neg_labels = torch.zeros_like(logits_neg)
 
@@ -529,12 +349,9 @@ class SelectorAgent:
                     labels = pos_labels
 
                 loss = bce_loss_fn(logits, labels)
-
                 loss.backward()
 
-                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
                 optimizer.step()
 
                 total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
@@ -544,11 +361,11 @@ class SelectorAgent:
             self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
             print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
 
-            # Early stopping
+            # Early stopping check
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 patience_counter = 0
-                self._save_checkpoint(epoch, avg_loss)   # Guardar mejor modelo
+                self._save_checkpoint(epoch, avg_loss)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -560,11 +377,6 @@ class SelectorAgent:
         print("✅ TGNN training complete.")
 
     def score_all_pairs_holdout(self):
-        """
-        Score all ticker pairs using memory propagation.
-        Ensures all nodes have embeddings even if not in edges.
-        """
-
         if self.model is None:
             print("Warning: No model attached. Cannot score pairs.")
             return pd.DataFrame()
@@ -611,16 +423,8 @@ class SelectorAgent:
 
         return results
 
-    def validate_pairs(self, df_pairs: pd.DataFrame, validation_window: Tuple[pd.Timestamp, pd.Timestamp], 
+    def validate_pairs(self, df_pairs: pd.DataFrame, validation_window: Tuple[pd.Timestamp, pd.Timestamp],
                       half_life_max: float = 60, min_crossings_per_year: int = 24):
-        """
-        Validate scored pairs in the holdout period.
-        
-        Checks:
-        - Mean reversion (ADF test)
-        - Half-life < half_life_max
-        - Sufficient crossings per year
-        """
 
         start, end = validation_window
         validated = []
