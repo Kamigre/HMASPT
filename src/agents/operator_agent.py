@@ -161,6 +161,7 @@ class OperatorAgent:
     - Trains PPO models on pairs
     - Evaluates trading performance
     - Responds to supervisor commands
+    - Tracks execution progress for supervisor monitoring
     """
     
     message_bus: MessageBus = None
@@ -171,6 +172,55 @@ class OperatorAgent:
         os.makedirs(self.storage_dir, exist_ok=True)
         self.active = True
         self.transaction_cost = CONFIG["transaction_cost"]
+        
+        # NEW: Add tracking for supervisor monitoring
+        self.current_step = 0  # Track current step in holdout execution
+        self.traces_buffer = []  # Store all traces for supervisor access
+        self.max_buffer_size = 10000  # Limit buffer size to prevent memory issues
+
+    def get_current_step(self):
+        """
+        Return the current step count for supervisor monitoring.
+        
+        Returns:
+            int: Current execution step
+        """
+        return self.current_step
+
+    def get_traces_since_step(self, start_step):
+        """
+        Get all traces since a specific step for supervisor evaluation.
+        
+        Args:
+            start_step: Starting step number (inclusive)
+            
+        Returns:
+            List of trace dictionaries since start_step
+        """
+        return [t for t in self.traces_buffer if t.get('step', 0) >= start_step]
+
+    def add_trace(self, trace):
+        """
+        Add a trace to the buffer for supervisor monitoring.
+        Maintains buffer size limit by removing oldest traces.
+        
+        Args:
+            trace: Dictionary containing trace information
+        """
+        self.traces_buffer.append(trace)
+        
+        # Remove oldest traces if buffer exceeds limit
+        if len(self.traces_buffer) > self.max_buffer_size:
+            self.traces_buffer = self.traces_buffer[-self.max_buffer_size:]
+
+    def clear_traces_before_step(self, step):
+        """
+        Remove traces older than a specific step to manage memory.
+        
+        Args:
+            step: Keep traces from this step onwards
+        """
+        self.traces_buffer = [t for t in self.traces_buffer if t.get('step', 0) >= step]
 
     def apply_command(self, command):
         """Apply runtime commands from supervisor."""
@@ -188,6 +238,21 @@ class OperatorAgent:
         elif cmd_type == "resume":
             self.active = True
             self.logger.log("operator", "resumed", {})
+
+    def load_model(self, model_path):
+        """
+        Load a trained PPO model from disk.
+        
+        Args:
+            model_path: Path to the saved model
+            
+        Returns:
+            Loaded PPO model
+        """
+        if not SB3_AVAILABLE:
+            raise ImportError("stable-baselines3 not installed")
+        
+        return PPO.load(model_path)
 
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
                       lookback: int = 252, timesteps: int = None):
