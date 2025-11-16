@@ -163,8 +163,8 @@ class OperatorAgent:
     - Responds to supervisor commands
     """
     
-    message_bus: MessageBus
-    logger: JSONLogger
+    message_bus: MessageBus = None
+    logger: JSONLogger = None
     storage_dir: str = "models/"
 
     def __post_init__(self):
