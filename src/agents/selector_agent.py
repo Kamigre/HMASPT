@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 from utils import half_life as compute_half_life, compute_spread
 from agents.message_bus import MessageBus
+from agents import JSONLogger
 
 class MemoryTGNN(nn.Module):
     """
@@ -183,6 +184,7 @@ class SelectorAgent:
     scaler: Optional[MinMaxScaler] = None
     edge_index: Optional[Any] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    logger: JSONLogger
     
     message_bus: Optional[MessageBus] = None
     trace_path: str = "traces/selector_trace.jsonl"
