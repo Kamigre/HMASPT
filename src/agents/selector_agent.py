@@ -178,14 +178,13 @@ class SelectorAgent:
     """
     
     df: pd.DataFrame
+    logger: JSONLogger = None
+    message_bus: MessageBus = None
     fundamentals: Optional[pd.DataFrame] = None
     model: Any = None
     scaler: Optional[MinMaxScaler] = None
     edge_index: Optional[Any] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    logger: JSONLogger
-    
-    message_bus: Optional[MessageBus] = None
     trace_path: str = "traces/selector_trace.jsonl"
     corr_threshold: float = 0.8
     holdout_years: int = 1
@@ -202,15 +201,22 @@ class SelectorAgent:
         self._log_event("init", {"device": self.device, "corr_threshold": self.corr_threshold})
 
     def _log_event(self, event: str, details: Dict[str, Any]):
-        """Append a structured event to the JSONL trace file and publish to the bus."""
+        """Append a structured event to the JSONL trace file, log via logger, and publish to the bus."""
         entry = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "agent": "selector",
             "event": event,
             "details": details,
         }
+        # Log via JSONLogger
+        if self.logger:
+            self.logger.log("selector", event, details)
+        
+        # Append to JSONL trace
         with open(self.trace_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
+        
+        # Publish to message bus
         if self.message_bus:
             try:
                 self.message_bus.publish(entry)
