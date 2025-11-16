@@ -185,7 +185,7 @@ class SelectorAgent:
     scaler: Optional[MinMaxScaler] = None
     edge_index: Optional[Any] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    trace_path: str = "traces/selector_trace.jsonl"
+    trace_path: str = None
     corr_threshold: float = 0.8
     holdout_years: int = 1
     node_features: Optional[pd.DataFrame] = None
