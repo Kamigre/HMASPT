@@ -1,6 +1,6 @@
 """
 Supervisor Agent for monitoring and coordinating other agents.
-Optionally uses LLM for decision-making (requires LangChain).
+Uses OpenAI API for decision-making.
 """
 
 import os
@@ -10,14 +10,11 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 
 try:
-    from langchain import LLMChain, PromptTemplate
-    from langchain.llms import LlamaCpp
-    from langchain.callbacks.manager import CallbackManager
-    from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-    LANGCHAIN_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Warning: LangChain not installed. Supervisor will use rule-based logic only.")
+    OPENAI_AVAILABLE = False
+    print("Warning: OpenAI package not installed. Run: pip install openai")
 
 import sys
 import os
@@ -35,18 +32,18 @@ class SupervisorAgent:
     Features:
     - Portfolio risk monitoring
     - Rule-based interventions
-    - Optional LLM-based analysis (requires LangChain)
+    - OpenAI-based analysis
     - Command issuing via MessageBus
     """
     
-    message_bus: MessageBus
-    logger: JSONLogger
+    message_bus: MessageBus = None
+    logger: JSONLogger = None
     max_total_drawdown: float = 0.20
     storage_dir: str = "./storage"
-    llm_model_path: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    model: str = "gpt-4o-mini"  # or "gpt-4o", "gpt-3.5-turbo"
     temperature: float = 0.1
-    llm: Optional[Any] = None
-    explainer_chain: Optional[Any] = None
+    use_openai: bool = True
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
@@ -54,40 +51,30 @@ class SupervisorAgent:
         self.swarm = SwarmOrchestrator(agents=["rules", "llm"], strategy="consensus")
         self.graph = Graph(name="supervisor_decisions")
 
-        if self.llm_model_path and LANGCHAIN_AVAILABLE:
+        # Initialize OpenAI client
+        if self.use_openai and OPENAI_AVAILABLE:
             try:
-                callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+                # Get API key from parameter, environment, or config
+                api_key = self.openai_api_key or os.getenv("OPENAI_API_KEY")
                 
-                self.llm = LlamaCpp(
-                    model_path=self.llm_model_path,
-                    temperature=self.temperature,
-                    callback_manager=callback_manager,
-                    verbose=False,
-                )
-                
-                self.explainer_chain = LLMChain(
-                    llm=self.llm,
-                    prompt=PromptTemplate(
-                        input_variables=["metrics", "actions"],
-                        template=(
-                            "You are an expert quantitative supervisor overseeing algorithmic trading agents.\n"
-                            "Given the portfolio metrics below, explain in natural language why the following actions are being taken.\n\n"
-                            "Metrics:\n{metrics}\n\n"
-                            "Actions:\n{actions}\n\n"
-                            "Explain clearly and concisely the reasoning behind each action, including risk management implications."
-                        )
-                    ),
-                )
-                print(f"✅ LLM loaded: {self.llm_model_path}")
+                if not api_key:
+                    print("Warning: No OpenAI API key provided. Set OPENAI_API_KEY environment variable.")
+                    self.use_openai = False
+                else:
+                    # Initialize OpenAI client (for openai >= 1.0.0)
+                    self.client = openai.OpenAI(api_key=api_key)
+                    print(f"✅ OpenAI API initialized with model: {self.model}")
             except Exception as e:
-                self.llm = None
-                self.explainer_chain = None
-                print(f"Warning: Could not load LLM model: {str(e)}")
+                self.use_openai = False
+                print(f"Warning: Could not initialize OpenAI client: {str(e)}")
+        else:
+            self.use_openai = False
         
         self.logger.log("supervisor", "init", {
             "max_total_drawdown": self.max_total_drawdown,
             "storage_dir": self.storage_dir,
-            "llm_enabled": self.llm is not None
+            "openai_enabled": self.use_openai,
+            "model": self.model if self.use_openai else None
         })
 
     def _action_to_commands(self, action: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -120,33 +107,81 @@ class SupervisorAgent:
 
         return commands
 
+    def _call_openai(self, messages: List[Dict[str, str]], response_format: Optional[str] = None) -> str:
+        """
+        Call OpenAI API with given messages.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            response_format: Optional format specification ('json_object' for JSON mode)
+            
+        Returns:
+            Response text from the model
+        """
+        try:
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature,
+            }
+            
+            # Add JSON mode if supported (GPT-4 and newer models)
+            if response_format == "json_object" and "gpt-4" in self.model or "gpt-3.5" in self.model:
+                kwargs["response_format"] = {"type": "json_object"}
+            
+            response = self.client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content
+        except Exception as e:
+            raise Exception(f"OpenAI API call failed: {str(e)}")
+
     def llm_based_analysis(self, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Query LLM for recommended action (if available).
-        Falls back to rule-based analysis if LLM is unavailable.
+        Query OpenAI for recommended action.
+        Falls back to rule-based analysis if OpenAI is unavailable.
         """
-        if self.llm is None:
+        if not self.use_openai:
+            # Fallback to rule-based logic
             if metrics.get("negatives", 0) > metrics.get("n_traces", 0) * 0.5:
                 return {"action": "retrain_selector", "reason": "fallback_rule"}
             if metrics.get("max_drawdown", 0) > self.max_total_drawdown:
                 return {"action": "reduce_risk", "reason": "fallback_rule"}
             return {"action": "no_op", "reason": "fallback_rule"}
 
-        prompt = (
-            f"Given these portfolio metrics: {json.dumps(metrics, default=str)}, "
-            "suggest one high-level action (in JSON format) to improve portfolio stability or returns. "
-            "Examples: {\"action\":\"rebalance\"}, {\"action\":\"freeze_agents\"}, {\"action\":\"retrain_selector\"}."
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert quantitative supervisor overseeing algorithmic trading agents. Respond only with valid JSON."
+            },
+            {
+                "role": "user",
+                "content": f"""Given these portfolio metrics: {json.dumps(metrics, default=str)}
+
+                Suggest one high-level action to improve portfolio stability or returns.
+
+                Respond with a JSON object with this structure:
+                {{"action": "action_name", "reason": "explanation"}}
+
+                Valid actions include:
+                - "rebalance": Rebalance portfolio positions
+                - "freeze_agents": Pause all trading agents
+                - "retrain_selector": Retrain the stock selection model
+                - "reduce_risk": Reduce position sizes and risk exposure
+                - "increase_capital_allocation": Increase position sizes
+                - "no_op": No action needed
+
+                Provide your recommendation as JSON only."""
+                            }
+        ]
         
         try:
-            raw = self.llm(prompt)
-            text = raw if isinstance(raw, str) else str(raw)
+            response_text = self._call_openai(messages, response_format="json_object")
             
             try:
-                return json.loads(text)
+                return json.loads(response_text)
             except json.JSONDecodeError:
+                # Try to extract JSON from response
                 import re
-                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+                m = re.search(r"\{.*\}", response_text, flags=re.DOTALL)
                 if m:
                     try:
                         return json.loads(m.group(0))
@@ -154,10 +189,42 @@ class SupervisorAgent:
                         pass
                 return {"action": "review_required", "reason": "LLM_unstructured_output"}
         except Exception as e:
-            self.logger.log("supervisor", "llm_error", {"error": str(e)})
+            self.logger.log("supervisor", "openai_error", {"error": str(e)})
+            # Fallback to rule-based
             if metrics.get("max_drawdown", 0) > self.max_total_drawdown:
-                return {"action": "reduce_risk", "reason": "llm_error_fallback"}
-            return {"action": "no_op", "reason": "llm_error_fallback"}
+                return {"action": "reduce_risk", "reason": "openai_error_fallback"}
+            return {"action": "no_op", "reason": "openai_error_fallback"}
+
+    def generate_explanation(self, metrics: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
+        """
+        Generate natural language explanation for actions using OpenAI.
+        """
+        if not self.use_openai or not actions:
+            return f"Rule-based analysis: {len(actions)} interventions recommended."
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert quantitative supervisor overseeing algorithmic trading agents."
+            },
+            {
+                "role": "user",
+                "content": f"""Given the portfolio metrics below, explain in natural language why the following actions are being taken.
+
+                Metrics:
+                {json.dumps(metrics, indent=2, default=str)}
+
+                Actions:
+                {json.dumps(actions, indent=2, default=str)}
+
+                Explain clearly and concisely the reasoning behind each action, including risk management implications."""
+                            }
+        ]
+        
+        try:
+            return self._call_openai(messages)
+        except Exception as e:
+            return f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics. (OpenAI explanation failed: {str(e)})"
 
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -183,35 +250,31 @@ class SupervisorAgent:
             "n_traces": len(operator_traces)
         }
 
+        # Rule-based actions
         actions_rules = []
         if metrics_summary["negatives"] > len(operator_traces) * 0.6:
             actions_rules.append({"action": "retrain_selector", "reason": "systemic_underperformance"})
         if max_dd > self.max_total_drawdown:
             actions_rules.append({"action": "reduce_risk", "reason": "portfolio_drawdown_limit_exceeded"})
 
+        # LLM-based action
         llm_action = self.llm_based_analysis(metrics_summary)
         actions_llm = [llm_action] if llm_action else []
 
+        # Merge actions
         actions = self.swarm.merge_actions(actions_rules + actions_llm)
 
+        # Update graph
         self.graph.add_node("PortfolioMetrics", "metrics")
         for act in actions:
             node_name = f"{act.get('action')} ({act.get('reason','')})"
             self.graph.add_node(node_name)
             self.graph.add_edge("PortfolioMetrics", node_name)
 
-        explanation = ""
-        if self.explainer_chain is not None and actions:
-            try:
-                explanation = self.explainer_chain.run(
-                    metrics=json.dumps(metrics_summary, default=str),
-                    actions=json.dumps(actions, default=str)
-                )
-            except Exception as e:
-                explanation = f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics."
-        else:
-            explanation = f"Rule-based analysis: {len(actions)} interventions recommended."
+        # Generate explanation
+        explanation = self.generate_explanation(metrics_summary, actions)
 
+        # Issue commands
         for act in actions:
             commands = self._action_to_commands(act)
             for cmd in commands:
