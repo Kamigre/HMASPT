@@ -47,22 +47,22 @@ if GYMNASIUM_AVAILABLE:
         """
         Gymnasium environment for pairs trading with mean reversion.
         
-        Features:
-        - Observation: z-score, volatility, half-life, correlation
-        - Actions: -1 (short), 0 (neutral), +1 (long)
-        - Rewards: Based on spread changes minus transaction costs
+        NEW: Supports test_mode to iterate through all data without consuming lookback period.
         """
         
         metadata = {"render.modes": ["human", "plot"]}
 
         def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 500,
-                     shock_prob: float = 0.01, shock_scale: float = 0.1,
-                     initial_capital: float = 1000):
+                    shock_prob: float = 0.01, shock_scale: float = 0.1,
+                    initial_capital: float = 1000, test_mode: bool = False):
             super().__init__()
 
             self.align = pd.concat([series_x, series_y], axis=1).dropna()
             self.lookback = lookback
-            self.ptr = lookback
+            self.test_mode = test_mode  # NEW: Test mode flag
+            
+            # In test mode, start from beginning; in training mode, start after lookback
+            self.ptr = 0 if test_mode else lookback
 
             self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
             self.action_space = spaces.Discrete(3)
@@ -75,16 +75,19 @@ if GYMNASIUM_AVAILABLE:
             self.max_drawdown = 0.0
             self.trades = []
 
-            self.shock_prob = shock_prob
-            self.shock_scale = shock_scale
+            self.shock_prob = shock_prob if not test_mode else 0.0  # No shocks in test mode
+            self.shock_scale = shock_scale if not test_mode else 0.0
 
+            from utils import compute_spread, half_life
             self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
             n = len(self.spread)
             shock_mask = np.random.rand(n) < self.shock_prob
             self.shocks = np.random.randn(n) * self.shock_scale * self.spread.std() * shock_mask
             self.spread_shocked = self.spread + self.shocks
 
-            self.zscores = (self.spread_shocked - self.spread_shocked.rolling(self.lookback).mean()) / self.spread_shocked.rolling(self.lookback).std()
+            # Pre-compute features
+            self.zscores = (self.spread_shocked - self.spread_shocked.rolling(self.lookback).mean()) / \
+                          self.spread_shocked.rolling(self.lookback).std()
             self.vols = self.spread_shocked.rolling(21).std()
             self.rx = self.align.iloc[:, 0].pct_change()
             self.ry = self.align.iloc[:, 1].pct_change()
@@ -96,26 +99,38 @@ if GYMNASIUM_AVAILABLE:
             self.spread_np = self.spread_shocked.to_numpy()
 
         def _compute_features(self, idx: int):
+            from utils import half_life
+            from config import CONFIG
+            
             z = self.zscores_np[idx]
             vol = self.vols_np[idx]
             corr = self.corrs_np[idx]
+            
+            # Use lookback window for half-life calculation
             start = max(0, idx - self.lookback)
             hl = half_life(self.spread_np[start:idx]) if idx > start else CONFIG["half_life_max"]
+            
             return np.array([z, vol, hl, corr], dtype=np.float32)
 
         def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
             super().reset(seed=seed)
-            self.ptr = self.lookback
+            
+            # In test mode, start from beginning; in training mode, start after lookback
+            self.ptr = 0 if self.test_mode else self.lookback
+            
             self.position = 0
             self.portfolio_value = self.initial_capital
             self.cum_returns = 0.0
             self.peak = self.initial_capital
             self.max_drawdown = 0.0
             self.trades = []
+            
             obs = self._compute_features(self.ptr)
             return obs, {}
 
         def step(self, action: int):
+            from config import CONFIG
+            
             target_pos = action - 1
             next_ptr = self.ptr + 1
             terminated = next_ptr >= len(self.spread_np)
@@ -125,8 +140,9 @@ if GYMNASIUM_AVAILABLE:
 
             if terminated:
                 return obs_next, 0.0, terminated, truncated, {
-                    "cum_returns": self.cum_returns,
-                    "max_drawdown": self.max_drawdown
+                    "cum_reward": self.cum_returns,
+                    "max_drawdown": self.max_drawdown,
+                    "position": self.position
                 }
 
             ret = self.spread_np[next_ptr] - self.spread_np[self.ptr]
@@ -147,10 +163,10 @@ if GYMNASIUM_AVAILABLE:
 
             return obs_next, float(daily_return), terminated, truncated, {
                 "pnl": daily_return,
-                "cum_returns": self.cum_returns,
-                "max_drawdown": self.max_drawdown
+                "cum_reward": self.cum_returns,
+                "max_drawdown": self.max_drawdown,
+                "position": self.position
             }
-
 
 @dataclass
 class OperatorAgent:
