@@ -25,8 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from config import CONFIG
 from utils import half_life as compute_half_life, compute_spread
-from agents.message_bus import MessageBus
-from agents import JSONLogger
+from agents.message_bus import MessageBus, JSONLogger
 
 class MemoryTGNN(nn.Module):
     """
