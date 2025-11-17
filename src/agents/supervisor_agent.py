@@ -6,8 +6,9 @@ Uses Google Gemini API for decision-making.
 import os
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
+import pandas as pd
 
 try:
     import google.generativeai as genai
@@ -413,4 +414,3 @@ class SupervisorAgent:
         self._log_event("pairs_validated", {"n_validated": len(validated)})
     
         return pd.DataFrame(validated)
-
