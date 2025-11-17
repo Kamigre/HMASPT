@@ -318,3 +318,99 @@ class SupervisorAgent:
         self.graph.export(os.path.join(self.storage_dir, "supervisor_graph.json"))
 
         return summary
+    # ---------------- Validation ----------------
+    def validate_pairs(
+        self,
+        df_pairs: pd.DataFrame,
+        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
+        half_life_max: float = 60,
+        min_crossings_per_year: int = 24
+    ) -> pd.DataFrame:
+        """
+        Validates statistically whether candidate pairs are cointegrated.
+        - Runs ADF test for stationarity of the spread.
+        - Computes half-life (mean reversion speed).
+        - Counts zero-crossings per year (signal frequency).
+    
+        The Selector produces a dataframe of pairs with scores.
+        The Supervisor validates them statistically before allowing the Operator to trade them.
+        """
+    
+        start, end = validation_window
+        validated = []
+    
+        # Extract clean price matrix
+        prices = self.df.pivot(
+            index="date",
+            columns="ticker",
+            values="adj_close"
+        ).sort_index()
+    
+        for _, row in df_pairs.iterrows():
+            # Allow Supervisor to break if a pause/freeze command arrives
+            self._check_for_commands()
+    
+            x, y = row["x"], row["y"]
+    
+            # Ensure both tickers exist
+            if x not in prices.columns or y not in prices.columns:
+                continue
+    
+            # Extract validation window prices
+            series_x = prices[x].loc[start:end].dropna()
+            series_y = prices[y].loc[start:end].dropna()
+    
+            # Require minimum length for statistical validity
+            if min(len(series_x), len(series_y)) < 60:
+                continue
+    
+            spread = compute_spread(series_x, series_y)
+            if spread is None or len(spread) == 0:
+                continue
+    
+            # Crossing frequency
+            centered = spread - spread.mean()
+            crossings = (centered.shift(1) * centered < 0).sum()
+    
+            days = (
+                (series_x.index[-1] - series_x.index[0]).days
+                if len(series_x.index) > 1 else 0
+            )
+    
+            crossings_per_year = float(crossings) / max(days / 252.0, 1e-9)
+    
+            if crossings_per_year < min_crossings_per_year:
+                continue
+    
+            # ADF test
+            try:
+                adf_res = adfuller(spread.dropna())
+                adf_stat, adf_p = adf_res[0], adf_res[1]
+            except Exception:
+                adf_p = 1.0
+    
+            # Half-life
+            hl = compute_half_life(spread.values)
+            try:
+                hl_val = float(hl)
+            except Exception:
+                hl_val = float("inf")
+    
+            # Decision
+            pass_criteria = (adf_p < 0.05) and (hl_val < half_life_max)
+    
+            validated.append({
+                "x": x,
+                "y": y,
+                "score": float(row.get("score", np.nan)),
+                "adf_p": float(adf_p),
+                "half_life": hl_val,
+                "crossings_per_year": float(crossings_per_year),
+                "pass": bool(pass_criteria)
+            })
+    
+        # Logging
+        self._log_event("pairs_validated", {"n_validated": len(validated)})
+    
+        return pd.DataFrame(validated)
+
