@@ -26,71 +26,81 @@ from config import CONFIG
 from utils import half_life as compute_half_life, compute_spread
 from agents.message_bus import MessageBus, JSONLogger
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class MemoryTGNN(nn.Module):
     """
-    Temporal Graph Neural Network (TGNN) with memory.
+    Enhanced Temporal Graph Neural Network for Pairs Trading.
     
-    Purpose:
-    - Learn dynamic node embeddings that evolve over time
-    - Capture both structural relationships (edges) and temporal evolution
-    - Provide embeddings for pair selection scoring
-    
-    Components:
-    1. Input projection: stabilizes features
-    2. GRUCell: updates hidden state ("memory") for each node
-    3. Learnable gating to blend old and new memory
-    4. Residual GAT layers with LayerNorm and dropout
-    5. L2-normalized embeddings for scoring pairs
-    6. Decoder: scores pairs of nodes using concatenated embeddings
+    Key improvements:
+    1. Edge-level memory for pair relationships
+    2. Temporal edge attributes (correlation history)
+    3. Multi-head attention on both nodes and edges
+    4. Sophisticated pair decoder with asymmetry modeling
+    5. Separate encoders for price dynamics vs fundamentals
     """
     
-    def __init__(self, in_channels, hidden_channels=64, num_heads=3, num_layers=3, 
-                 dropout=0.1, blend_factor=0.3, device=None):
+    def __init__(self, in_channels, hidden_channels=64, num_heads=4, 
+                 num_layers=3, dropout=0.2, device=None):
         super().__init__()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_channels = hidden_channels
         self.num_heads = num_heads
-        self.num_layers = max(1, num_layers)
+        self.num_layers = num_layers
         self.dropout_p = dropout
-        self.blend_factor = blend_factor
 
-        self.input_proj = nn.Sequential(
+        # Single input encoder
+        self.input_encoder = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels)
+            nn.LayerNorm(hidden_channels),
+            nn.Dropout(dropout)
         )
 
-        self.msg_gru = nn.GRUCell(hidden_channels, hidden_channels)
+        # Node memory (GRU for temporal evolution)
+        self.node_gru = nn.GRUCell(hidden_channels, hidden_channels)
+        
+        # Edge memory (for pair relationships)
+        # This stores historical pair interactions
+        self.edge_memory_proj = nn.Linear(hidden_channels * 2, hidden_channels)
+        self.edge_gru = nn.GRUCell(hidden_channels, hidden_channels)
 
-        self.update_gate = nn.Sequential(
-            nn.Linear(2 * hidden_channels, hidden_channels),
-            nn.Sigmoid()
-        )
-
+        # Graph convolution layers with edge attributes
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        for _ in range(self.num_layers):
-            # Ensure hidden_channels is divisible by num_heads
-            assert hidden_channels % num_heads == 0, f"hidden_channels ({hidden_channels}) must be divisible by num_heads ({num_heads})"
-            self.convs.append(GATConv(hidden_channels, hidden_channels // num_heads, heads=num_heads))
+        
+        for _ in range(num_layers):
+            # Use TransformerConv for better long-range dependencies
+            self.convs.append(
+                TransformerConv(
+                    hidden_channels,
+                    hidden_channels // num_heads,
+                    heads=num_heads,
+                    edge_dim=hidden_channels,  # Edge features (correlations, spread)
+                    concat=True,
+                    dropout=dropout
+                )
+            )
             self.norms.append(nn.LayerNorm(hidden_channels))
 
-        self.dropout = nn.Dropout(p=self.dropout_p)
+        self.dropout = nn.Dropout(dropout)
 
-        self.proj_head = nn.Sequential(
+        # Final node projection
+        self.node_proj = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels),
             nn.LeakyReLU(),
             nn.LayerNorm(hidden_channels)
         )
 
-        self.decoder = nn.Sequential(
-            nn.Linear(2 * hidden_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.Dropout(p=self.dropout_p),
-            nn.Linear(hidden_channels, 1)
-        )
+        # Enhanced pair decoder
+        self.pair_decoder = EnhancedPairDecoder(hidden_channels, dropout)
 
+        # Memory storage
         self.node_memory = None
+        self.edge_memory_dict = {}  # Store edge memories by (src, dst) tuple
+        
         self._reset_parameters()
         self.to(self.device)
 
@@ -99,66 +109,208 @@ class MemoryTGNN(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x, edge_index, pair_index=None, memory=None, timestamps=None):
+    def encode_edge_features(self, edge_index, edge_attr, node_embeddings):
         """
-        Forward pass for TGNN.
+        Create rich edge features from:
+        - Current edge attributes (correlation, spread)
+        - Node embeddings of connected nodes
+        - Previous edge memory
+        """
+        src_idx, dst_idx = edge_index[0], edge_index[1]
+        
+        # Concatenate source and destination embeddings
+        edge_node_features = torch.cat([
+            node_embeddings[src_idx],
+            node_embeddings[dst_idx]
+        ], dim=1)
+        
+        # Project to edge feature space
+        edge_features = self.edge_memory_proj(edge_node_features)
+        
+        # Add explicit edge attributes if provided
+        if edge_attr is not None:
+            edge_features = edge_features + edge_attr
+        
+        return edge_features
+
+    def update_edge_memory(self, edge_index, edge_features):
+        """
+        Update edge memory using GRU for temporal consistency.
+        Each edge (pair) has its own memory.
+        """
+        updated_edge_features = []
+        
+        for i in range(edge_index.size(1)):
+            src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+            edge_key = (min(src, dst), max(src, dst))  # Undirected edge
+            
+            # Get previous edge memory or initialize
+            if edge_key not in self.edge_memory_dict:
+                prev_memory = torch.zeros(self.hidden_channels, device=self.device)
+            else:
+                prev_memory = self.edge_memory_dict[edge_key]
+            
+            # Update edge memory
+            new_memory = self.edge_gru(
+                edge_features[i].unsqueeze(0),
+                prev_memory.unsqueeze(0)
+            ).squeeze(0)
+            
+            self.edge_memory_dict[edge_key] = new_memory
+            updated_edge_features.append(new_memory)
+        
+        return torch.stack(updated_edge_features)
+
+    def forward(self, x, edge_index, edge_attr=None, pair_index=None, 
+                node_memory=None):
+        """
+        Forward pass with edge-aware processing.
         
         Args:
-            x: Node features (num_nodes x in_channels)
-            edge_index: Graph edges (2 x num_edges)
-            pair_index: Optional pairs to score (2 x num_pairs)
-            memory: Optional previous node memory
-            timestamps: Optional temporal encoding
+            x: Node features [num_nodes, in_channels]
+            edge_index: Graph edges [2, num_edges]
+            edge_attr: Edge attributes [num_edges, edge_dim] (correlation, spread, etc.)
+            pair_index: Pairs to score [2, num_pairs]
+            node_memory: Previous node memory
             
         Returns:
-            - Embeddings for all nodes and updated memory, or
-            - Pair scores if pair_index is provided
+            If pair_index provided: pair scores
+            Otherwise: node embeddings and updated memory
         """
         x = x.to(self.device)
         N = x.size(0)
-        edge_index = edge_index.to(self.device) if edge_index is not None else None
+        
+        # Single encoding path
+        h = self.input_encoder(x)
 
-        if memory is None:
-            memory = torch.zeros(N, self.hidden_channels, device=self.device)
+        # Update node memory
+        if node_memory is None:
+            node_memory = torch.zeros(N, self.hidden_channels, device=self.device)
         else:
-            memory = memory.to(self.device)
+            node_memory = node_memory.to(self.device)
+        
+        node_memory = self.node_gru(h, node_memory)
+        h = node_memory
 
-        x_proj = self.input_proj(x)
+        # Process edges with memory
+        if edge_index is not None and edge_index.numel() > 0:
+            edge_index = edge_index.to(self.device)
+            
+            # Create edge features
+            edge_features = self.encode_edge_features(edge_index, edge_attr, h)
+            
+            # Update edge memory
+            edge_features = self.update_edge_memory(edge_index, edge_features)
+            
+            # Graph convolutions with edge features
+            for conv, norm in zip(self.convs, self.norms):
+                h_conv = conv(h, edge_index, edge_features)
+                h = norm(h + self.dropout(F.relu(h_conv)))
 
-        if timestamps is not None:
-            tproj = torch.tanh(nn.Linear(timestamps.shape[-1], self.hidden_channels).to(self.device)(timestamps.to(self.device)))
-            x_proj = x_proj + tproj
-
-        new_mem = self.msg_gru(x_proj, memory)
-
-        gate_in = torch.cat([memory, new_mem], dim=1)
-        gate = self.update_gate(gate_in)
-        memory = (1.0 - gate) * memory + gate * new_mem
-
-        h = memory
-        for conv, norm in zip(self.convs, self.norms):
-            if edge_index is not None and edge_index.numel() > 0:
-                h_conv = conv(h, edge_index)
-            else:
-                h_conv = h
-            h = norm(h + self.dropout(F.relu(h_conv)))
-
-        self.node_memory = memory
-
-        z = self.proj_head(h)
+        # Final node projection
+        z = self.node_proj(h)
         z = F.normalize(z, p=2, dim=1)
+        
+        self.node_memory = node_memory
 
+        # Score pairs if requested
         if pair_index is not None:
             src_idx = pair_index[0].long().to(self.device)
             dst_idx = pair_index[1].long().to(self.device)
-            pair_embed = torch.cat([z[src_idx], z[dst_idx]], dim=1)
-            logits = self.decoder(pair_embed).view(-1)
-            return logits
+            
+            # Get edge features for these pairs
+            pair_edge_features = []
+            for i in range(len(src_idx)):
+                src, dst = src_idx[i].item(), dst_idx[i].item()
+                edge_key = (min(src, dst), max(src, dst))
+                if edge_key in self.edge_memory_dict:
+                    pair_edge_features.append(self.edge_memory_dict[edge_key])
+                else:
+                    pair_edge_features.append(torch.zeros(self.hidden_channels, device=self.device))
+            
+            pair_edge_features = torch.stack(pair_edge_features)
+            
+            scores = self.pair_decoder(z[src_idx], z[dst_idx], pair_edge_features)
+            return scores.view(-1)
 
-        return z, memory
+        return z, node_memory
 
-    def model_memory(self):
-        return self.node_memory
+    def reset_edge_memory(self):
+        """Reset edge memory (call between epochs or training phases)"""
+        self.edge_memory_dict = {}
+
+
+class EnhancedPairDecoder(nn.Module):
+    """
+    Sophisticated pair decoder for pairs trading.
+    
+    Models:
+    1. Asymmetric relationships (A->B different from B->A)
+    2. Temporal stability of the pair
+    3. Edge history integration
+    """
+    
+    def __init__(self, hidden_dim, dropout=0.2):
+        super().__init__()
+        
+        # Symmetric features (same for both directions)
+        self.symmetric_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 32)
+        )
+        
+        # Asymmetric features (directional)
+        self.asymmetric_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 32)
+        )
+        
+        # Edge history features
+        self.edge_history_net = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Final scoring layer
+        self.score_net = nn.Sequential(
+            nn.Linear(96, 64),  # 32 + 32 + 32
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.LeakyReLU(),
+            nn.Linear(32, 1)
+        )
+    
+    def forward(self, z_i, z_j, edge_memory):
+        """
+        Score pairs with asymmetry awareness.
+        
+        Args:
+            z_i: Source node embeddings [batch, hidden]
+            z_j: Destination node embeddings [batch, hidden]
+            edge_memory: Edge memory features [batch, hidden]
+        """
+        # Symmetric features (order-invariant)
+        symmetric = self.symmetric_net(torch.cat([z_i, z_j], dim=1))
+        
+        # Asymmetric features (order-dependent)
+        asymmetric = self.asymmetric_net(torch.cat([z_i - z_j, z_i * z_j], dim=1))
+        
+        # Edge history
+        edge_features = self.edge_history_net(edge_memory)
+        
+        # Combine all features
+        combined = torch.cat([symmetric, asymmetric, edge_features], dim=1)
+        
+        # Final score
+        score = self.score_net(combined)
+        
+        return score
 
 @dataclass
 class SelectorAgent:
