@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
+from torch_geometric.nn import TransformerConv
 
 from statsmodels.tsa.stattools import adfuller
 
@@ -44,7 +45,9 @@ class MemoryTGNN(nn.Module):
     
     def __init__(self, in_channels, hidden_channels=64, num_heads=4, 
                  num_layers=3, dropout=0.2, device=None):
+
         super().__init__()
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_channels = hidden_channels
         self.num_heads = num_heads
@@ -72,17 +75,15 @@ class MemoryTGNN(nn.Module):
         self.norms = nn.ModuleList()
         
         for _ in range(num_layers):
+
             # Use TransformerConv for better long-range dependencies
             self.convs.append(
-                TransformerConv(
-                    hidden_channels,
-                    hidden_channels // num_heads,
-                    heads=num_heads,
-                    edge_dim=hidden_channels,  # Edge features (correlations, spread)
-                    concat=True,
-                    dropout=dropout
+                TransformerConv(hidden_channels, hidden_channels // num_heads,
+                heads=num_heads, edge_dim=hidden_channels, concat=True,
+                dropout=dropout
                 )
             )
+
             self.norms.append(nn.LayerNorm(hidden_channels))
 
         self.dropout = nn.Dropout(dropout)
@@ -95,7 +96,7 @@ class MemoryTGNN(nn.Module):
         )
 
         # Enhanced pair decoder
-        self.pair_decoder = EnhancedPairDecoder(hidden_channels, dropout)
+        self.pair_decoder_edge_proj = nn.Linear(hidden_channels, 1)  # simple decoder using history
 
         # Memory storage
         self.node_memory = None
@@ -112,7 +113,7 @@ class MemoryTGNN(nn.Module):
     def encode_edge_features(self, edge_index, edge_attr, node_embeddings):
         """
         Create rich edge features from:
-        - Current edge attributes (correlation, spread)
+        - Current edge attributes
         - Node embeddings of connected nodes
         - Previous edge memory
         """
@@ -141,6 +142,7 @@ class MemoryTGNN(nn.Module):
         updated_edge_features = []
         
         for i in range(edge_index.size(1)):
+
             src, dst = edge_index[0, i].item(), edge_index[1, i].item()
             edge_key = (min(src, dst), max(src, dst))  # Undirected edge
             
@@ -169,7 +171,7 @@ class MemoryTGNN(nn.Module):
         Args:
             x: Node features [num_nodes, in_channels]
             edge_index: Graph edges [2, num_edges]
-            edge_attr: Edge attributes [num_edges, edge_dim] (correlation, spread, etc.)
+            edge_attr: Edge attributes [num_edges, edge_dim]
             pair_index: Pairs to score [2, num_pairs]
             node_memory: Previous node memory
             
@@ -239,79 +241,6 @@ class MemoryTGNN(nn.Module):
         """Reset edge memory (call between epochs or training phases)"""
         self.edge_memory_dict = {}
 
-
-class EnhancedPairDecoder(nn.Module):
-    """
-    Sophisticated pair decoder for pairs trading.
-    
-    Models:
-    1. Asymmetric relationships (A->B different from B->A)
-    2. Temporal stability of the pair
-    3. Edge history integration
-    """
-    
-    def __init__(self, hidden_dim, dropout=0.2):
-        super().__init__()
-        
-        # Symmetric features (same for both directions)
-        self.symmetric_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 32)
-        )
-        
-        # Asymmetric features (directional)
-        self.asymmetric_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 32)
-        )
-        
-        # Edge history features
-        self.edge_history_net = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Final scoring layer
-        self.score_net = nn.Sequential(
-            nn.Linear(96, 64),  # 32 + 32 + 32
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.LeakyReLU(),
-            nn.Linear(32, 1)
-        )
-    
-    def forward(self, z_i, z_j, edge_memory):
-        """
-        Score pairs with asymmetry awareness.
-        
-        Args:
-            z_i: Source node embeddings [batch, hidden]
-            z_j: Destination node embeddings [batch, hidden]
-            edge_memory: Edge memory features [batch, hidden]
-        """
-        # Symmetric features (order-invariant)
-        symmetric = self.symmetric_net(torch.cat([z_i, z_j], dim=1))
-        
-        # Asymmetric features (order-dependent)
-        asymmetric = self.asymmetric_net(torch.cat([z_i - z_j, z_i * z_j], dim=1))
-        
-        # Edge history
-        edge_features = self.edge_history_net(edge_memory)
-        
-        # Combine all features
-        combined = torch.cat([symmetric, asymmetric, edge_features], dim=1)
-        
-        # Final score
-        score = self.score_net(combined)
-        
-        return score
-
 @dataclass
 class SelectorAgent:
     """
@@ -322,7 +251,7 @@ class SelectorAgent:
     - Memory-based TGNN for embeddings
     - Temporal holdout: train on first 4 years, score pairs on last year
     - GPU support if available
-    - NO DATA LEAKAGE: Scaler fit only on training data
+    - No data leakage: Scaler fit only on training data
     
     Improvements:
     - Integrates with MessageBus for supervisor commands
