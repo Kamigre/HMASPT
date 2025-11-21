@@ -496,7 +496,7 @@ class SelectorAgent:
             start_week = weeks[i]
             end_week = weeks[i + 1]
 
-            mask = (train_df["date"].dt.to_period("Y") >= start_week) & (train_df["date"].dt.to_period("W") <= end_week)
+            mask = (train_df["date"].dt.to_period("Y") >= start_week) & (train_df["date"].dt.to_period("Y") <= end_week)
             interval = train_df.loc[mask]
 
             if interval.empty:
@@ -545,137 +545,138 @@ class SelectorAgent:
 
     def train_tgn_temporal_batches(self, optimizer, batch_size=16, epochs=3, neg_sample_ratio=1):
 
-        numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
-        if numeric_features.empty:
-            raise ValueError("No numeric columns found in node_features after filtering.")
+            numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
+            if numeric_features.empty:
+                raise ValueError("No numeric columns found in node_features after filtering.")
 
-        x = torch.from_numpy(numeric_features.values).float().to(self.device)
+            x = torch.from_numpy(numeric_features.values).float().to(self.device)
 
-        tickers = self.node_features["ticker"].unique().tolist()
-        num_nodes = len(tickers)
-        ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+            tickers = self.node_features["ticker"].unique().tolist()
+            num_nodes = len(tickers)
+            ticker_to_idx = {t: i for i, t in enumerate(tickers)}
 
-        decoder = getattr(self, "decoder", None)
-        if decoder is None:
-            if not hasattr(self, "_train_decoder"):
-                self._train_decoder = None
-            decoder = getattr(self, "_train_decoder", None)
+            decoder = getattr(self, "decoder", None)
+            if decoder is None:
+                if not hasattr(self, "_train_decoder"):
+                    self._train_decoder = None
+                decoder = getattr(self, "_train_decoder", None)
 
-        bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+            bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
 
-        self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
-        print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
+            self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
+            print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
 
-        memory = None
+            memory = None
 
-        # Early stopping
-        best_loss = float('inf')
-        patience_counter = 0
-        patience = 5
+            # Early stopping
+            best_loss = float('inf')
+            patience_counter = 0
+            patience = 5
 
-        for epoch in range(epochs):
+            for epoch in range(epochs):
 
-            self.model.train()
-            total_loss = 0.0
-            total_events = 0
+                self.model.train()
+                total_loss = 0.0
+                total_events = 0
 
-            for i, graph in enumerate(self.temporal_graphs):
+                for i, graph in enumerate(self.temporal_graphs):
 
-                self._check_for_commands()
-                optimizer.zero_grad()
+                    self._check_for_commands()
+                    optimizer.zero_grad()
 
-                edge_index = graph["edge_index"].detach().clone()
-                edge_attr = graph.get("edge_attr", None)
-                if edge_attr is not None:
-                    edge_attr = edge_attr.detach().clone()
+                    edge_index = graph["edge_index"].detach().clone()
+                    edge_attr = graph.get("edge_attr", None)
+                    if edge_attr is not None:
+                        edge_attr = edge_attr.detach().clone()
 
-                model_out = self.model(x, edge_index=edge_index, memory=memory)
+                    # Fix: Pass edge_attr as positional argument, not skipping it with keyword args
+                    model_out = self.model(x, edge_index, edge_attr, pair_index=None, memory=memory)
 
-                if isinstance(model_out, tuple) and len(model_out) >= 2:
-                    z, memory = model_out[0], model_out[1]
-                else:
-                    z = model_out
+                    if isinstance(model_out, tuple) and len(model_out) >= 2:
+                        z, memory = model_out[0], model_out[1]
+                    else:
+                        z = model_out
 
-                if memory is not None:
-                    memory = memory.detach()
+                    if memory is not None:
+                        memory = memory.detach()
 
-                if z is None:
-                    raise RuntimeError("Model returned None embeddings.")
-                if z.dim() == 1:
-                    raise RuntimeError("Embeddings must have shape (num_nodes, d).")
+                    if z is None:
+                        raise RuntimeError("Model returned None embeddings.")
+                    if z.dim() == 1:
+                        raise RuntimeError("Embeddings must have shape (num_nodes, d).")
 
-                if getattr(self, "_train_decoder", None) is None and getattr(self, "decoder", None) is None:
-                    d = z.size(1)
-                    self._train_decoder = nn.Sequential(
-                        nn.Linear(2 * d, d),
-                        nn.ReLU(),
-                        nn.Linear(d, 1)
-                    ).to(self.device)
-                    decoder = self._train_decoder
-                    optimizer.add_param_group({"params": self._train_decoder.parameters()})
-                elif getattr(self, "decoder", None) is None:
-                    decoder = self._train_decoder
+                    if getattr(self, "_train_decoder", None) is None and getattr(self, "decoder", None) is None:
+                        d = z.size(1)
+                        self._train_decoder = nn.Sequential(
+                            nn.Linear(2 * d, d),
+                            nn.ReLU(),
+                            nn.Linear(d, 1)
+                        ).to(self.device)
+                        decoder = self._train_decoder
+                        optimizer.add_param_group({"params": self._train_decoder.parameters()})
+                    elif getattr(self, "decoder", None) is None:
+                        decoder = self._train_decoder
 
-                # Positive samples
-                if edge_index.numel() == 0:
-                    continue
+                    # Positive samples
+                    if edge_index.numel() == 0:
+                        continue
 
-                src = edge_index[0]
-                dst = edge_index[1]
-                E = src.size(0)
-                total_events += E
+                    src = edge_index[0]
+                    dst = edge_index[1]
+                    E = src.size(0)
+                    total_events += E
 
-                pos_cat = torch.cat([z[src], z[dst]], dim=1)
-                logits_pos = decoder(pos_cat).view(-1)
-                pos_labels = torch.ones_like(logits_pos)
+                    pos_cat = torch.cat([z[src], z[dst]], dim=1)
+                    logits_pos = decoder(pos_cat).view(-1)
+                    pos_labels = torch.ones_like(logits_pos)
 
-                # Negative sampling
-                num_neg = int(E * neg_sample_ratio)
-                if num_neg > 0:
-                    rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
-                    src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
-                    mask_equal = rand_idx == src_for_neg
-                    while mask_equal.any():
-                        rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
+                    # Negative sampling
+                    num_neg = int(E * neg_sample_ratio)
+                    if num_neg > 0:
+                        rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
+                        src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
                         mask_equal = rand_idx == src_for_neg
+                        while mask_equal.any():
+                            rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
+                            mask_equal = rand_idx == src_for_neg
 
-                    neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
-                    logits_neg = decoder(neg_cat).view(-1)
-                    neg_labels = torch.zeros_like(logits_neg)
+                        neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
+                        logits_neg = decoder(neg_cat).view(-1)
+                        neg_labels = torch.zeros_like(logits_neg)
 
-                    logits = torch.cat([logits_pos, logits_neg])
-                    labels = torch.cat([pos_labels, neg_labels])
+                        logits = torch.cat([logits_pos, logits_neg])
+                        labels = torch.cat([pos_labels, neg_labels])
+                    else:
+                        logits = logits_pos
+                        labels = pos_labels
+
+                    loss = bce_loss_fn(logits, labels)
+                    loss.backward()
+
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                    total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
+
+                avg_loss = total_loss / max(total_events, 1)
+
+                self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
+                print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
+
+                # Early stopping check
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                    self._save_checkpoint(epoch, avg_loss)
                 else:
-                    logits = logits_pos
-                    labels = pos_labels
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        self._log_event("early_stopping", {"epoch": epoch})
+                        print(f"⛔ Early stopping triggered at epoch {epoch+1}")
+                        break
 
-                loss = bce_loss_fn(logits, labels)
-                loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
-
-            avg_loss = total_loss / max(total_events, 1)
-
-            self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
-            print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
-
-            # Early stopping check
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                patience_counter = 0
-                self._save_checkpoint(epoch, avg_loss)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    self._log_event("early_stopping", {"epoch": epoch})
-                    print(f"⛔ Early stopping triggered at epoch {epoch+1}")
-                    break
-
-        self._log_event("tgn_training_complete", {"epochs": epoch + 1})
-        print("✅ TGNN training complete.")
+            self._log_event("tgn_training_complete", {"epochs": epoch + 1})
+            print("✅ TGNN training complete.")
 
     def score_all_pairs_holdout(self):
         if self.model is None:
@@ -698,7 +699,7 @@ class SelectorAgent:
             for g in self.temporal_graphs:
                 self._check_for_commands()
 
-                out = self.model(x_full, g["edge_index"], memory=memory)
+                out = self.model(x_full, g["edge_index"], g.get("edge_attr", None), pair_index=None, memory=memory)
 
                 if isinstance(out, tuple) and len(out) == 2:
                     _, memory = out
