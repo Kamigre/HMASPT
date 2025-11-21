@@ -31,16 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MemoryTGNN(nn.Module):
-    """
-    Enhanced Temporal Graph Neural Network for Pairs Trading.
-    
-    Key improvements:
-    1. Edge-level memory for pair relationships
-    2. Temporal edge attributes (correlation history)
-    3. Multi-head attention on both nodes and edges
-    4. Sophisticated pair decoder with asymmetry modeling
-    5. Separate encoders for price dynamics vs fundamentals
-    """
     
     def __init__(self, in_channels, hidden_channels=64, num_heads=4, 
                  num_layers=3, dropout=0.2, device=None):
@@ -94,6 +84,8 @@ class MemoryTGNN(nn.Module):
 
         # Enhanced pair decoder
         self.decoder = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(),
             nn.Linear(hidden_channels, 1),
             nn.Sigmoid()  # Ensures output is in [0, 1]
         )
@@ -633,17 +625,7 @@ class SelectorAgent:
                     if z.dim() == 1:
                         raise RuntimeError("Embeddings must have shape (num_nodes, d).")
 
-                    if getattr(self, "_train_decoder", None) is None and getattr(self, "decoder", None) is None:
-                        d = z.size(1)
-                        self._train_decoder = nn.Sequential(
-                            nn.Linear(2 * d, d),
-                            nn.ReLU(),
-                            nn.Linear(d, 1)
-                        ).to(self.device)
-                        decoder = self._train_decoder
-                        optimizer.add_param_group({"params": self._train_decoder.parameters()})
-                    elif getattr(self, "decoder", None) is None:
-                        decoder = self._train_decoder
+                    decoder = self.model.decoder
 
                     # Positive samples
                     if edge_index.numel() == 0:
