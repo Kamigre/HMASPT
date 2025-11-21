@@ -483,7 +483,7 @@ class SelectorAgent:
         test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
 
         # Add month column to training data AFTER splitting
-        train_df["month"] = train_df["date"].dt.to_period("M")
+        train_df["month"] = train_df["date"].dt.to_period("Y")
         
         # Get unique months sorted
         unique_months = sorted(train_df["month"].unique())
@@ -563,241 +563,130 @@ class SelectorAgent:
 
         return self.temporal_graphs, val_df, test_df
 
-    """
-    Key optimizations for memory and speed:
-    1. Mini-batch training instead of full graph
-    2. Gradient accumulation for large graphs
-    3. Mixed precision training (FP16)
-    4. Memory-efficient edge sampling
-    5. Periodic memory cleanup
-    """
+    def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, neg_sample_ratio=1):
 
-    import torch
-    import torch.nn as nn
-    from torch.cuda.amp import autocast, GradScaler
-    import gc
+            numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
+            if numeric_features.empty:
+                raise ValueError("No numeric columns found in node_features after filtering.")
 
-    def train_tgn_temporal_batches(
-        self, 
-        optimizer, 
-        batch_size=32, 
-        epochs=3, 
-        neg_sample_ratio=1,
-        accumulation_steps=4,  # NEW: Gradient accumulation
-        use_amp=True,  # NEW: Mixed precision training
-        edge_batch_size=1000  # NEW: Process edges in batches
-    ):
-        """
-        Optimized training with:
-        - Mini-batch processing of edges
-        - Gradient accumulation
-        - Mixed precision (FP16) training
-        - Memory-efficient sampling
-        - Periodic garbage collection
-        """
-        
-        # Prepare features once
-        numeric_features = self.node_features.drop(
-            columns=["date", "ticker"], errors="ignore"
-        ).select_dtypes(include=[np.number])
-        
-        if numeric_features.empty:
-            raise ValueError("No numeric columns found in node_features.")
-        
-        # Keep on CPU initially, move to GPU in batches
-        x_cpu = torch.from_numpy(numeric_features.values).float()
-        x = x_cpu.to(self.device)
-        
-        tickers = self.node_features["ticker"].unique().tolist()
-        num_nodes = len(tickers)
-        
-        # Mixed precision setup
-        scaler = GradScaler() if use_amp and self.device == "cuda" else None
-        
-        bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
-        
-        self._log_event("tgn_training_started", {
-            "n_snapshots": len(self.temporal_graphs),
-            "epochs": epochs,
-            "use_amp": use_amp,
-            "edge_batch_size": edge_batch_size
-        })
-        
-        print(f"🚀 Starting optimized TGNN training:")
-        print(f"   - {len(self.temporal_graphs)} temporal snapshots")
-        print(f"   - Mixed precision: {use_amp}")
-        print(f"   - Edge batch size: {edge_batch_size}")
-        print(f"   - Gradient accumulation: {accumulation_steps} steps")
-        
-        memory = None
-        best_loss = float('inf')
-        patience_counter = 0
-        patience = 5
-        
-        for epoch in range(epochs):
-            self.model.train()
-            total_loss = 0.0
-            total_events = 0
-            
-            # Reset gradient accumulation
-            optimizer.zero_grad()
-            accumulated_steps = 0
-            
-            for i, graph in enumerate(self.temporal_graphs):
-                self._check_for_commands()
-                
-                edge_index = graph["edge_index"].detach().clone()
-                edge_attr = graph.get("edge_attr")
-                if edge_attr is not None:
-                    edge_attr = edge_attr.detach().clone()
-                
-                # Skip empty graphs
-                if edge_index.numel() == 0:
-                    continue
-                
-                # Forward pass with mixed precision
-                with autocast(enabled=(use_amp and self.device == "cuda")):
-                    model_out = self.model(x, edge_index, edge_attr, 
-                                          pair_index=None, memory=memory)
-                    
+            x = torch.from_numpy(numeric_features.values).float().to(self.device)
+
+            tickers = self.node_features["ticker"].unique().tolist()
+            num_nodes = len(tickers)
+            ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+
+            decoder = getattr(self, "decoder", None)
+            if decoder is None:
+                if not hasattr(self, "_train_decoder"):
+                    self._train_decoder = None
+                decoder = getattr(self, "_train_decoder", None)
+
+            bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+
+            self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
+            print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
+
+            memory = None
+
+            # Early stopping
+            best_loss = float('inf')
+            patience_counter = 0
+            patience = 5
+
+            for epoch in range(epochs):
+
+                self.model.train()
+                total_loss = 0.0
+                total_events = 0
+
+                for i, graph in enumerate(self.temporal_graphs):
+
+                    self._check_for_commands()
+                    optimizer.zero_grad()
+
+                    edge_index = graph["edge_index"].detach().clone()
+                    edge_attr = graph.get("edge_attr", None)
+                    if edge_attr is not None:
+                        edge_attr = edge_attr.detach().clone()
+
+                    # Fix: Pass edge_attr as positional argument, not skipping it with keyword args
+                    model_out = self.model(x, edge_index, edge_attr, pair_index=None, memory=memory)
+
                     if isinstance(model_out, tuple) and len(model_out) >= 2:
                         z, memory = model_out[0], model_out[1]
                     else:
                         z = model_out
-                    
-                    # Detach memory to prevent backprop through time
+
                     if memory is not None:
                         memory = memory.detach()
-                    
-                    # Process edges in mini-batches to save memory
-                    num_edges = edge_index.size(1)
-                    edge_batch_loss = 0.0
-                    edge_batches_processed = 0
-                    
-                    for start_idx in range(0, num_edges, edge_batch_size):
-                        end_idx = min(start_idx + edge_batch_size, num_edges)
-                        
-                        # Get edge batch
-                        src_batch = edge_index[0, start_idx:end_idx]
-                        dst_batch = edge_index[1, start_idx:end_idx]
-                        batch_size_actual = src_batch.size(0)
-                        
-                        # Positive samples
-                        pos_cat = torch.cat([z[src_batch], z[dst_batch]], dim=1)
-                        logits_pos = self.model.decoder(pos_cat).view(-1)
-                        pos_labels = torch.ones_like(logits_pos)
-                        
-                        # Negative sampling (efficient)
-                        num_neg = int(batch_size_actual * neg_sample_ratio)
-                        if num_neg > 0:
-                            # Sample negatives efficiently
-                            rand_idx = torch.randint(
-                                0, num_nodes, (num_neg,), device=self.device
-                            )
-                            src_for_neg = src_batch.repeat(neg_sample_ratio)[:num_neg]
-                            
-                            # Quick collision check (vectorized)
-                            mask = rand_idx != src_for_neg
-                            while not mask.all():
-                                rand_idx[~mask] = torch.randint(
-                                    0, num_nodes, (~mask).sum().item(), device=self.device
-                                )[0]
-                                mask = rand_idx != src_for_neg
-                            
-                            neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
-                            logits_neg = self.model.decoder(neg_cat).view(-1)
-                            neg_labels = torch.zeros_like(logits_neg)
-                            
-                            logits = torch.cat([logits_pos, logits_neg])
-                            labels = torch.cat([pos_labels, neg_labels])
-                        else:
-                            logits = logits_pos
-                            labels = pos_labels
-                        
-                        # Compute loss for this edge batch
-                        loss = bce_loss_fn(logits, labels)
-                        edge_batch_loss += loss
-                        edge_batches_processed += 1
-                        
-                        # Free memory
-                        del pos_cat, logits_pos, logits, labels
-                        if num_neg > 0:
-                            del neg_cat, logits_neg
-                    
-                    # Average loss across edge batches
-                    avg_edge_loss = edge_batch_loss / max(edge_batches_processed, 1)
-                    
-                    # Scale loss for gradient accumulation
-                    scaled_loss = avg_edge_loss / accumulation_steps
-                
-                # Backward pass with mixed precision
-                if scaler is not None:
-                    scaler.scale(scaled_loss).backward()
-                else:
-                    scaled_loss.backward()
-                
-                accumulated_steps += 1
-                total_loss += avg_edge_loss.item()
-                total_events += 1
-                
-                # Update weights after accumulation steps
-                if accumulated_steps >= accumulation_steps:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
+
+                    if z is None:
+                        raise RuntimeError("Model returned None embeddings.")
+                    if z.dim() == 1:
+                        raise RuntimeError("Embeddings must have shape (num_nodes, d).")
+
+                    decoder = self.model.decoder
+
+                    # Positive samples
+                    if edge_index.numel() == 0:
+                        continue
+
+                    src = edge_index[0]
+                    dst = edge_index[1]
+                    E = src.size(0)
+                    total_events += E
+
+                    pos_cat = torch.cat([z[src], z[dst]], dim=1)
+                    logits_pos = decoder(pos_cat).view(-1)
+                    pos_labels = torch.ones_like(logits_pos)
+
+                    # Negative sampling
+                    num_neg = int(E * neg_sample_ratio)
+                    if num_neg > 0:
+                        rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
+                        src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
+                        mask_equal = rand_idx == src_for_neg
+                        while mask_equal.any():
+                            rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
+                            mask_equal = rand_idx == src_for_neg
+
+                        neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
+                        logits_neg = decoder(neg_cat).view(-1)
+                        neg_labels = torch.zeros_like(logits_neg)
+
+                        logits = torch.cat([logits_pos, logits_neg])
+                        labels = torch.cat([pos_labels, neg_labels])
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        optimizer.step()
-                    
-                    optimizer.zero_grad()
-                    accumulated_steps = 0
-                
-                # Periodic memory cleanup
-                if (i + 1) % 10 == 0:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-            
-            # Handle remaining gradients
-            if accumulated_steps > 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
+                        logits = logits_pos
+                        labels = pos_labels
+
+                    loss = bce_loss_fn(logits, labels)
+                    loss.backward()
+
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     optimizer.step()
-                optimizer.zero_grad()
-            
-            avg_loss = total_loss / max(total_events, 1)
-            
-            self._log_event("tgn_epoch_complete", {
-                "epoch": epoch + 1,
-                "avg_loss": avg_loss
-            })
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f}")
-            
-            # Early stopping
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                patience_counter = 0
-                self._save_checkpoint(epoch, avg_loss)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    self._log_event("early_stopping", {"epoch": epoch})
-                    print(f"⛔ Early stopping at epoch {epoch+1}")
-                    break
-            
-            # Cleanup after epoch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-        
-        self._log_event("tgn_training_complete", {"epochs": epoch + 1})
+
+                    total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
+
+                avg_loss = total_loss / max(total_events, 1)
+
+                self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
+                print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
+
+                # Early stopping check
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                    self._save_checkpoint(epoch, avg_loss)
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        self._log_event("early_stopping", {"epoch": epoch})
+                        print(f"⛔ Early stopping triggered at epoch {epoch+1}")
+                        break
+
+            self._log_event("tgn_training_complete", {"epochs": epoch + 1})
+            print("✅ TGNN training complete.")
 
     def score_all_pairs_holdout(self):
         if self.model is None:
