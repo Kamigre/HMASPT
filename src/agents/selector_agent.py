@@ -93,7 +93,10 @@ class MemoryTGNN(nn.Module):
         )
 
         # Enhanced pair decoder
-        self.pair_decoder_edge_proj = nn.Linear(hidden_channels, 1)  # simple decoder using history
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_channels, 1),
+            nn.Sigmoid()  # Ensures output is in [0, 1]
+        )
 
         # Memory storage
         self.node_memory = None
@@ -440,7 +443,7 @@ class SelectorAgent:
     def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
         """
         Build temporal graphs with proper train/val/test split BEFORE feature scaling.
-        This prevents data leakage.
+        Uses MONTHLY frequency to avoid period comparison errors.
         """
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
@@ -482,68 +485,93 @@ class SelectorAgent:
         exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", "div_amount", "volume"]
         feature_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
 
-        # Split data
-        train_df = df[df["date"] < val_start]
-        val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)]
-        test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)]
+        # Split data using datetime comparison (NOT period comparison!)
+        train_df = df[df["date"] < val_start].copy()
+        val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)].copy()
+        test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
 
-        # Build temporal graphs ONLY from training data
-        weeks = sorted(train_df["date"].dt.to_period("Y").unique())
+        # Add month column to training data AFTER splitting
+        train_df["month"] = train_df["date"].dt.to_period("Y")
+        
+        # Get unique months sorted
+        unique_months = sorted(train_df["month"].unique())
+        
+        print(f"Building {len(unique_months)} monthly temporal graphs from training data...")
 
-        for i in range(len(weeks) - 1):
+        # Process each month
+        for month_period in unique_months:
             self._check_for_commands()
 
-            start_week = weeks[i]
-            end_week = weeks[i + 1]
+            # Filter data for this specific month
+            # Use the period column directly - no comparisons needed
+            month_data = train_df[train_df["month"] == month_period]
 
-            mask = (train_df["date"].dt.to_period("Y") >= start_week) & (train_df["date"].dt.to_period("Y") <= end_week)
-            interval = train_df.loc[mask]
-
-            if interval.empty:
+            if month_data.empty or len(month_data) < 10:  # Skip months with too little data
                 continue
 
-            weekly_features = interval.groupby("ticker")[feature_cols].mean().fillna(0.0)
-            weekly_features = weekly_features.reindex(tickers, fill_value=0.0)
+            # Aggregate features for the month
+            monthly_features = month_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
+            monthly_features = monthly_features.reindex(tickers, fill_value=0.0)
 
-            corr_matrix = np.corrcoef(weekly_features.values)
-            corr_matrix = np.nan_to_num(corr_matrix)
+            # Skip if we don't have enough tickers
+            if len(monthly_features) < 2:
+                continue
 
+            # Compute correlation matrix
+            corr_matrix = np.corrcoef(monthly_features.values)
+            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Create edges based on correlation threshold
             edges = np.argwhere(np.abs(corr_matrix) >= corr_threshold)
-            edges = edges[edges[:, 0] < edges[:, 1]]
+            edges = edges[edges[:, 0] < edges[:, 1]]  # Keep upper triangle only
 
             num_nodes = len(tickers)
             edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
 
             if len(edges) > 0:
                 edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
-                edge_attr = torch.tensor([[corr_matrix[i, j]] for i, j in edges], dtype=torch.float, device=self.device)
+                edge_attr = torch.tensor(
+                    [[corr_matrix[i, j]] for i, j in edges], 
+                    dtype=torch.float, 
+                    device=self.device
+                )
             else:
                 edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
                 edge_attr = torch.zeros((0, 1), dtype=torch.float, device=self.device)
 
+            # Store graph snapshot
             self.temporal_graphs.append({
-                "start": str(start_week),
-                "end": str(end_week),
+                "month": str(month_period),
+                "start": str(month_period.start_time.date()),
+                "end": str(month_period.end_time.date()),
                 "edge_index": edge_index,
-                "edge_attr": edge_attr
+                "edge_attr": edge_attr,
+                "num_edges": len(edges)
             })
+
+        # Clean up temporary column
+        train_df.drop(columns=["month"], inplace=True, errors="ignore")
 
         self._log_event("temporal_graphs_built", {
             "n_graphs": len(self.temporal_graphs),
-            "train_end": str(train_end),
-            "val_period": (str(self.val_period[0]), str(self.val_period[1])),
-            "test_period": (str(self.test_period[0]), str(self.test_period[1])),
+            "frequency": "monthly",
+            "train_end": str(train_end.date()),
+            "val_period": (str(self.val_period[0].date()), str(self.val_period[1].date())),
+            "test_period": (str(self.test_period[0].date()), str(self.test_period[1].date())),
             "corr_threshold": corr_threshold
         })
 
-        print(f"✅ Temporal graphs built: {len(self.temporal_graphs)} (TRAINING ONLY)")
-        print(f"   Training: up to {train_end.date()}")
+        avg_edges = np.mean([g["num_edges"] for g in self.temporal_graphs]) if self.temporal_graphs else 0
+        
+        print(f"✅ Temporal graphs built: {len(self.temporal_graphs)} monthly graphs")
+        print(f"   Average edges per graph: {avg_edges:.1f}")
+        print(f"   Training period: up to {train_end.date()}")
         print(f"   Validation: {self.val_period[0].date()} → {self.val_period[1].date()}")
         print(f"   Test: {self.test_period[0].date()} → {self.test_period[1].date()}")
 
         return self.temporal_graphs, val_df, test_df
 
-    def train_tgn_temporal_batches(self, optimizer, batch_size=16, epochs=3, neg_sample_ratio=1):
+    def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, neg_sample_ratio=1):
 
             numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
             if numeric_features.empty:
