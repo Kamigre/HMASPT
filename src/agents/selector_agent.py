@@ -161,7 +161,7 @@ class MemoryTGNN(nn.Module):
         return torch.stack(updated_edge_features)
 
     def forward(self, x, edge_index, edge_attr=None, pair_index=None, 
-                node_memory=None):
+                memory=None):
         """
         Forward pass with edge-aware processing.
         
@@ -170,7 +170,7 @@ class MemoryTGNN(nn.Module):
             edge_index: Graph edges [2, num_edges]
             edge_attr: Edge attributes [num_edges, edge_dim]
             pair_index: Pairs to score [2, num_pairs]
-            node_memory: Previous node memory
+            memory: Previous node memory
             
         Returns:
             If pair_index provided: pair scores
@@ -183,13 +183,13 @@ class MemoryTGNN(nn.Module):
         h = self.input_encoder(x)
 
         # Update node memory
-        if node_memory is None:
-            node_memory = torch.zeros(N, self.hidden_channels, device=self.device)
+        if memory is None:
+            memory = torch.zeros(N, self.hidden_channels, device=self.device)
         else:
-            node_memory = node_memory.to(self.device)
+            memory = memory.to(self.device)
         
-        node_memory = self.node_gru(h, node_memory)
-        h = node_memory
+        memory = self.node_gru(h, memory)
+        h = memory
 
         # Process edges with memory
         if edge_index is not None and edge_index.numel() > 0:
@@ -210,7 +210,7 @@ class MemoryTGNN(nn.Module):
         z = self.node_proj(h)
         z = F.normalize(z, p=2, dim=1)
         
-        self.node_memory = node_memory
+        self.memory = memory
 
         # Score pairs if requested
         if pair_index is not None:
@@ -232,7 +232,7 @@ class MemoryTGNN(nn.Module):
             scores = self.pair_decoder(z[src_idx], z[dst_idx], pair_edge_features)
             return scores.view(-1)
 
-        return z, node_memory
+        return z, memory
 
     def reset_edge_memory(self):
         """Reset edge memory (call between epochs or training phases)"""
@@ -488,7 +488,7 @@ class SelectorAgent:
         test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)]
 
         # Build temporal graphs ONLY from training data
-        weeks = sorted(train_df["date"].dt.to_period("W").unique())
+        weeks = sorted(train_df["date"].dt.to_period("Y").unique())
 
         for i in range(len(weeks) - 1):
             self._check_for_commands()
@@ -496,7 +496,7 @@ class SelectorAgent:
             start_week = weeks[i]
             end_week = weeks[i + 1]
 
-            mask = (train_df["date"].dt.to_period("W") >= start_week) & (train_df["date"].dt.to_period("W") <= end_week)
+            mask = (train_df["date"].dt.to_period("Y") >= start_week) & (train_df["date"].dt.to_period("W") <= end_week)
             interval = train_df.loc[mask]
 
             if interval.empty:
