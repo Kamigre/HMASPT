@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-from torch_geometric.nn import TransformerConv
 
 from statsmodels.tsa.stattools import adfuller
 
@@ -76,13 +75,11 @@ class MemoryTGNN(nn.Module):
         
         for _ in range(num_layers):
 
-            # Use TransformerConv for better long-range dependencies
+            # GAT
+            out_per_head = max(1, hidden_channels // self.num_heads)
             self.convs.append(
-                TransformerConv(hidden_channels, hidden_channels // num_heads,
-                heads=num_heads, edge_dim=hidden_channels, concat=True,
-                dropout=dropout
+                GATConv(hidden_channels, out_per_head, heads=self.num_heads, concat=True)
                 )
-            )
 
             self.norms.append(nn.LayerNorm(hidden_channels))
 
