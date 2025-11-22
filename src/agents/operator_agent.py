@@ -39,8 +39,8 @@ from typing import Optional
 class PairTradingEnv(gym.Env):
 
     def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
-                shock_prob: float = 0.01, shock_scale: float = 0.2,
-                initial_capital: float = 1000, test_mode: bool = False):
+                shock_prob: float = 0.01, shock_scale: float = 0.4,
+                initial_capital: float = 100000, test_mode: bool = False):
     
         super().__init__()
 
@@ -248,8 +248,8 @@ class OperatorAgent:
 
     # Individual pair training
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = 30, timesteps: int = 1000,
-                      shock_prob: float = 0.01, shock_scale: float = 0.1):
+                      lookback: int = 30, timesteps: int = 100000,
+                      shock_prob: float = 0.01, shock_scale: float = 0.4):
 
         if not self.active:
             return None
@@ -308,7 +308,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     def train(pair):
         x, y = pair
         print(f"\n🔹 Training Operator on pair ({x}, {y})")
-        return operator.train_on_pair(prices, x, y, 30, 1000)
+        return operator.train_on_pair(prices, x, y, 30, 100000)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
