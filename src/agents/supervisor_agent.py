@@ -48,8 +48,6 @@ class SupervisorAgent:
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
-        
-        self.swarm = SwarmOrchestrator(agents=["rules", "llm"], strategy="consensus")
         self.graph = Graph(name="supervisor_decisions")
 
         # Initialize Gemini client
@@ -163,12 +161,12 @@ class SupervisorAgent:
         except Exception as e:
             raise Exception(f"Gemini API call failed: {str(e)}")
 
-    def generate_explanation(self, metrics: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
+    def generate_explanation(self, metrics: Dict[str, Any], actions_rules: List[Dict[str, Any]]) -> str:
         """
         Generate natural language explanation for actions using Gemini.
         """
-        if not self.use_gemini or not actions:
-            return f"Rule-based analysis: {len(actions)} interventions recommended."
+        if not self.use_gemini or not actions_rules:
+            return f"Rule-based analysis: {len(actions_rules)} interventions recommended."
 
         system_instruction = "You are an expert quantitative supervisor overseeing algorithmic trading agents."
         
@@ -178,14 +176,14 @@ class SupervisorAgent:
                   {json.dumps(metrics, indent=2, default=str)}
 
                   Actions:
-                  {json.dumps(actions, indent=2, default=str)}
+                  {json.dumps(actions_rules, indent=2, default=str)}
 
                   Explain clearly and concisely the reasoning behind each action, including risk management implications."""
         
         try:
             return self._call_gemini(prompt, system_instruction=system_instruction)
         except Exception as e:
-            return f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics. (Gemini explanation failed: {str(e)})"
+            return f"Simple rule-based explanation: {len(actions_rules)} actions triggered based on portfolio metrics. (Gemini explanation failed: {str(e)})"
 
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -212,9 +210,9 @@ class SupervisorAgent:
         }
 
         # Rule-based actions
-        actions_rules = []
+        actions = []
         if max_dd > self.max_total_drawdown:
-            actions_rules.append({"action": "reduce_risk", "reason": "portfolio_drawdown_limit_exceeded"})
+            actions.append({"action": "reduce_risk", "reason": "portfolio_drawdown_limit_exceeded"})
 
         # Update graph
         self.graph.add_node("PortfolioMetrics", "metrics")
