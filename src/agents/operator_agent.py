@@ -175,7 +175,7 @@ class PairTradingEnv(gym.Env):
         daily_return = pnl / max(1e-8, old_value)
         daily_return = np.clip(daily_return, -0.5, 0.5)  # Cap at ±50% daily return
     
-        self.cum_returns = self.portfolio_value - self.initial_capital
+        self.cum_returns = (self.portfolio_value / self.initial_capital - 1) * 100
         self.peak = max(self.peak, self.portfolio_value)
         self.max_drawdown = max(
             self.max_drawdown,
