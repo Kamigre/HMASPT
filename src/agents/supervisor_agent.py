@@ -103,9 +103,7 @@ class SupervisorAgent:
         act = action.get("action", "")
         commands = []
 
-        if act == "retrain_selector":
-            commands.append({"target": "selector", "command": "retrain_tgn", "epochs": action.get("epochs", 1)})
-        elif act == "reduce_risk":
+        if act == "reduce_risk":
             new_tc = action.get("new_transaction_cost", CONFIG.get("transaction_cost", 0.005) + 0.002)
             commands.append({"target": "operator", "command": "adjust_transaction_cost", "new_value": new_tc})
         elif act in ["freeze_agents", "pause_agents"]:
@@ -114,8 +112,6 @@ class SupervisorAgent:
         elif act == "resume_agents":
             commands.append({"target": "selector", "command": "resume"})
             commands.append({"target": "operator", "command": "resume"})
-        elif act == "increase_capital_allocation":
-            commands.append({"target": "operator", "command": "adjust_position_size", "new_value": action.get("new_value", 1.0)})
         elif "target" in action and "command" in action:
             commands.append(action)
 
@@ -167,67 +163,6 @@ class SupervisorAgent:
         except Exception as e:
             raise Exception(f"Gemini API call failed: {str(e)}")
 
-    def llm_based_analysis(self, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Query Gemini for recommended action.
-        Falls back to rule-based analysis if Gemini is unavailable.
-        """
-        if not self.use_gemini:
-            # Fallback to rule-based logic
-            if metrics.get("negatives", 0) > metrics.get("n_traces", 0) * 0.5:
-                return {"action": "retrain_selector", "reason": "fallback_rule"}
-            if metrics.get("max_drawdown", 0) > self.max_total_drawdown:
-                return {"action": "reduce_risk", "reason": "fallback_rule"}
-            return {"action": "no_op", "reason": "fallback_rule"}
-
-        system_instruction = "You are an expert quantitative supervisor overseeing algorithmic trading agents. Respond only with valid JSON."
-        
-        prompt = f"""Given these portfolio metrics: {json.dumps(metrics, default=str)}
-
-                  Suggest one high-level action to improve portfolio stability or returns.
-
-                  Respond with a JSON object with this structure:
-                  {{"action": "action_name", "reason": "explanation"}}
-
-                  Valid actions include:
-                  - "rebalance": Rebalance portfolio positions
-                  - "freeze_agents": Pause all trading agents
-                  - "retrain_selector": Retrain the stock selection model
-                  - "reduce_risk": Reduce position sizes and risk exposure
-                  - "increase_capital_allocation": Increase position sizes
-                  - "no_op": No action needed
-
-                  Provide your recommendation as JSON only."""
-        
-        try:
-            response_text = self._call_gemini(prompt, system_instruction=system_instruction, json_mode=True)
-            
-            # Clean response text (remove markdown code blocks if present)
-            response_text = response_text.strip()
-            if response_text.startswith('```'):
-                lines = response_text.split('\n')
-                response_text = '\n'.join(lines[1:-1]) if len(lines) > 2 else response_text
-                response_text = response_text.replace('```json', '').replace('```', '').strip()
-            
-            try:
-                return json.loads(response_text)
-            except json.JSONDecodeError:
-                # Try to extract JSON from response
-                import re
-                m = re.search(r"\{.*\}", response_text, flags=re.DOTALL)
-                if m:
-                    try:
-                        return json.loads(m.group(0))
-                    except Exception:
-                        pass
-                return {"action": "review_required", "reason": "LLM_unstructured_output"}
-        except Exception as e:
-            self.logger.log("supervisor", "gemini_error", {"error": str(e)})
-            # Fallback to rule-based
-            if metrics.get("max_drawdown", 0) > self.max_total_drawdown:
-                return {"action": "reduce_risk", "reason": "gemini_error_fallback"}
-            return {"action": "no_op", "reason": "gemini_error_fallback"}
-
     def generate_explanation(self, metrics: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
         """
         Generate natural language explanation for actions using Gemini.
@@ -278,17 +213,8 @@ class SupervisorAgent:
 
         # Rule-based actions
         actions_rules = []
-        if metrics_summary["negatives"] > len(operator_traces) * 0.6:
-            actions_rules.append({"action": "retrain_selector", "reason": "systemic_underperformance"})
         if max_dd > self.max_total_drawdown:
             actions_rules.append({"action": "reduce_risk", "reason": "portfolio_drawdown_limit_exceeded"})
-
-        # LLM-based action
-        llm_action = self.llm_based_analysis(metrics_summary)
-        actions_llm = [llm_action] if llm_action else []
-
-        # Merge actions
-        actions = self.swarm.merge_actions(actions_rules + actions_llm)
 
         # Update graph
         self.graph.add_node("PortfolioMetrics", "metrics")
