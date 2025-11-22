@@ -11,27 +11,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-    GYMNASIUM_AVAILABLE = True
-except ImportError:
-    GYMNASIUM_AVAILABLE = False
-    print("Warning: gymnasium not installed. OperatorAgent will have limited functionality.")
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
 
-try:
-    from stable_baselines3 import PPO
-    SB3_AVAILABLE = True
-except ImportError:
-    SB3_AVAILABLE = False
-    print("Warning: stable-baselines3 not installed. RL training will not be available.")
-
-try:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from tqdm import tqdm
-    PARALLEL_TRAINING_AVAILABLE = True
-except ImportError:
-    PARALLEL_TRAINING_AVAILABLE = False
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 import sys
 import os
@@ -41,182 +26,141 @@ from config import CONFIG
 from utils import half_life, compute_spread
 from agents.message_bus import MessageBus, JSONLogger
 
+class PairTradingEnv(gym.Env):
 
-if GYMNASIUM_AVAILABLE:
-    class PairTradingEnv(gym.Env):
-        """
-        Gymnasium environment for pairs trading with mean reversion.
-        
-        NEW: Supports test_mode to iterate through all data without consuming lookback period.
+  def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
+              shock_prob: float = None, shock_scale: float = None,
+              initial_capital: float = None, test_mode: bool = False):
+  
+      super().__init__()
 
+      self.align = pd.concat([series_x, series_y], axis=1).dropna()
+      self.lookback = lookback
+      self.test_mode = test_mode
+      self.ptr = 0 if test_mode else lookback # In test mode, start from beginning; in training mode, start after lookback
+      self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+      self.action_space = spaces.Discrete(3) # Buy, neutral or sell
+      self.position = 0
+      self.initial_capital = initial_capital
+      self.portfolio_value = initial_capital
+      self.cum_returns = 0.0
+      self.peak = initial_capital
+      self.max_drawdown = 0.0
+      self.trades = []
+      self.shock_prob = shock_prob if not test_mode else 0.0  # No shocks in test mode
+      self.shock_scale = shock_scale if not test_mode else 0.0
+      self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
+      n = len(self.spread)
+      shock_mask = np.random.rand(n) < self.shock_prob
+      self.shocks = np.random.randn(n) * self.shock_scale * self.spread.std() * shock_mask
+      self.spread_shocked = self.spread + self.shocks
 
+      # Pre-compute features
+      self.zscores = (self.spread_shocked - self.spread_shocked.rolling(self.lookback).mean()) / \
+                    self.spread_shocked.rolling(self.lookback).std()
+      self.vols = self.spread_shocked.rolling(15).std()
+      self.rx = self.align.iloc[:, 0].pct_change()
+      self.ry = self.align.iloc[:, 1].pct_change()
+      self.corrs = self.rx.rolling(15).corr(self.ry)
+      self.zscores_np = np.nan_to_num(self.zscores.to_numpy())
+      self.vols_np = np.nan_to_num(self.vols.to_numpy())
+      self.corrs_np = np.nan_to_num(self.corrs.to_numpy())
+      self.spread_np = self.spread_shocked.to_numpy()
 
-        """
+  def _compute_features(self, idx: int):
+      
+      z = self.zscores_np[idx]
+      vol = self.vols_np[idx]
+      corr = self.corrs_np[idx]
+      
+      # Use lookback window for half-life calculation
+      start = max(0, idx - self.lookback)
+      hl = half_life(self.spread_np[start:idx]) if idx > start else CONFIG["half_life_max"]
+      
+      return np.array([z, vol, hl, corr], dtype=np.float32)
 
-        metadata = {"render.modes": ["human", "plot"]}
+  def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
 
-        def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 500,
-                    shock_prob: float = 0.01, shock_scale: float = 0.1,
-                    initial_capital: float = 1000, test_mode: bool = False):
-            super().__init__()
+      super().reset(seed=seed)
+      
+      # In test mode, start from beginning; in training mode, start after lookback
+      self.ptr = 0 if self.test_mode else self.lookback
+      self.position = 0
+      self.portfolio_value = self.initial_capital
+      self.cum_returns = 0.0
+      self.peak = self.initial_capital
+      self.max_drawdown = 0.0
+      self.trades = []
 
-            self.align = pd.concat([series_x, series_y], axis=1).dropna()
-            self.lookback = lookback
-            self.test_mode = test_mode  # NEW: Test mode flag
-            
-            # In test mode, start from beginning; in training mode, start after lookback
-            self.ptr = 0 if test_mode else lookback
+      obs = self._compute_features(self.ptr)
+      return obs, {}
 
-            self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
-            self.action_space = spaces.Discrete(3)
-
-            self.position = 0
-            self.initial_capital = initial_capital
-            self.portfolio_value = initial_capital
-            self.cum_returns = 0.0
-            self.peak = initial_capital
-            self.max_drawdown = 0.0
-            self.trades = []
-
-            self.shock_prob = shock_prob if not test_mode else 0.0  # No shocks in test mode
-            self.shock_scale = shock_scale if not test_mode else 0.0
-
-            from utils import compute_spread, half_life
-            self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
-            n = len(self.spread)
-            shock_mask = np.random.rand(n) < self.shock_prob
-            self.shocks = np.random.randn(n) * self.shock_scale * self.spread.std() * shock_mask
-            self.spread_shocked = self.spread + self.shocks
-
-            # Pre-compute features
-            self.zscores = (self.spread_shocked - self.spread_shocked.rolling(self.lookback).mean()) / \
-                          self.spread_shocked.rolling(self.lookback).std()
-            self.vols = self.spread_shocked.rolling(21).std()
-            self.rx = self.align.iloc[:, 0].pct_change()
-            self.ry = self.align.iloc[:, 1].pct_change()
-            self.corrs = self.rx.rolling(21).corr(self.ry)
-
-            self.zscores_np = np.nan_to_num(self.zscores.to_numpy())
-            self.vols_np = np.nan_to_num(self.vols.to_numpy())
-            self.corrs_np = np.nan_to_num(self.corrs.to_numpy())
-            self.spread_np = self.spread_shocked.to_numpy()
-
-        def _compute_features(self, idx: int):
-            from utils import half_life
-            from config import CONFIG
-            
-            z = self.zscores_np[idx]
-            vol = self.vols_np[idx]
-            corr = self.corrs_np[idx]
-            
-            # Use lookback window for half-life calculation
-            start = max(0, idx - self.lookback)
-            hl = half_life(self.spread_np[start:idx]) if idx > start else CONFIG["half_life_max"]
-            
-            return np.array([z, vol, hl, corr], dtype=np.float32)
-
-        def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-            super().reset(seed=seed)
-            
-            # In test mode, start from beginning; in training mode, start after lookback
-            self.ptr = 0 if self.test_mode else self.lookback
-            
-            self.position = 0
-            self.portfolio_value = self.initial_capital
-            self.cum_returns = 0.0
-            self.peak = self.initial_capital
-            self.max_drawdown = 0.0
-            self.trades = []
-            
-            obs = self._compute_features(self.ptr)
-            return obs, {}
-
-       def step(self, action: int):
-            from config import CONFIG
-        
-            # convert action (0,1,2) into target position (-1,0,+1)
-            target_pos = action - 1 
-        
-            next_ptr = self.ptr + 1
-            terminated = next_ptr >= len(self.spread_np)
-            truncated = False
-        
-            # next observation
-            obs_next = self._compute_features(self.ptr)
-        
-            # if episode ends here, return terminal obs
-            if terminated:
-                return obs_next, 0.0, terminated, truncated, {
-                    "cum_reward": self.cum_returns,
-                    "max_drawdown": self.max_drawdown,
-                    "position": self.position,
-                    "pnl": 0.0,
-                    "return": 0.0
-                }
-        
-            # --------------------------
-            # 1. compute spread change
-            # --------------------------
-            spread_now = self.spread_np[self.ptr]
-            spread_next = self.spread_np[next_ptr]
-            spread_change = spread_next - spread_now
-        
-            # --------------------------
-            # 2. compute PnL from position
-            # --------------------------
-            pnl = -self.position * spread_change  # correct pairs trading pnl
-        
-            # --------------------------
-            # 3. apply transaction costs
-            # --------------------------
-            if target_pos != self.position:
-                pnl -= CONFIG["transaction_cost"]
-        
-            # --------------------------
-            # 4. update portfolio value
-            # --------------------------
-            old_value = self.portfolio_value
-            self.portfolio_value += pnl
-        
-            # --------------------------
-            # 5. compute true financial return
-            # --------------------------
-            daily_return = pnl / max(1e-8, old_value)
-        
-            # --------------------------
-            # 6. update risk stats
-            # --------------------------
-            self.cum_returns = self.portfolio_value - self.initial_capital
-        
-            self.peak = max(self.peak, self.portfolio_value)
-            self.max_drawdown = max(
-                self.max_drawdown,
-                (self.peak - self.portfolio_value) / self.peak
-            )
-        
-            # --------------------------
-            # 7. update position & pointer
-            # --------------------------
-            self.position = target_pos
-            self.ptr = next_ptr
-        
-            self.trades.append(daily_return)
-        
-            return obs_next, float(daily_return), terminated, truncated, {
-                "pnl": float(pnl),
-                "return": float(daily_return),
-                "cum_reward": self.cum_returns,
-                "max_drawdown": self.max_drawdown,
-                "position": self.position
-            }
-
-
+  def step(self, action: int):
+  
+      # Convert action (0,1,2) into target position (-1,0,+1)
+      target_pos = action - 1 
+      next_ptr = self.ptr + 1
+      terminated = next_ptr >= len(self.spread_np)
+      truncated = False
+  
+      # Next observation
+      obs_next = self._compute_features(self.ptr)
+  
+      # If episode ends here, return terminal obs
+      if terminated:
+          return obs_next, 0.0, terminated, truncated, {
+              "cum_reward": self.cum_returns,
+              "max_drawdown": self.max_drawdown,
+              "position": self.position,
+              "pnl": 0.0,
+              "return": 0.0
+          }
+  
+      # Compute spread change
+      spread_now = self.spread_np[self.ptr]
+      spread_next = self.spread_np[next_ptr]
+      spread_change = spread_next - spread_now
+  
+      # Compute PnL from position
+      pnl = -self.position * spread_change
+  
+      # Apply transaction costs
+      if target_pos != self.position:
+          pnl -= CONFIG["transaction_cost"]
+  
+      # Update portfolio value
+      old_value = self.portfolio_value
+      self.portfolio_value += pnl
+  
+      # Compute true financial return
+      daily_return = pnl / max(1e-8, old_value)
+  
+      # Update risk stats
+      self.cum_returns = self.portfolio_value - self.initial_capital
+      self.peak = max(self.peak, self.portfolio_value)
+      self.max_drawdown = max(
+          self.max_drawdown,
+          (self.peak - self.portfolio_value) / self.peak
+      )
+  
+      # Update position & pointer
+      self.position = target_pos
+      self.ptr = next_ptr
+      self.trades.append(daily_return)
+  
+      return obs_next, float(daily_return), terminated, truncated, {
+          "pnl": float(pnl),
+          "return": float(daily_return),
+          "cum_reward": self.cum_returns,
+          "max_drawdown": self.max_drawdown,
+          "position": self.position
+      }
 
 @dataclass
 class OperatorAgent:
     """
     Agent responsible for executing trades using RL-optimized strategies.
-    
+
     Features:
     - Trains PPO models on pairs
     - Evaluates trading performance
@@ -229,44 +173,25 @@ class OperatorAgent:
     storage_dir: str = "models/"
 
     def __post_init__(self):
+
         os.makedirs(self.storage_dir, exist_ok=True)
         self.active = True
         self.transaction_cost = CONFIG["transaction_cost"]
 
-        # NEW: Add tracking for supervisor monitoring
         self.current_step = 0  # Track current step in holdout execution
         self.traces_buffer = []  # Store all traces for supervisor access
-        self.max_buffer_size = 10000  # Limit buffer size to prevent memory issues
+        self.max_buffer_size = 1000  # Limit buffer size to prevent memory issues
 
     def get_current_step(self):
-        """
-        Return the current step count for supervisor monitoring.
-        
-        Returns:
-            int: Current execution step
-        """
+
         return self.current_step
 
     def get_traces_since_step(self, start_step):
-        """
-        Get all traces since a specific step for supervisor evaluation.
-        
-        Args:
-            start_step: Starting step number (inclusive)
-            
-        Returns:
-            List of trace dictionaries since start_step
-        """
+
         return [t for t in self.traces_buffer if t.get('step', 0) >= start_step]
 
     def add_trace(self, trace):
-        """
-        Add a trace to the buffer for supervisor monitoring.
-        Maintains buffer size limit by removing oldest traces.
-        
-        Args:
-            trace: Dictionary containing trace information
-        """
+
         self.traces_buffer.append(trace)
 
         # Remove oldest traces if buffer exceeds limit
@@ -274,61 +199,38 @@ class OperatorAgent:
             self.traces_buffer = self.traces_buffer[-self.max_buffer_size:]
 
     def clear_traces_before_step(self, step):
-        """
-        Remove traces older than a specific step to manage memory.
-        
-        Args:
-            step: Keep traces from this step onwards
-        """
+
         self.traces_buffer = [t for t in self.traces_buffer if t.get('step', 0) >= step]
 
     def apply_command(self, command):
-        """Apply runtime commands from supervisor."""
+
         cmd_type = command.get("command")
-        if cmd_type == "adjust_transaction_cost":
-            old = self.transaction_cost
-            self.transaction_cost = command.get("new_value", old)
-            CONFIG["transaction_cost"] = self.transaction_cost
-            self.logger.log("operator", "adjust_transaction_cost", {
-                "old_value": old, "new_value": self.transaction_cost
-            })
-        elif cmd_type == "pause":
+
+        # if cmd_type == "adjust_transaction_cost":
+        #     old = self.transaction_cost
+        #     self.transaction_cost = command.get("new_value", old)
+        #     CONFIG["transaction_cost"] = self.transaction_cost
+        #     self.logger.log("operator", "adjust_transaction_cost", {
+        #         "old_value": old, "new_value": self.transaction_cost
+        #     })
+
+        if cmd_type == "pause":
             self.active = False
             self.logger.log("operator", "paused", {})
+
         elif cmd_type == "resume":
             self.active = True
             self.logger.log("operator", "resumed", {})
 
     def load_model(self, model_path):
-        """
-        Load a trained PPO model from disk.
-        
-        Args:
-            model_path: Path to the saved model
-            
-        Returns:
-            Loaded PPO model
-        """
-        if not SB3_AVAILABLE:
-            raise ImportError("stable-baselines3 not installed")
-
         return PPO.load(model_path)
 
+    # Individual pair training
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = 252, timesteps: int = None):
-        """
-        Train a PPO model on a stock pair.
-        Returns performance metrics.
-        """
+                      lookback: int = None, timesteps: int = None):
+
         if not self.active:
             return None
-
-        if not GYMNASIUM_AVAILABLE or not SB3_AVAILABLE:
-            print("Warning: Cannot train - gymnasium or stable-baselines3 not installed")
-            return None
-
-        if timesteps is None:
-            timesteps = CONFIG["rl_timesteps"]
 
         series_x = prices[x]
         series_y = prices[y]
@@ -342,6 +244,7 @@ class OperatorAgent:
         obs, _ = env.reset()
         done = False
         daily_returns = []
+
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, _ = env.step(action)
@@ -374,16 +277,9 @@ class OperatorAgent:
 
         return trace
 
-
-def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
+    # Parallel pair training
+    def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
                             pairs: list, max_workers: int = 2):
-    """
-    Train operator on multiple pairs in parallel.
-    Returns list of performance traces.
-    """
-    if not PARALLEL_TRAINING_AVAILABLE:
-        print("Warning: Parallel training not available - will train sequentially")
-        return [operator.train_on_pair(prices, x, y) for x, y in pairs if operator.train_on_pair(prices, x, y)]
 
     all_traces = []
 
