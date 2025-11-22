@@ -33,11 +33,21 @@ class PairTradingEnv(gym.Env):
     Fixed PairTradingEnv with numerical stability improvements
     """
 
-    def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
-                shock_prob: float = 0.01, shock_scale: float = 0.4,
-                initial_capital: float = 100000, test_mode: bool = False):
+    def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
+                shock_prob: float = None, shock_scale: float = None,
+                initial_capital: float = None, test_mode: bool = False):
     
         super().__init__()
+
+        # Use CONFIG defaults if not provided
+        if lookback is None:
+            lookback = CONFIG.get("rl_lookback", 30)
+        if shock_prob is None:
+            shock_prob = CONFIG.get("shock_prob", 0.01)
+        if shock_scale is None:
+            shock_scale = CONFIG.get("shock_scale", 0.4)
+        if initial_capital is None:
+            initial_capital = CONFIG.get("initial_capital", 10000)
 
         self.align = pd.concat([series_x, series_y], axis=1).dropna()
         self.lookback = lookback
@@ -239,15 +249,25 @@ class OperatorAgent:
 
     # Individual pair training
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = 30, timesteps: int = 100000,
-                      shock_prob: float = 0.01, shock_scale: float = 0.4):
+                      lookback: int = None, timesteps: int = None,
+                      shock_prob: float = None, shock_scale: float = None):
 
         if not self.active:
             return None
 
+        # Use CONFIG defaults if not provided
+        if lookback is None:
+            lookback = CONFIG.get("rl_lookback", 30)
+        if timesteps is None:
+            timesteps = CONFIG.get("rl_timesteps", 20000)
+        if shock_prob is None:
+            shock_prob = CONFIG.get("shock_prob", 0.01)
+        if shock_scale is None:
+            shock_scale = CONFIG.get("shock_scale", 0.4)
+
         series_x = prices[x]
         series_y = prices[y]
-        env = PairTradingEnv(series_x, series_y, lookback)
+        env = PairTradingEnv(series_x, series_y, lookback, shock_prob, shock_scale)
         model = PPO(CONFIG["rl_policy"], env, verbose=0, device="cpu")
         model.learn(total_timesteps=timesteps)
 
@@ -264,7 +284,7 @@ class OperatorAgent:
             daily_returns.append(reward)
 
         rets = np.array(daily_returns)
-        rf_daily = 0.02 / 252
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess_rets = rets - rf_daily
 
         sharpe = np.mean(excess_rets) / (np.std(excess_rets, ddof=1) + 1e-8) * np.sqrt(252)
@@ -293,14 +313,17 @@ class OperatorAgent:
 
 # Parallel pair training
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
-                        pairs: list, max_workers: int = 2):
+                        pairs: list, max_workers: int = None):
+
+    if max_workers is None:
+        max_workers = CONFIG.get("max_workers", 2)
 
     all_traces = []
 
     def train(pair):
         x, y = pair
         print(f"\n🔹 Training Operator on pair ({x}, {y})")
-        return operator.train_on_pair(prices, x, y, 30, 100000)
+        return operator.train_on_pair(prices, x, y)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
@@ -361,10 +384,10 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
         env = PairTradingEnv(
             series_x=aligned.iloc[:, 0],
             series_y=aligned.iloc[:, 1],
-            lookback=30,
+            lookback=CONFIG.get("rl_lookback", 30),
             shock_prob=0.0,  # No random shocks in evaluation
             shock_scale=0.0,
-            initial_capital=10000,
+            initial_capital=CONFIG.get("initial_capital", 10000),
             test_mode=True  # Starts from beginning of data
         )
 
@@ -445,7 +468,11 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
     return operator.traces_buffer
 
 
-def calculate_sharpe(traces, risk_free_rate=0.04):
+def calculate_sharpe(traces, risk_free_rate=None):
+    """Calculate Sharpe ratio from episode traces."""
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    
     returns = [t['return'] for t in traces]
     if len(returns) == 0:
         return 0.0
@@ -462,7 +489,11 @@ def calculate_sharpe(traces, risk_free_rate=0.04):
     return (mean_excess / std_excess) * (252**0.5)
 
 
-def calculate_sortino(traces, risk_free_rate=0.04):
+def calculate_sortino(traces, risk_free_rate=None):
+    """Calculate Sortino ratio from episode traces."""
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    
     returns = [t['return'] for t in traces]
     if len(returns) == 0:
         return 0.0
