@@ -26,135 +26,173 @@ from config import CONFIG
 from utils import half_life, compute_spread
 from agents.message_bus import MessageBus, JSONLogger
 
+"""
+Fixed PairTradingEnv with numerical stability improvements
+"""
+
+import numpy as np
+import pandas as pd
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Optional
+
 class PairTradingEnv(gym.Env):
 
-  def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
-              shock_prob: float = 0.01, shock_scale: float = 0.2,
-              initial_capital: float = 10000, test_mode: bool = False):
-  
-      super().__init__()
+    def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
+                shock_prob: float = 0.01, shock_scale: float = 0.2,
+                initial_capital: float = 1000, test_mode: bool = False):
+    
+        super().__init__()
 
-      self.align = pd.concat([series_x, series_y], axis=1).dropna()
-      self.lookback = lookback
-      self.test_mode = test_mode
-      self.ptr = 0 if test_mode else lookback # In test mode, start from beginning; in training mode, start after lookback
-      self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
-      self.action_space = spaces.Discrete(3) # Buy, neutral or sell
-      self.position = 0
-      self.initial_capital = initial_capital
-      self.portfolio_value = initial_capital
-      self.cum_returns = 0.0
-      self.peak = initial_capital
-      self.max_drawdown = 0.0
-      self.trades = []
-      self.shock_prob = shock_prob if not test_mode else 0.0  # No shocks in test mode
-      self.shock_scale = shock_scale if not test_mode else 0.0
-      self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
-      n = len(self.spread)
-      shock_mask = np.random.rand(n) < self.shock_prob
-      self.shocks = np.random.randn(n) * self.shock_scale * self.spread.std() * shock_mask
-      self.spread_shocked = self.spread + self.shocks
+        self.align = pd.concat([series_x, series_y], axis=1).dropna()
+        self.lookback = lookback
+        self.test_mode = test_mode
+        self.ptr = 0 if test_mode else lookback
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+        self.action_space = spaces.Discrete(3)
+        self.position = 0
+        self.initial_capital = initial_capital
+        self.portfolio_value = initial_capital
+        self.cum_returns = 0.0
+        self.peak = initial_capital
+        self.max_drawdown = 0.0
+        self.trades = []
+        self.shock_prob = shock_prob if not test_mode else 0.0
+        self.shock_scale = shock_scale if not test_mode else 0.0
+        
+        # Compute spread
+        from utils import compute_spread
+        self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
+        n = len(self.spread)
+        shock_mask = np.random.rand(n) < self.shock_prob
+        self.shocks = np.random.randn(n) * self.shock_scale * self.spread.std() * shock_mask
+        self.spread_shocked = self.spread + self.shocks
 
-      # Pre-compute features
-      self.zscores = (self.spread_shocked - self.spread_shocked.rolling(self.lookback).mean()) / \
-                    self.spread_shocked.rolling(self.lookback).std()
-      self.vols = self.spread_shocked.rolling(15).std()
-      self.rx = self.align.iloc[:, 0].pct_change()
-      self.ry = self.align.iloc[:, 1].pct_change()
-      self.corrs = self.rx.rolling(15).corr(self.ry)
-      self.zscores_np = np.nan_to_num(self.zscores.to_numpy())
-      self.vols_np = np.nan_to_num(self.vols.to_numpy())
-      self.corrs_np = np.nan_to_num(self.corrs.to_numpy())
-      self.spread_np = self.spread_shocked.to_numpy()
+        # Pre-compute features with stability fixes
+        spread_mean = self.spread_shocked.rolling(self.lookback).mean()
+        spread_std = self.spread_shocked.rolling(self.lookback).std()
+        
+        # FIX 1: Add epsilon to prevent division by zero
+        spread_std = spread_std.clip(lower=1e-8)
+        self.zscores = (self.spread_shocked - spread_mean) / spread_std
+        
+        # FIX 2: Clip z-scores to prevent extreme values
+        self.zscores = self.zscores.clip(-5, 5)
+        
+        self.vols = self.spread_shocked.rolling(15).std().clip(lower=1e-8)
+        self.rx = self.align.iloc[:, 0].pct_change()
+        self.ry = self.align.iloc[:, 1].pct_change()
+        self.corrs = self.rx.rolling(15).corr(self.ry)
+        
+        # Convert to numpy and handle NaNs
+        self.zscores_np = np.nan_to_num(self.zscores.to_numpy(), nan=0.0, posinf=5.0, neginf=-5.0)
+        self.vols_np = np.nan_to_num(self.vols.to_numpy(), nan=1.0, posinf=1.0, neginf=0.0)
+        self.corrs_np = np.nan_to_num(self.corrs.to_numpy(), nan=0.0, posinf=1.0, neginf=-1.0)
+        self.spread_np = self.spread_shocked.to_numpy()
+        
+        # FIX 3: Normalize volatility for stable features
+        self.vol_mean = np.nanmean(self.vols_np)
+        self.vol_std = np.nanstd(self.vols_np) + 1e-8
 
-  def _compute_features(self, idx: int):
-      
-      z = self.zscores_np[idx]
-      vol = self.vols_np[idx]
-      corr = self.corrs_np[idx]
-      
-      # Use lookback window for half-life calculation
-      start = max(0, idx - self.lookback)
-      hl = half_life(self.spread_np[start:idx]) if idx > start else CONFIG["half_life_max"]
-      
-      return np.array([z, vol, hl, corr], dtype=np.float32)
+    def _compute_features(self, idx: int):
+        
+        z = self.zscores_np[idx]
+        vol = self.vols_np[idx]
+        corr = self.corrs_np[idx]
+        
+        # FIX 4: Normalize volatility feature
+        vol_normalized = (vol - self.vol_mean) / self.vol_std
+        vol_normalized = np.clip(vol_normalized, -5, 5)
+        
+        # Use lookback window for half-life calculation
+        start = max(0, idx - self.lookback)
+        if idx > start:
+            from utils import half_life
+            from config import CONFIG
+            hl = half_life(self.spread_np[start:idx])
+            if np.isnan(hl) or np.isinf(hl):
+                hl = CONFIG.get("half_life_max", 100)
+        else:
+            from config import CONFIG
+            hl = CONFIG.get("half_life_max", 100)
+        
+        # FIX 5: Normalize half-life to [0, 1] range
+        hl_normalized = np.clip(hl / 100.0, 0, 1)
+        
+        features = np.array([z, vol_normalized, hl_normalized, corr], dtype=np.float32)
+        
+        # FIX 6: Final safety check for NaN/Inf
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return features
 
-  def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
 
-      super().reset(seed=seed)
-      
-      # In test mode, start from beginning; in training mode, start after lookback
-      self.ptr = 0 if self.test_mode else self.lookback
-      self.position = 0
-      self.portfolio_value = self.initial_capital
-      self.cum_returns = 0.0
-      self.peak = self.initial_capital
-      self.max_drawdown = 0.0
-      self.trades = []
+        super().reset(seed=seed)
+        self.ptr = 0 if self.test_mode else self.lookback
+        self.position = 0
+        self.portfolio_value = self.initial_capital
+        self.cum_returns = 0.0
+        self.peak = self.initial_capital
+        self.max_drawdown = 0.0
+        self.trades = []
 
-      obs = self._compute_features(self.ptr)
-      return obs, {}
+        obs = self._compute_features(self.ptr)
+        return obs, {}
 
-  def step(self, action: int):
-  
-      # Convert action (0,1,2) into target position (-1,0,+1)
-      target_pos = action - 1 
-      next_ptr = self.ptr + 1
-      terminated = next_ptr >= len(self.spread_np)
-      truncated = False
-  
-      # Next observation
-      obs_next = self._compute_features(self.ptr)
-  
-      # If episode ends here, return terminal obs
-      if terminated:
-          return obs_next, 0.0, terminated, truncated, {
-              "cum_reward": self.cum_returns,
-              "max_drawdown": self.max_drawdown,
-              "position": self.position,
-              "pnl": 0.0,
-              "return": 0.0
-          }
-  
-      # Compute spread change
-      spread_now = self.spread_np[self.ptr]
-      spread_next = self.spread_np[next_ptr]
-      spread_change = spread_next - spread_now
-  
-      # Compute PnL from position
-      pnl = -self.position * spread_change
-  
-      # Apply transaction costs
-      if target_pos != self.position:
-          pnl -= CONFIG["transaction_cost"]
-  
-      # Update portfolio value
-      old_value = self.portfolio_value
-      self.portfolio_value += pnl
-  
-      # Compute true financial return
-      daily_return = pnl / max(1e-8, old_value)
-  
-      # Update risk stats
-      self.cum_returns = self.portfolio_value - self.initial_capital
-      self.peak = max(self.peak, self.portfolio_value)
-      self.max_drawdown = max(
-          self.max_drawdown,
-          (self.peak - self.portfolio_value) / self.peak
-      )
-  
-      # Update position & pointer
-      self.position = target_pos
-      self.ptr = next_ptr
-      self.trades.append(daily_return)
-  
-      return obs_next, float(daily_return), terminated, truncated, {
-          "pnl": float(pnl),
-          "return": float(daily_return),
-          "cum_reward": self.cum_returns,
-          "max_drawdown": self.max_drawdown,
-          "position": self.position
-      }
+    def step(self, action: int):
+    
+        target_pos = action - 1 
+        next_ptr = self.ptr + 1
+        terminated = next_ptr >= len(self.spread_np)
+        truncated = False
+    
+        obs_next = self._compute_features(self.ptr)
+    
+        if terminated:
+            return obs_next, 0.0, terminated, truncated, {
+                "cum_reward": self.cum_returns,
+                "max_drawdown": self.max_drawdown,
+                "position": self.position,
+                "pnl": 0.0,
+                "return": 0.0
+            }
+    
+        spread_now = self.spread_np[self.ptr]
+        spread_next = self.spread_np[next_ptr]
+        spread_change = spread_next - spread_now
+    
+        pnl = -self.position * spread_change
+    
+        from config import CONFIG
+        if target_pos != self.position:
+            pnl -= CONFIG.get("transaction_cost", 0.005)
+    
+        old_value = self.portfolio_value
+        self.portfolio_value += pnl
+    
+        # FIX 7: Clip reward to prevent explosive values
+        daily_return = pnl / max(1e-8, old_value)
+        daily_return = np.clip(daily_return, -0.5, 0.5)  # Cap at ±50% daily return
+    
+        self.cum_returns = self.portfolio_value - self.initial_capital
+        self.peak = max(self.peak, self.portfolio_value)
+        self.max_drawdown = max(
+            self.max_drawdown,
+            (self.peak - self.portfolio_value) / max(self.peak, 1e-8)
+        )
+    
+        self.position = target_pos
+        self.ptr = next_ptr
+        self.trades.append(daily_return)
+    
+        return obs_next, float(daily_return), terminated, truncated, {
+            "pnl": float(pnl),
+            "return": float(daily_return),
+            "cum_reward": self.cum_returns,
+            "max_drawdown": self.max_drawdown,
+            "position": self.position
+        }
 
 @dataclass
 class OperatorAgent:
@@ -210,8 +248,8 @@ class OperatorAgent:
 
     # Individual pair training
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = 30, timesteps: int = 10000,
-                      shock_prob: float = 0.01, shock_scale: float = 0.02):
+                      lookback: int = 30, timesteps: int = 1000,
+                      shock_prob: float = 0.01, shock_scale: float = 0.1):
 
         if not self.active:
             return None
@@ -270,7 +308,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     def train(pair):
         x, y = pair
         print(f"\n🔹 Training Operator on pair ({x}, {y})")
-        return operator.train_on_pair(prices, x, y, 30, 10000)
+        return operator.train_on_pair(prices, x, y, 30, 1000)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
