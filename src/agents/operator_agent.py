@@ -277,9 +277,9 @@ class OperatorAgent:
 
         return trace
 
-    # Parallel pair training
-    def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
-                            pairs: list, max_workers: int = 2):
+# Parallel pair training
+def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
+                        pairs: list, max_workers: int = 2):
 
     all_traces = []
 
