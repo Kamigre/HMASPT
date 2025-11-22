@@ -166,7 +166,7 @@ class PairTradingEnv(gym.Env):
         pnl = -self.position * spread_change
     
         if target_pos != self.position:
-            pnl -= CONFIG.get("transaction_cost", 0.005)
+            pnl -= CONFIG.get("transaction_cost", 0.0005)
     
         old_value = self.portfolio_value
         self.portfolio_value += pnl
