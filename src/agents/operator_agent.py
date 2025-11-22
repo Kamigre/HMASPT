@@ -28,7 +28,7 @@ from agents.message_bus import MessageBus, JSONLogger
 
 class PairTradingEnv(gym.Env):
 
-  def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
+  def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
               shock_prob: float = 0.01, shock_scale: float = 0.2,
               initial_capital: float = 10000, test_mode: bool = False):
   
@@ -210,7 +210,8 @@ class OperatorAgent:
 
     # Individual pair training
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = None, timesteps: int = None):
+                      lookback: int = 30, timesteps: int = 10000,
+                      shock_prob: float = 0.01, shock_scale: float = 0.02):
 
         if not self.active:
             return None
@@ -269,7 +270,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     def train(pair):
         x, y = pair
         print(f"\n🔹 Training Operator on pair ({x}, {y})")
-        return operator.train_on_pair(prices, x, y, lookback=30, timesteps=10000)
+        return operator.train_on_pair(prices, x, y, 30, 10000)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
