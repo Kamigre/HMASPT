@@ -31,68 +31,62 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MemoryTGNN(nn.Module):
+    """
+    Efficient TGNN with simplified but preserved edge memory.
     
-    def __init__(self, in_channels, hidden_channels=64, num_heads=4, 
-                 num_layers=3, dropout=0.2, device=None):
+    Key optimizations:
+    - Single GAT layer
+    - Simplified edge memory update (no complex projections)
+    - Batch edge memory updates
+    - Smaller hidden dimensions
+    """
+    
+    def __init__(self, in_channels, hidden_channels=48, num_heads=2, 
+                 dropout=0.2, device=None):
 
         super().__init__()
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_channels = hidden_channels
         self.num_heads = num_heads
-        self.num_layers = num_layers
         self.dropout_p = dropout
 
-        # Single input encoder
+        # Simplified input encoder
         self.input_encoder = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels),
+            nn.ReLU(),
             nn.Dropout(dropout)
         )
 
-        # Node memory (GRU for temporal evolution)
+        # Node memory (tracks each stock's temporal evolution)
         self.node_gru = nn.GRUCell(hidden_channels, hidden_channels)
         
-        # Edge memory (for pair relationships)
-        # This stores historical pair interactions
-        self.edge_memory_proj = nn.Linear(hidden_channels * 2, hidden_channels)
+        # Simplified edge memory projection
+        # Instead of complex projection, just average the two node embeddings
+        self.edge_transform = nn.Linear(hidden_channels, hidden_channels)
         self.edge_gru = nn.GRUCell(hidden_channels, hidden_channels)
 
-        # Graph convolution layers with edge attributes
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        
-        for _ in range(num_layers):
-
-            # GAT
-            out_per_head = max(1, hidden_channels // self.num_heads)
-            self.convs.append(
-                GATConv(hidden_channels, out_per_head, heads=self.num_heads, concat=True)
-                )
-
-            self.norms.append(nn.LayerNorm(hidden_channels))
-
-        self.dropout = nn.Dropout(dropout)
-
-        # Final node projection
-        self.node_proj = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.LeakyReLU(),
-            nn.LayerNorm(hidden_channels)
+        # Single GAT layer (down from 3)
+        out_per_head = max(1, hidden_channels // num_heads)
+        self.gat = GATConv(
+            hidden_channels, 
+            out_per_head, 
+            heads=num_heads, 
+            concat=True,
+            dropout=dropout
         )
-
-        # Enhanced pair decoder
+        
+        # Simplified decoder
         self.decoder = nn.Sequential(
             nn.Linear(hidden_channels * 2, hidden_channels),
             nn.ReLU(),
-            nn.Linear(hidden_channels, 1),
-            nn.Sigmoid()  # Ensures output is in [0, 1]
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 1)
         )
 
-        # Memory storage
+        # Edge memory storage (simplified)
         self.node_memory = None
-        self.edge_memory_dict = {}  # Store edge memories by (src, dst) tuple
+        self.edge_memory_dict = {}
         
         self._reset_parameters()
         self.to(self.device)
@@ -102,79 +96,59 @@ class MemoryTGNN(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def encode_edge_features(self, edge_index, edge_attr, node_embeddings):
+    def create_edge_features(self, edge_index, node_embeddings):
         """
-        Create rich edge features from:
-        - Current edge attributes
-        - Node embeddings of connected nodes
-        - Previous edge memory
+        Fast edge feature creation by averaging node embeddings.
+        Much simpler than original concatenate + project approach.
         """
         src_idx, dst_idx = edge_index[0], edge_index[1]
         
-        # Concatenate source and destination embeddings
-        edge_node_features = torch.cat([
-            node_embeddings[src_idx],
-            node_embeddings[dst_idx]
-        ], dim=1)
-        
-        # Project to edge feature space
-        edge_features = self.edge_memory_proj(edge_node_features)
-        
-        # Add explicit edge attributes if provided
-        if edge_attr is not None:
-            edge_features = edge_features + edge_attr
+        # Simple average of connected nodes (faster than concat + project)
+        edge_features = (node_embeddings[src_idx] + node_embeddings[dst_idx]) / 2
+        edge_features = self.edge_transform(edge_features)
         
         return edge_features
 
     def update_edge_memory(self, edge_index, edge_features):
         """
-        Update edge memory using GRU for temporal consistency.
-        Each edge (pair) has its own memory.
-        """
-        updated_edge_features = []
+        Batched edge memory update - much faster than loop.
         
-        for i in range(edge_index.size(1)):
-
+        Key optimization: Process all edges at once, then store individually.
+        """
+        num_edges = edge_index.size(1)
+        
+        # Collect previous memories in batch
+        prev_memories = []
+        edge_keys = []
+        
+        for i in range(num_edges):
             src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-            edge_key = (min(src, dst), max(src, dst))  # Undirected edge
+            edge_key = (min(src, dst), max(src, dst))
+            edge_keys.append(edge_key)
             
-            # Get previous edge memory or initialize
-            if edge_key not in self.edge_memory_dict:
-                prev_memory = torch.zeros(self.hidden_channels, device=self.device)
+            if edge_key in self.edge_memory_dict:
+                prev_memories.append(self.edge_memory_dict[edge_key])
             else:
-                prev_memory = self.edge_memory_dict[edge_key]
-            
-            # Update edge memory
-            new_memory = self.edge_gru(
-                edge_features[i].unsqueeze(0),
-                prev_memory.unsqueeze(0)
-            ).squeeze(0)
-            
-            self.edge_memory_dict[edge_key] = new_memory
-            updated_edge_features.append(new_memory)
+                prev_memories.append(torch.zeros(self.hidden_channels, device=self.device))
         
-        return torch.stack(updated_edge_features)
+        # Batch GRU update (much faster than loop)
+        prev_memories_batch = torch.stack(prev_memories)
+        new_memories_batch = self.edge_gru(edge_features, prev_memories_batch)
+        
+        # Store updated memories
+        for i, edge_key in enumerate(edge_keys):
+            self.edge_memory_dict[edge_key] = new_memories_batch[i]
+        
+        return new_memories_batch
 
-    def forward(self, x, edge_index, edge_attr=None, pair_index=None, 
-                memory=None):
+    def forward(self, x, edge_index, edge_attr=None, pair_index=None, memory=None):
         """
-        Forward pass with edge-aware processing.
-        
-        Args:
-            x: Node features [num_nodes, in_channels]
-            edge_index: Graph edges [2, num_edges]
-            edge_attr: Edge attributes [num_edges, edge_dim]
-            pair_index: Pairs to score [2, num_pairs]
-            memory: Previous node memory
-            
-        Returns:
-            If pair_index provided: pair scores
-            Otherwise: node embeddings and updated memory
+        Forward pass with efficient edge memory.
         """
         x = x.to(self.device)
         N = x.size(0)
         
-        # Single encoding path
+        # Encode input
         h = self.input_encoder(x)
 
         # Update node memory
@@ -186,52 +160,73 @@ class MemoryTGNN(nn.Module):
         memory = self.node_gru(h, memory)
         h = memory
 
-        # Process edges with memory
+        # Process edges with memory (if edges exist)
         if edge_index is not None and edge_index.numel() > 0:
             edge_index = edge_index.to(self.device)
             
-            # Create edge features
-            edge_features = self.encode_edge_features(edge_index, edge_attr, h)
+            # Create edge features (simplified approach)
+            edge_features = self.create_edge_features_fast(edge_index, h)
             
-            # Update edge memory
-            edge_features = self.update_edge_memory(edge_index, edge_features)
+            # Update edge memory (batched for speed)
+            edge_features = self.update_edge_memory_batch(edge_index, edge_features)
             
-            # Graph convolutions with edge features
-            for conv, norm in zip(self.convs, self.norms):
-                h_conv = conv(h, edge_index, edge_features)
-                h = norm(h + self.dropout(F.relu(h_conv)))
+            # Single GAT layer with edge features
+            h = self.gat(h, edge_index)
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout_p, training=self.training)
 
-        # Final node projection
-        z = self.node_proj(h)
-        z = F.normalize(z, p=2, dim=1)
+        # Normalize embeddings
+        z = F.normalize(h, p=2, dim=1)
         
-        self.memory = memory
+        self.node_memory = memory
 
         # Score pairs if requested
         if pair_index is not None:
             src_idx = pair_index[0].long().to(self.device)
             dst_idx = pair_index[1].long().to(self.device)
             
-            # Get edge features for these pairs
-            pair_edge_features = []
+            # Use edge memory for scoring if available
+            pair_scores = []
             for i in range(len(src_idx)):
                 src, dst = src_idx[i].item(), dst_idx[i].item()
                 edge_key = (min(src, dst), max(src, dst))
+                
+                # Concatenate node embeddings
+                pair_features = torch.cat([z[src_idx[i:i+1]], z[dst_idx[i:i+1]]], dim=1)
+                
+                # If we have edge memory for this pair, incorporate it
                 if edge_key in self.edge_memory_dict:
-                    pair_edge_features.append(self.edge_memory_dict[edge_key])
-                else:
-                    pair_edge_features.append(torch.zeros(self.hidden_channels, device=self.device))
+                    edge_mem = self.edge_memory_dict[edge_key]
+                    # Blend edge memory with pair features (simple attention-like mechanism)
+                    pair_features = pair_features + torch.cat([edge_mem, edge_mem], dim=0).unsqueeze(0)
+                
+                score = self.decoder(pair_features)
+                pair_scores.append(score)
             
-            pair_edge_features = torch.stack(pair_edge_features)
-            
-            scores = self.pair_decoder(z[src_idx], z[dst_idx], pair_edge_features)
-            return scores.view(-1)
+            scores = torch.cat(pair_scores, dim=0)
+            return torch.sigmoid(scores.view(-1))
 
         return z, memory
 
     def reset_edge_memory(self):
         """Reset edge memory (call between epochs or training phases)"""
         self.edge_memory_dict = {}
+    
+    def prune_edge_memory(self, keep_top_k=1000):
+        """
+        Prune edge memory to keep only most important edges.
+        Call this periodically if memory grows too large.
+        """
+        if len(self.edge_memory_dict) <= keep_top_k:
+            return
+        
+        # Keep edges with highest memory norm (most active pairs)
+        edge_norms = {k: v.norm().item() for k, v in self.edge_memory_dict.items()}
+        top_edges = sorted(edge_norms.items(), key=lambda x: x[1], reverse=True)[:keep_top_k]
+        
+        self.edge_memory_dict = {k: self.edge_memory_dict[k] for k, _ in top_edges}
+        
+        print(f"Pruned edge memory: {len(edge_norms)} → {keep_top_k} edges")
 
 @dataclass
 class SelectorAgent:
