@@ -131,45 +131,85 @@ if GYMNASIUM_AVAILABLE:
             obs = self._compute_features(self.ptr)
             return obs, {}
 
-        def step(self, action: int):
+       def step(self, action: int):
             from config import CONFIG
-            
-            target_pos = action - 1
+        
+            # convert action (0,1,2) into target position (-1,0,+1)
+            target_pos = action - 1 
+        
             next_ptr = self.ptr + 1
             terminated = next_ptr >= len(self.spread_np)
             truncated = False
-
+        
+            # next observation
             obs_next = self._compute_features(self.ptr)
-
+        
+            # if episode ends here, return terminal obs
             if terminated:
                 return obs_next, 0.0, terminated, truncated, {
                     "cum_reward": self.cum_returns,
                     "max_drawdown": self.max_drawdown,
-                    "position": self.position
+                    "position": self.position,
+                    "pnl": 0.0,
+                    "return": 0.0
                 }
-
-            ret = self.spread_np[next_ptr] - self.spread_np[self.ptr]
-            reward = -ret * target_pos / (self.align.iloc[self.lookback, 0])
-
+        
+            # --------------------------
+            # 1. compute spread change
+            # --------------------------
+            spread_now = self.spread_np[self.ptr]
+            spread_next = self.spread_np[next_ptr]
+            spread_change = spread_next - spread_now
+        
+            # --------------------------
+            # 2. compute PnL from position
+            # --------------------------
+            pnl = -self.position * spread_change  # correct pairs trading pnl
+        
+            # --------------------------
+            # 3. apply transaction costs
+            # --------------------------
             if target_pos != self.position:
-                reward -= CONFIG["transaction_cost"] + 0.002
-
-            daily_return = reward / max(1e-8, self.portfolio_value)
-            self.portfolio_value *= (1 + daily_return)
+                pnl -= CONFIG["transaction_cost"]
+        
+            # --------------------------
+            # 4. update portfolio value
+            # --------------------------
+            old_value = self.portfolio_value
+            self.portfolio_value += pnl
+        
+            # --------------------------
+            # 5. compute true financial return
+            # --------------------------
+            daily_return = pnl / max(1e-8, old_value)
+        
+            # --------------------------
+            # 6. update risk stats
+            # --------------------------
             self.cum_returns = self.portfolio_value - self.initial_capital
+        
             self.peak = max(self.peak, self.portfolio_value)
-            self.max_drawdown = max(self.max_drawdown, (self.peak - self.portfolio_value) / self.peak)
-
+            self.max_drawdown = max(
+                self.max_drawdown,
+                (self.peak - self.portfolio_value) / self.peak
+            )
+        
+            # --------------------------
+            # 7. update position & pointer
+            # --------------------------
             self.position = target_pos
             self.ptr = next_ptr
+        
             self.trades.append(daily_return)
-
+        
             return obs_next, float(daily_return), terminated, truncated, {
-                "pnl": daily_return,
+                "pnl": float(pnl),
+                "return": float(daily_return),
                 "cum_reward": self.cum_returns,
                 "max_drawdown": self.max_drawdown,
                 "position": self.position
             }
+
 
 
 @dataclass
