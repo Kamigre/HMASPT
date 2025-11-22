@@ -5,6 +5,7 @@ Requires: gymnasium, stable-baselines3 (optional)
 
 import os
 import json
+import time
 import datetime
 from dataclasses import dataclass
 from typing import Optional
@@ -26,17 +27,11 @@ from config import CONFIG
 from utils import half_life, compute_spread
 from agents.message_bus import MessageBus, JSONLogger
 
-"""
-Fixed PairTradingEnv with numerical stability improvements
-"""
-
-import numpy as np
-import pandas as pd
-import gymnasium as gym
-from gymnasium import spaces
-from typing import Optional
 
 class PairTradingEnv(gym.Env):
+    """
+    Fixed PairTradingEnv with numerical stability improvements
+    """
 
     def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = 30,
                 shock_prob: float = 0.01, shock_scale: float = 0.4,
@@ -61,7 +56,6 @@ class PairTradingEnv(gym.Env):
         self.shock_scale = shock_scale if not test_mode else 0.0
         
         # Compute spread
-        from utils import compute_spread
         self.spread = compute_spread(self.align.iloc[:, 0], self.align.iloc[:, 1])
         n = len(self.spread)
         shock_mask = np.random.rand(n) < self.shock_prob
@@ -107,13 +101,10 @@ class PairTradingEnv(gym.Env):
         # Use lookback window for half-life calculation
         start = max(0, idx - self.lookback)
         if idx > start:
-            from utils import half_life
-            from config import CONFIG
             hl = half_life(self.spread_np[start:idx])
             if np.isnan(hl) or np.isinf(hl):
                 hl = CONFIG.get("half_life_max", 100)
         else:
-            from config import CONFIG
             hl = CONFIG.get("half_life_max", 100)
         
         # FIX 5: Normalize half-life to [0, 1] range
@@ -164,7 +155,6 @@ class PairTradingEnv(gym.Env):
     
         pnl = -self.position * spread_change
     
-        from config import CONFIG
         if target_pos != self.position:
             pnl -= CONFIG.get("transaction_cost", 0.005)
     
@@ -193,6 +183,7 @@ class PairTradingEnv(gym.Env):
             "max_drawdown": self.max_drawdown,
             "position": self.position
         }
+
 
 @dataclass
 class OperatorAgent:
@@ -299,6 +290,7 @@ class OperatorAgent:
 
         return trace
 
+
 # Parallel pair training
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
                         pairs: list, max_workers: int = 2):
@@ -324,3 +316,168 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     operator.logger.log("operator", "batch_training_complete", {"n_pairs": len(all_traces)})
     print("\n✅ All traces saved successfully.")
     return all_traces
+
+
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_every_n_days=15):
+
+    # Initialize operator state
+    operator.traces_buffer = []
+    operator.current_step = 0
+    operator.evaluation_in_progress = False
+
+    global_step = 0
+
+    for pair in pairs:
+        print(f"\n{'='*70}")
+        print(f"Running pair: {pair[0]} - {pair[1]}")
+        print(f"{'='*70}")
+
+        # Validate pair exists in holdout data
+        if pair[0] not in holdout_prices.columns or pair[1] not in holdout_prices.columns:
+            print(f"⚠️ Warning: Tickers {pair} not found in holdout data - skipping")
+            continue
+
+        # Prepare aligned time series
+        series_x = holdout_prices[pair[0]].dropna()
+        series_y = holdout_prices[pair[1]].dropna()
+        aligned = pd.concat([series_x, series_y], axis=1).dropna()
+
+        print(f"  Data: {aligned.shape[0]} days")
+
+        if len(aligned) < 2:
+            print(f"⚠️ Insufficient data ({len(aligned)} days) - skipping pair")
+            continue
+
+        # Load trained model for this pair
+        model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
+        if not os.path.exists(model_path):
+            print(f"⚠️ Model not found at {model_path} - skipping pair")
+            continue
+
+        model = operator.load_model(model_path)
+        print(f"  ✓ Model loaded from {model_path}")
+
+        # Create test environment (no shocks, test_mode=True)
+        env = PairTradingEnv(
+            series_x=aligned.iloc[:, 0],
+            series_y=aligned.iloc[:, 1],
+            lookback=30,
+            shock_prob=0.0,  # No random shocks in evaluation
+            shock_scale=0.0,
+            initial_capital=10000,
+            test_mode=True  # Starts from beginning of data
+        )
+
+        # Execute trading episode
+        episode_traces = []
+        local_step = 0
+        obs, info = env.reset()
+        terminated = False
+        truncated = False
+
+        print(f"  Trading through {len(aligned)} days...")
+
+        while not (terminated or truncated):
+            # Get action from trained model
+            action, _ = model.predict(obs, deterministic=True)
+            
+            # Execute action in environment
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            # Record trace for this step
+            trace = {
+                "pair": f"{pair[0]}-{pair[1]}",
+                "step": global_step,
+                "local_step": local_step,
+                "reward": float(reward),
+                "pnl": float(info.get("pnl", 0.0)),
+                "return": float(info.get("return", 0.0)),
+                "cum_reward": float(info.get("cum_reward", 0)),
+                "position": float(info.get("position", 0)),
+                "max_drawdown": float(info.get("max_drawdown", 0))
+            }
+
+            # Store trace in multiple places
+            episode_traces.append(trace)
+            operator.add_trace(trace)  # Uses the add_trace method for buffer management
+            operator.logger.log("operator", "holdout_step", trace)
+
+            local_step += 1
+            global_step += 1
+            operator.current_step = global_step
+
+            # Optional: Add supervisor check at intervals
+            if check_every_n_days > 0 and local_step % check_every_n_days == 0:
+                # Supervisor could analyze recent traces and send commands
+                # Example: supervisor.evaluate_operator_performance(operator)
+                pass
+
+            # Small delay for visualization/logging (remove for production)
+            time.sleep(0.05)
+
+        # Episode summary
+        print(f"  ✓ Complete: {len(episode_traces)} steps")
+        print(f"  Final cumulative return: {episode_traces[-1]['cum_reward']:.4f}")
+        print(f"  Final P&L: {sum(t['pnl'] for t in episode_traces):.4f}")
+        print(f"  Max drawdown: {max(t['max_drawdown'] for t in episode_traces):.4f}")
+
+        # Calculate and log performance metrics
+        sharpe = calculate_sharpe(episode_traces)
+        sortino = calculate_sortino(episode_traces)
+
+        # Log episode summary
+        operator.logger.log("operator", "episode_complete", {
+            "pair": f"{pair[0]}-{pair[1]}",
+            "total_steps": len(episode_traces),
+            "final_cum_return": episode_traces[-1]['cum_reward'],
+            "total_pnl": sum(t['pnl'] for t in episode_traces),
+            "max_drawdown": max(t['max_drawdown'] for t in episode_traces),
+            "sharpe": sharpe,
+            "sortino": sortino
+        })
+
+    print("\n" + "="*70)
+    print("Holdout trading finished.")
+    print(f"Total steps executed: {global_step}")
+    print(f"Total traces collected: {len(operator.traces_buffer)}")
+    print("="*70)
+    
+    return operator.traces_buffer
+
+
+def calculate_sharpe(traces, risk_free_rate=0.04):
+    returns = [t['return'] for t in traces]
+    if len(returns) == 0:
+        return 0.0
+    
+    rf_daily = risk_free_rate / 252
+    excess_returns = [r - rf_daily for r in returns]
+    
+    mean_excess = sum(excess_returns) / len(excess_returns)
+    std_excess = (sum((r - mean_excess)**2 for r in excess_returns) / (len(excess_returns) - 1))**0.5
+    
+    if std_excess == 0:
+        return 0.0
+    
+    return (mean_excess / std_excess) * (252**0.5)
+
+
+def calculate_sortino(traces, risk_free_rate=0.04):
+    returns = [t['return'] for t in traces]
+    if len(returns) == 0:
+        return 0.0
+    
+    rf_daily = risk_free_rate / 252
+    excess_returns = [r - rf_daily for r in returns]
+    downside_returns = [r for r in excess_returns if r < 0]
+    
+    if len(downside_returns) == 0:
+        return float('inf')
+    
+    mean_excess = sum(excess_returns) / len(excess_returns)
+    downside_std = (sum(r**2 for r in downside_returns) / (len(downside_returns) - 1))**0.5
+    
+    if downside_std == 0:
+        return float('inf')
+    
+    return (mean_excess / downside_std) * (252**0.5)
