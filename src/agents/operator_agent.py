@@ -29,8 +29,8 @@ from agents.message_bus import MessageBus, JSONLogger
 class PairTradingEnv(gym.Env):
 
   def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
-              shock_prob: float = None, shock_scale: float = None,
-              initial_capital: float = None, test_mode: bool = False):
+              shock_prob: float = 0.01, shock_scale: float = 0.2,
+              initial_capital: float = 10000, test_mode: bool = False):
   
       super().__init__()
 
@@ -158,15 +158,6 @@ class PairTradingEnv(gym.Env):
 
 @dataclass
 class OperatorAgent:
-    """
-    Agent responsible for executing trades using RL-optimized strategies.
-
-    Features:
-    - Trains PPO models on pairs
-    - Evaluates trading performance
-    - Responds to supervisor commands
-    - Tracks execution progress for supervisor monitoring
-    """
 
     message_bus: MessageBus = None
     logger: JSONLogger = None
@@ -205,14 +196,6 @@ class OperatorAgent:
     def apply_command(self, command):
 
         cmd_type = command.get("command")
-
-        # if cmd_type == "adjust_transaction_cost":
-        #     old = self.transaction_cost
-        #     self.transaction_cost = command.get("new_value", old)
-        #     CONFIG["transaction_cost"] = self.transaction_cost
-        #     self.logger.log("operator", "adjust_transaction_cost", {
-        #         "old_value": old, "new_value": self.transaction_cost
-        #     })
 
         if cmd_type == "pause":
             self.active = False
@@ -286,7 +269,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     def train(pair):
         x, y = pair
         print(f"\n🔹 Training Operator on pair ({x}, {y})")
-        return operator.train_on_pair(prices, x, y)
+        return operator.train_on_pair(prices, x, y, lookback=30, timesteps=10000)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
