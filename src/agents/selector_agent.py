@@ -29,15 +29,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MemoryTGNN(nn.Module):
-    """
-    Efficient TGNN with simplified but preserved edge memory.
-    
-    Key optimizations:
-    - Single GAT layer
-    - Simplified edge memory update (no complex projections)
-    - Batch edge memory updates
-    - Smaller hidden dimensions
-    """
     
     def __init__(self, in_channels, hidden_channels=48, num_heads=2, 
                  dropout=0.2, device=None):
@@ -64,7 +55,7 @@ class MemoryTGNN(nn.Module):
         self.edge_transform = nn.Linear(hidden_channels, hidden_channels)
         self.edge_gru = nn.GRUCell(hidden_channels, hidden_channels)
 
-        # Single GAT layer (down from 3)
+        # Single GAT layer
         out_per_head = max(1, hidden_channels // num_heads)
         self.gat = GATConv(
             hidden_channels, 
@@ -82,7 +73,7 @@ class MemoryTGNN(nn.Module):
             nn.Linear(hidden_channels, 1)
         )
 
-        # Edge memory storage (simplified)
+        # Edge memory storage
         self.node_memory = None
         self.edge_memory_dict = {}
         
@@ -95,24 +86,17 @@ class MemoryTGNN(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def create_edge_features(self, edge_index, node_embeddings):
-        """
-        Fast edge feature creation by averaging node embeddings.
-        Much simpler than original concatenate + project approach.
-        """
+
         src_idx, dst_idx = edge_index[0], edge_index[1]
         
-        # Simple average of connected nodes (faster than concat + project)
+        # Simple average of connected nodes
         edge_features = (node_embeddings[src_idx] + node_embeddings[dst_idx]) / 2
         edge_features = self.edge_transform(edge_features)
         
         return edge_features
 
     def update_edge_memory(self, edge_index, edge_features):
-        """
-        Batched edge memory update - much faster than loop.
-        
-        Key optimization: Process all edges at once, then store individually.
-        """
+
         num_edges = edge_index.size(1)
         
         # Collect previous memories in batch
@@ -129,7 +113,7 @@ class MemoryTGNN(nn.Module):
             else:
                 prev_memories.append(torch.zeros(self.hidden_channels, device=self.device))
         
-        # Batch GRU update (much faster than loop)
+        # Batch GRU update
         prev_memories_batch = torch.stack(prev_memories)
         new_memories_batch = self.edge_gru(edge_features, prev_memories_batch)
         
@@ -140,9 +124,7 @@ class MemoryTGNN(nn.Module):
         return new_memories_batch
 
     def forward(self, x, edge_index, edge_attr=None, pair_index=None, memory=None):
-        """
-        Forward pass with efficient edge memory.
-        """
+
         x = x.to(self.device)
         N = x.size(0)
         
@@ -207,14 +189,11 @@ class MemoryTGNN(nn.Module):
         return z, memory
 
     def reset_edge_memory(self):
-        """Reset edge memory (call between epochs or training phases)"""
+
         self.edge_memory_dict = {}
     
     def prune_edge_memory(self, keep_top_k=1000):
-        """
-        Prune edge memory to keep only most important edges.
-        Call this periodically if memory grows too large.
-        """
+
         if len(self.edge_memory_dict) <= keep_top_k:
             return
         
@@ -228,22 +207,6 @@ class MemoryTGNN(nn.Module):
 
 @dataclass
 class SelectorAgent:
-    """
-    SelectorAgent with temporal holdout for simulating future performance.
-    
-    Key Features:
-    - Monthly temporal graphs
-    - Memory-based TGNN for embeddings
-    - Temporal holdout: train on first 4 years, score pairs on last year
-    - GPU support if available
-    - No data leakage: Scaler fit only on training data
-    
-    Improvements:
-    - Integrates with MessageBus for supervisor commands
-    - Traces important events to JSONL for audit
-    - Periodically checks message bus during long operations
-    - Fixed data leakage by splitting data BEFORE scaling
-    """
 
     df: pd.DataFrame
     logger: JSONLogger = None
@@ -300,7 +263,9 @@ class SelectorAgent:
                 self._log_event("command_failed", {"command": cmd, "error": str(e)})
 
     def _apply_command(self, cmd: Dict[str, Any]):
+
         c = cmd.get("command")
+
         if c == "adjust_threshold":
             self.corr_threshold = float(cmd.get("value", self.corr_threshold))
             self._log_event("threshold_changed", {"new_threshold": self.corr_threshold})
@@ -326,10 +291,7 @@ class SelectorAgent:
             self._log_event("unknown_command", {"command": cmd})
 
     def _save_checkpoint(self, epoch, loss, path=None):
-        """
-        Saves a checkpoint with model weights and metadata.
-        Called automatically by early stopping in training.
-        """
+
         if path is None:
             directory = os.path.dirname(self.trace_path) or "."
             path = os.path.join(directory, "selector_checkpoint.pt")
@@ -350,16 +312,7 @@ class SelectorAgent:
         })
 
     def build_node_features(self, windows=[5, 15, 30], train_end_date=None) -> pd.DataFrame:
-        """
-        Build node features WITHOUT data leakage.
-        
-        CRITICAL: Scaler is fit ONLY on training data (before train_end_date).
-        If train_end_date is None, scaler is fit on entire dataset (use only for initial exploration).
-        
-        Args:
-            windows: Rolling window sizes for feature engineering
-            train_end_date: End date of training data. Scaler will be fit only on data before this date.
-        """
+
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
         
@@ -426,19 +379,6 @@ class SelectorAgent:
         return df
 
     def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
-        """
-        Build temporal graphs with proper train/val/test split BEFORE feature scaling.
-        Uses MONTHLY frequency to avoid period comparison errors.
-        """
-        if corr_threshold is None:
-            corr_threshold = self.corr_threshold
-        else:
-            self.corr_threshold = corr_threshold
-
-        if holdout_years is None:
-            holdout_years = self.holdout_years
-        else:
-            self.holdout_years = holdout_years
 
         # Determine split dates FIRST
         df_dates = self.df.copy()
@@ -476,7 +416,7 @@ class SelectorAgent:
         test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
 
         # Add month column to training data AFTER splitting
-        train_df["month"] = train_df["date"].dt.to_period("Y")
+        train_df["month"] = train_df["date"].dt.to_period("M")
         
         # Get unique months sorted
         unique_months = sorted(train_df["month"].unique())
@@ -513,16 +453,12 @@ class SelectorAgent:
             num_nodes = len(tickers)
             edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
 
-            if len(edges) > 0:
-                edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
-                edge_attr = torch.tensor(
-                    [[corr_matrix[i, j]] for i, j in edges], 
-                    dtype=torch.float, 
-                    device=self.device
-                )
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
-                edge_attr = torch.zeros((0, 1), dtype=torch.float, device=self.device)
+            edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
+            edge_attr = torch.tensor(
+                [[corr_matrix[i, j]] for i, j in edges], 
+                dtype=torch.float, 
+                device=self.device
+            )
 
             # Store graph snapshot
             self.temporal_graphs.append({
@@ -558,133 +494,124 @@ class SelectorAgent:
 
     def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, neg_sample_ratio=1):
 
-            numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
-            if numeric_features.empty:
-                raise ValueError("No numeric columns found in node_features after filtering.")
+        numeric_features = self.node_features.drop(columns=["date", "ticker"], errors="ignore").select_dtypes(include=[np.number])
 
-            x = torch.from_numpy(numeric_features.values).float().to(self.device)
+        x = torch.from_numpy(numeric_features.values).float().to(self.device)
 
-            tickers = self.node_features["ticker"].unique().tolist()
-            num_nodes = len(tickers)
-            ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+        tickers = self.node_features["ticker"].unique().tolist()
+        num_nodes = len(tickers)
+        ticker_to_idx = {t: i for i, t in enumerate(tickers)}
 
-            decoder = getattr(self, "decoder", None)
-            if decoder is None:
-                if not hasattr(self, "_train_decoder"):
-                    self._train_decoder = None
-                decoder = getattr(self, "_train_decoder", None)
+        decoder = getattr(self, "decoder", None)
 
-            bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+        bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
 
-            self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
-            print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
+        self._log_event("tgn_training_started", {"n_snapshots": len(self.temporal_graphs), "epochs": epochs})
+        print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
 
-            memory = None
+        memory = None
 
-            # Early stopping
-            best_loss = float('inf')
-            patience_counter = 0
-            patience = 5
+        # Early stopping
+        best_loss = float('inf')
+        patience_counter = 0
+        patience = 5
 
-            for epoch in range(epochs):
+        for epoch in range(epochs):
 
-                self.model.train()
-                total_loss = 0.0
-                total_events = 0
+            self.model.train()
+            total_loss = 0.0
+            total_events = 0
 
-                for i, graph in enumerate(self.temporal_graphs):
+            for i, graph in enumerate(self.temporal_graphs):
 
-                    self._check_for_commands()
-                    optimizer.zero_grad()
+                self._check_for_commands()
+                optimizer.zero_grad()
 
-                    edge_index = graph["edge_index"].detach().clone()
-                    edge_attr = graph.get("edge_attr", None)
-                    if edge_attr is not None:
-                        edge_attr = edge_attr.detach().clone()
+                edge_index = graph["edge_index"].detach().clone()
+                edge_attr = graph.get("edge_attr", None)
+                if edge_attr is not None:
+                    edge_attr = edge_attr.detach().clone()
 
-                    # Fix: Pass edge_attr as positional argument, not skipping it with keyword args
-                    model_out = self.model(x, edge_index, edge_attr, pair_index=None, memory=memory)
+                # Fix: Pass edge_attr as positional argument, not skipping it with keyword args
+                model_out = self.model(x, edge_index, edge_attr, pair_index=None, memory=memory)
 
-                    if isinstance(model_out, tuple) and len(model_out) >= 2:
-                        z, memory = model_out[0], model_out[1]
-                    else:
-                        z = model_out
-
-                    if memory is not None:
-                        memory = memory.detach()
-
-                    if z is None:
-                        raise RuntimeError("Model returned None embeddings.")
-                    if z.dim() == 1:
-                        raise RuntimeError("Embeddings must have shape (num_nodes, d).")
-
-                    decoder = self.model.decoder
-
-                    # Positive samples
-                    if edge_index.numel() == 0:
-                        continue
-
-                    src = edge_index[0]
-                    dst = edge_index[1]
-                    E = src.size(0)
-                    total_events += E
-
-                    pos_cat = torch.cat([z[src], z[dst]], dim=1)
-                    logits_pos = decoder(pos_cat).view(-1)
-                    pos_labels = torch.ones_like(logits_pos)
-
-                    # Negative sampling
-                    num_neg = int(E * neg_sample_ratio)
-                    if num_neg > 0:
-                        rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
-                        src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
-                        mask_equal = rand_idx == src_for_neg
-                        while mask_equal.any():
-                            rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
-                            mask_equal = rand_idx == src_for_neg
-
-                        neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
-                        logits_neg = decoder(neg_cat).view(-1)
-                        neg_labels = torch.zeros_like(logits_neg)
-
-                        logits = torch.cat([logits_pos, logits_neg])
-                        labels = torch.cat([pos_labels, neg_labels])
-                    else:
-                        logits = logits_pos
-                        labels = pos_labels
-
-                    loss = bce_loss_fn(logits, labels)
-                    loss.backward()
-
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    optimizer.step()
-
-                    total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
-
-                avg_loss = total_loss / max(total_events, 1)
-
-                self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
-                print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
-
-                # Early stopping check
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    patience_counter = 0
-                    self._save_checkpoint(epoch, avg_loss)
+                if isinstance(model_out, tuple) and len(model_out) >= 2:
+                    z, memory = model_out[0], model_out[1]
                 else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        self._log_event("early_stopping", {"epoch": epoch})
-                        print(f"⛔ Early stopping triggered at epoch {epoch+1}")
-                        break
+                    z = model_out
 
-            self._log_event("tgn_training_complete", {"epochs": epoch + 1})
-            print("✅ TGNN training complete.")
+                if memory is not None:
+                    memory = memory.detach()
+
+                if z is None:
+                    raise RuntimeError("Model returned None embeddings.")
+                if z.dim() == 1:
+                    raise RuntimeError("Embeddings must have shape (num_nodes, d).")
+
+                decoder = self.model.decoder
+
+                # Positive samples
+                if edge_index.numel() == 0:
+                    continue
+
+                src = edge_index[0]
+                dst = edge_index[1]
+                E = src.size(0)
+                total_events += E
+
+                pos_cat = torch.cat([z[src], z[dst]], dim=1)
+                logits_pos = decoder(pos_cat).view(-1)
+                pos_labels = torch.ones_like(logits_pos)
+
+                # Negative sampling
+                num_neg = int(E * neg_sample_ratio)
+                if num_neg > 0:
+                    rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
+                    src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
+                    mask_equal = rand_idx == src_for_neg
+                    while mask_equal.any():
+                        rand_idx[mask_equal] = torch.randint(0, num_nodes, (mask_equal.sum().item(),), device=self.device)
+                        mask_equal = rand_idx == src_for_neg
+
+                    neg_cat = torch.cat([z[src_for_neg], z[rand_idx]], dim=1)
+                    logits_neg = decoder(neg_cat).view(-1)
+                    neg_labels = torch.zeros_like(logits_neg)
+
+                    logits = torch.cat([logits_pos, logits_neg])
+                    labels = torch.cat([pos_labels, neg_labels])
+                else:
+                    logits = logits_pos
+                    labels = pos_labels
+
+                loss = bce_loss_fn(logits, labels)
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_loss += loss.item() * (E + (num_neg if num_neg > 0 else 0))
+
+            avg_loss = total_loss / max(total_events, 1)
+
+            self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
+            print(f"Epoch {epoch+1}/{epochs} complete. Avg (scaled) loss: {avg_loss:.6f}")
+
+            # Early stopping check
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+                self._save_checkpoint(epoch, avg_loss)
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    self._log_event("early_stopping", {"epoch": epoch})
+                    print(f"⛔ Early stopping triggered at epoch {epoch+1}")
+                    break
+
+        self._log_event("tgn_training_complete", {"epochs": epoch + 1})
+        print("✅ TGNN training complete.")
 
     def score_all_pairs_holdout(self):
-        if self.model is None:
-            print("Warning: No model attached. Cannot score pairs.")
-            return pd.DataFrame()
 
         tickers = self.node_features["ticker"].unique().tolist()
         num_nodes = len(tickers)
