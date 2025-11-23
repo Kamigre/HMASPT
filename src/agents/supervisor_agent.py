@@ -9,21 +9,15 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
-
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("Warning: Google Generative AI package not installed. Run: pip install google-generativeai")
-
+import google.generativeai as genai
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from config import CONFIG
 from agents.message_bus import MessageBus, JSONLogger, Graph, SwarmOrchestrator
-
+from utils import half_life as compute_half_life, compute_spread
+from statsmodels.tsa.stattools import adfuller
 
 @dataclass
 class SupervisorAgent:
@@ -51,7 +45,7 @@ class SupervisorAgent:
         self.graph = Graph(name="supervisor_decisions")
 
         # Initialize Gemini client
-        if self.use_gemini and GEMINI_AVAILABLE:
+        if self.use_gemini:
             try:
                 # Get API key from parameter, environment, or config
                 api_key = self.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -243,14 +237,14 @@ class SupervisorAgent:
         self.graph.export(os.path.join(self.storage_dir, "supervisor_graph.json"))
 
         return summary
-    # ---------------- Validation ----------------
+
     def validate_pairs(
         self,
         df_pairs: pd.DataFrame,
         validation_window: Tuple[pd.Timestamp, pd.Timestamp],
         half_life_max: float = 60,
         min_crossings_per_year: int = 24
-    ) -> pd.DataFrame:
+        ) -> pd.DataFrame:
         """
         Validates statistically whether candidate pairs are cointegrated.
         - Runs ADF test for stationarity of the spread.
