@@ -152,59 +152,216 @@ class SupervisorAgent:
             return f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics. (Gemini explanation failed: {str(e)})"
 
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-
-        total_return = sum(t.get("cum_reward", 0.0) for t in operator_traces)
+        """
+        Evaluate portfolio performance across all operator runs with comprehensive aggregated metrics.
+        
+        Args:
+            operator_traces: List of trace dictionaries from all trading pairs
+            
+        Returns:
+            Dictionary containing metrics, actions, explanation, and commands issued
+        """
+        
+        # Group traces by pair for per-pair analysis
+        traces_by_pair = {}
+        for t in operator_traces:
+            pair = t.get("pair", "unknown")
+            if pair not in traces_by_pair:
+                traces_by_pair[pair] = []
+            traces_by_pair[pair].append(t)
+        
+        # Aggregate metrics across all pairs
+        all_returns = [t.get("return", 0.0) for t in operator_traces if "return" in t]
+        all_pnls = [t.get("pnl", 0.0) for t in operator_traces if "pnl" in t]
+        all_cum_rewards = [t.get("cum_reward", 0.0) for t in operator_traces if "cum_reward" in t]
+        
+        # Portfolio-level metrics
+        total_pnl = sum(all_pnls)
+        total_steps = len(operator_traces)
         max_dd = max([t.get("max_drawdown", 0.0) for t in operator_traces] + [0.0])
-        returns = [t.get("cum_reward", 0.0) for t in operator_traces if "cum_reward" in t]
-
+        
+        # Calculate aggregate Sharpe and Sortino from all returns
+        sharpe_ratio = self._calculate_portfolio_sharpe(all_returns)
+        sortino_ratio = self._calculate_portfolio_sortino(all_returns)
+        
+        # Risk metrics: VaR and CVaR
         var_95, cvar_95 = 0.0, 0.0
-        if returns:
-            var_95 = float(np.percentile(returns, 5))
-            cvar_95 = float(np.mean([r for r in returns if r <= var_95]) if any(r <= var_95 for r in returns) else var_95)
-
+        if all_returns:
+            var_95 = float(np.percentile(all_returns, 5))
+            cvar_95 = float(np.mean([r for r in all_returns if r <= var_95]) 
+                           if any(r <= var_95 for r in all_returns) else var_95)
+        
+        # Win rate and profitability metrics
+        positive_returns = sum(1 for r in all_returns if r > 0)
+        negative_returns = sum(1 for r in all_returns if r < 0)
+        win_rate = positive_returns / len(all_returns) if all_returns else 0.0
+        
+        # Per-pair summary statistics
+        pair_summaries = []
+        for pair, traces in traces_by_pair.items():
+            pair_pnl = sum(t.get("pnl", 0.0) for t in traces)
+            pair_cum_return = traces[-1].get("cum_reward", 0.0) if traces else 0.0
+            pair_max_dd = max([t.get("max_drawdown", 0.0) for t in traces] + [0.0])
+            pair_steps = len(traces)
+            
+            # Calculate per-pair Sharpe and Sortino
+            pair_returns = [t.get("return", 0.0) for t in traces if "return" in t]
+            pair_sharpe = self._calculate_portfolio_sharpe(pair_returns)
+            pair_sortino = self._calculate_portfolio_sortino(pair_returns)
+            
+            pair_summaries.append({
+                "pair": pair,
+                "total_pnl": float(pair_pnl),
+                "final_cum_return": float(pair_cum_return),
+                "max_drawdown": float(pair_max_dd),
+                "steps": pair_steps,
+                "sharpe": float(pair_sharpe),
+                "sortino": float(pair_sortino)
+            })
+        
+        # Compile comprehensive metrics summary
         metrics_summary = {
-            "total_return": float(total_return),
+            # Portfolio-level aggregates
+            "total_pnl": float(total_pnl),
+            "total_steps": int(total_steps),
             "max_drawdown": float(max_dd),
+            "sharpe_ratio": float(sharpe_ratio),
+            "sortino_ratio": float(sortino_ratio),
+            
+            # Risk metrics
             "var_95": float(var_95),
             "cvar_95": float(cvar_95),
-            "negatives": int(sum(1 for t in operator_traces if t.get("cum_reward", 0.0) < 0)),
-            "n_traces": len(operator_traces)
+            
+            # Performance distribution
+            "win_rate": float(win_rate),
+            "positive_returns": int(positive_returns),
+            "negative_returns": int(negative_returns),
+            "avg_return": float(np.mean(all_returns)) if all_returns else 0.0,
+            "median_return": float(np.median(all_returns)) if all_returns else 0.0,
+            "std_return": float(np.std(all_returns)) if all_returns else 0.0,
+            
+            # Trading activity
+            "n_pairs": len(traces_by_pair),
+            "n_traces": len(operator_traces),
+            "avg_steps_per_pair": float(total_steps / len(traces_by_pair)) if traces_by_pair else 0.0,
+            
+            # Per-pair breakdown
+            "pair_summaries": pair_summaries
         }
-
-        # Rule-based actions
+        
+        # Rule-based actions based on aggregated metrics
         actions = []
+        
         if max_dd > self.max_total_drawdown:
-            actions.append({"action": "reduce_risk", "reason": "portfolio_drawdown_limit_exceeded"})
-
-        # Update graph
+            actions.append({
+                "action": "reduce_risk",
+                "reason": "portfolio_drawdown_limit_exceeded",
+                "severity": "high"
+            })
+        
+        if sharpe_ratio < 0:
+            actions.append({
+                "action": "review_strategy",
+                "reason": "negative_sharpe_ratio",
+                "severity": "medium"
+            })
+        
+        if win_rate < 0.5:
+            actions.append({
+                "action": "review_entry_exit",
+                "reason": "low_win_rate",
+                "severity": "medium"
+            })
+        
+        if cvar_95 < -0.05:  # If tail risk exceeds 5%
+            actions.append({
+                "action": "reduce_position_sizes",
+                "reason": "excessive_tail_risk",
+                "severity": "high"
+            })
+        
+        # Update graph with portfolio metrics
         self.graph.add_node("PortfolioMetrics", "metrics")
+        for pair_summary in pair_summaries:
+            pair_node = f"Pair: {pair_summary['pair']}"
+            self.graph.add_node(pair_node, "pair")
+            self.graph.add_edge("PortfolioMetrics", pair_node)
+        
         for act in actions:
-            node_name = f"{act.get('action')} ({act.get('reason','')})"
-            self.graph.add_node(node_name)
+            node_name = f"{act.get('action')} ({act.get('reason', '')})"
+            self.graph.add_node(node_name, "action")
             self.graph.add_edge("PortfolioMetrics", node_name)
-
+        
         # Generate explanation
         explanation = self.generate_explanation(metrics_summary, actions)
-
-        # Issue commands
+        
+        # Issue commands based on actions
+        commands_issued = 0
         for act in actions:
             commands = self._action_to_commands(act)
             for cmd in commands:
                 target = cmd.pop("target", None)
                 if target:
                     self.message_bus.send_command(target, cmd)
-
+                    commands_issued += 1
+        
+        # Compile final summary
         summary = {
             "metrics": metrics_summary,
             "actions": actions,
             "explanation": explanation,
-            "commands_issued": sum(len(self._action_to_commands(a)) for a in actions)
+            "commands_issued": commands_issued
         }
-
+        
+        # Log comprehensive evaluation
         self.logger.log("supervisor", "portfolio_evaluated", summary)
         self.graph.export(os.path.join(self.storage_dir, "supervisor_graph.json"))
-
+        
         return summary
+    
+    def _calculate_portfolio_sharpe(self, returns: List[float], 
+                                    risk_free_rate: float = None) -> float:
+        """Calculate annualized Sharpe ratio from returns."""
+        if risk_free_rate is None:
+            risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+        
+        if len(returns) == 0:
+            return 0.0
+        
+        rf_daily = risk_free_rate / 252
+        excess_returns = [r - rf_daily for r in returns]
+        
+        mean_excess = np.mean(excess_returns)
+        std_excess = np.std(excess_returns, ddof=1)
+        
+        if std_excess == 0:
+            return 0.0
+        
+        return (mean_excess / std_excess) * np.sqrt(252)
+    
+    def _calculate_portfolio_sortino(self, returns: List[float], 
+                                     risk_free_rate: float = None) -> float:
+        """Calculate annualized Sortino ratio from returns."""
+        if risk_free_rate is None:
+            risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+        
+        if len(returns) == 0:
+            return 0.0
+        
+        rf_daily = risk_free_rate / 252
+        excess_returns = [r - rf_daily for r in returns]
+        downside_returns = [r for r in excess_returns if r < 0]
+        
+        if len(downside_returns) == 0:
+            return float('inf')
+        
+        mean_excess = np.mean(excess_returns)
+        downside_std = np.sqrt(np.mean([r**2 for r in downside_returns]))
+        
+        if downside_std == 0:
+            return float('inf')
+        
+        return (mean_excess / downside_std) * np.sqrt(252)
 
     def validate_pairs(self, df_pairs: pd.DataFrame, validation_window: Tuple[pd.Timestamp, pd.Timestamp],
         half_life_max: float = 60, min_crossings_per_year: int = 24) -> pd.DataFrame:
