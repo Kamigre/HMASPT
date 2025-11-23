@@ -118,13 +118,23 @@ class SupervisorAgent:
             
             response = model.generate_content(prompt)
             
-            # Extract text from response
-            if hasattr(response, 'text'):
-                return response.text
-            elif hasattr(response, 'parts'):
-                return ''.join(part.text for part in response.parts if hasattr(part, 'text'))
-            else:
-                raise Exception("Unexpected response format from Gemini")
+            # Extract text robustly
+            if response and hasattr(response, "candidates") and response.candidates:
+                candidate = response.candidates[0]
+
+                # Check finish reason
+                if hasattr(candidate, "finish_reason") and candidate.finish_reason != 1:
+                    raise Exception(f"Gemini blocked or incomplete response (finish_reason={candidate.finish_reason})")
+
+                # Extract content parts safely
+                if candidate.content and candidate.content.parts:
+                    texts = []
+                    for p in candidate.content.parts:
+                        if hasattr(p, "text"):
+                            texts.append(p.text)
+                    return "".join(texts)
+
+            raise Exception("Gemini returned no content")
                 
         except Exception as e:
             raise Exception(f"Gemini API call failed: {str(e)}")
@@ -163,7 +173,9 @@ class SupervisorAgent:
           3. Explains why each action is being taken and its risk management purpose
           4. Offers a brief outlook on portfolio health
 
-          Keep the explanation professional, clear, and actionable. Limit to 3-4 paragraphs."""
+          Keep the explanation professional, clear, and actionable. Limit to 3-4 paragraphs.
+          
+          This is a fictional simulation used for model debugging and does not represent real financial advice."""
         
         try:
             explanation = self._call_gemini(prompt, system_instruction=system_instruction)
