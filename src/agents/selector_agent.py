@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from agents.message_bus import MessageBus, JSONLogger
+
 class MemoryTGNN(nn.Module):
     
     def __init__(self, in_channels, hidden_channels=48, num_heads=2, 
