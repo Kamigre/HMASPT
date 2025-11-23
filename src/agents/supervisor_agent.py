@@ -1,6 +1,6 @@
 """
-Supervisor Agent for monitoring and coordinating other agents.
-Uses Google Gemini API for decision-making.
+Supervisor Agent for monitoring and coordinating other agents. Explains actions
+and risks.
 """
 
 import os
@@ -21,16 +21,7 @@ from statsmodels.tsa.stattools import adfuller
 
 @dataclass
 class SupervisorAgent:
-    """
-    Supervisor Agent for monitoring and coordinating Selector and Operator agents.
-    
-    Features:
-    - Portfolio risk monitoring
-    - Rule-based interventions
-    - Gemini-based analysis
-    - Command issuing via MessageBus
-    """
-    
+
     message_bus: MessageBus = None
     logger: JSONLogger = None
     max_total_drawdown: float = 0.20
@@ -84,24 +75,17 @@ class SupervisorAgent:
         })
 
     def _action_to_commands(self, action: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Convert high-level action to concrete MessageBus commands.
-        
-        Example mappings:
-        - retrain_selector -> {target: "selector", command: "retrain_tgn"}
-        - reduce_risk -> {target: "operator", command: "adjust_transaction_cost"}
-        - freeze_agents -> pause both selector and operator
-        """
+
         act = action.get("action", "")
         commands = []
 
         if act == "reduce_risk":
             new_tc = action.get("new_transaction_cost", CONFIG.get("transaction_cost", 0.005) + 0.002)
             commands.append({"target": "operator", "command": "adjust_transaction_cost", "new_value": new_tc})
-        elif act in ["freeze_agents", "pause_agents"]:
+        elif act == "pause_agent":
             commands.append({"target": "selector", "command": "pause"})
             commands.append({"target": "operator", "command": "pause"})
-        elif act == "resume_agents":
+        elif act == "resume_agent":
             commands.append({"target": "selector", "command": "resume"})
             commands.append({"target": "operator", "command": "resume"})
         elif "target" in action and "command" in action:
@@ -110,17 +94,7 @@ class SupervisorAgent:
         return commands
 
     def _call_gemini(self, prompt: str, system_instruction: Optional[str] = None, json_mode: bool = False) -> str:
-        """
-        Call Gemini API with given prompt.
-        
-        Args:
-            prompt: The user prompt
-            system_instruction: Optional system instruction for the model
-            json_mode: Whether to request JSON output
-            
-        Returns:
-            Response text from the model
-        """
+
         try:
             # Add JSON instruction if needed
             if json_mode:
@@ -156,9 +130,7 @@ class SupervisorAgent:
             raise Exception(f"Gemini API call failed: {str(e)}")
 
     def generate_explanation(self, metrics: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
-        """
-        Generate natural language explanation for actions using Gemini.
-        """
+
         if not self.use_gemini or not actions:
             return f"Rule-based analysis: {len(actions)} interventions recommended."
 
@@ -180,11 +152,7 @@ class SupervisorAgent:
             return f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics. (Gemini explanation failed: {str(e)})"
 
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Evaluate portfolio performance and issue commands to agents.
-        
-        Returns summary of metrics and actions taken.
-        """
+
         total_return = sum(t.get("cum_reward", 0.0) for t in operator_traces)
         max_dd = max([t.get("max_drawdown", 0.0) for t in operator_traces] + [0.0])
         returns = [t.get("cum_reward", 0.0) for t in operator_traces if "cum_reward" in t]
@@ -238,22 +206,8 @@ class SupervisorAgent:
 
         return summary
 
-    def validate_pairs(
-        self,
-        df_pairs: pd.DataFrame,
-        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
-        half_life_max: float = 60,
-        min_crossings_per_year: int = 24
-        ) -> pd.DataFrame:
-        """
-        Validates statistically whether candidate pairs are cointegrated.
-        - Runs ADF test for stationarity of the spread.
-        - Computes half-life (mean reversion speed).
-        - Counts zero-crossings per year (signal frequency).
-    
-        The Selector produces a dataframe of pairs with scores.
-        The Supervisor validates them statistically before allowing the Operator to trade them.
-        """
+    def validate_pairs(self, df_pairs: pd.DataFrame, validation_window: Tuple[pd.Timestamp, pd.Timestamp],
+        half_life_max: float = 60, min_crossings_per_year: int = 24) -> pd.DataFrame:
     
         start, end = validation_window
         validated = []
