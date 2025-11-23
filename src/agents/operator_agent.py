@@ -75,18 +75,14 @@ class PairTradingEnv(gym.Env):
         # Pre-compute features with stability fixes
         spread_mean = self.spread_shocked.rolling(self.lookback).mean()
         spread_std = self.spread_shocked.rolling(self.lookback).std()
-        
-        # FIX 1: Add epsilon to prevent division by zero
+
         spread_std = spread_std.clip(lower=1e-8)
         self.zscores = (self.spread_shocked - spread_mean) / spread_std
         
-        # FIX 2: Clip z-scores to prevent extreme values
-        self.zscores = self.zscores.clip(-5, 5)
-        
-        self.vols = self.spread_shocked.rolling(15).std().clip(lower=1e-8)
+        self.vols = self.spread_shocked.rolling(5).std().clip(lower=1e-8)
         self.rx = self.align.iloc[:, 0].pct_change()
         self.ry = self.align.iloc[:, 1].pct_change()
-        self.corrs = self.rx.rolling(15).corr(self.ry)
+        self.corrs = self.rx.rolling(5).corr(self.ry)
         
         # Convert to numpy and handle NaNs
         self.zscores_np = np.nan_to_num(self.zscores.to_numpy(), nan=0.0, posinf=5.0, neginf=-5.0)
@@ -94,7 +90,7 @@ class PairTradingEnv(gym.Env):
         self.corrs_np = np.nan_to_num(self.corrs.to_numpy(), nan=0.0, posinf=1.0, neginf=-1.0)
         self.spread_np = self.spread_shocked.to_numpy()
         
-        # FIX 3: Normalize volatility for stable features
+        # Normalize volatility for stable features
         self.vol_mean = np.nanmean(self.vols_np)
         self.vol_std = np.nanstd(self.vols_np) + 1e-8
 
@@ -104,7 +100,7 @@ class PairTradingEnv(gym.Env):
         vol = self.vols_np[idx]
         corr = self.corrs_np[idx]
         
-        # FIX 4: Normalize volatility feature
+        # Normalize volatility feature
         vol_normalized = (vol - self.vol_mean) / self.vol_std
         vol_normalized = np.clip(vol_normalized, -5, 5)
         
@@ -117,12 +113,12 @@ class PairTradingEnv(gym.Env):
         else:
             hl = CONFIG.get("half_life_max", 100)
         
-        # FIX 5: Normalize half-life to [0, 1] range
+        # Normalize half-life to [0, 1] range
         hl_normalized = np.clip(hl / 100.0, 0, 1)
         
         features = np.array([z, vol_normalized, hl_normalized, corr], dtype=np.float32)
         
-        # FIX 6: Final safety check for NaN/Inf
+        # Final safety check for NaN/Inf
         features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return features
@@ -162,18 +158,23 @@ class PairTradingEnv(gym.Env):
         spread_now = self.spread_np[self.ptr]
         spread_next = self.spread_np[next_ptr]
         spread_change = spread_next - spread_now
-    
+
         pnl = -self.position * spread_change
-    
-        if target_pos != self.position:
-            pnl -= CONFIG.get("transaction_cost", 0.0005)
-    
+
+        # Compute how much you trade
+        trade_size = abs(target_pos - self.position)
+
+        # Apply 5 bps (0.05%) transaction cost proportional to trade size
+        if trade_size > 0:
+            cost_rate = CONFIG.get("transaction_cost", 0.0005)  # 5 bps
+            pnl -= trade_size * cost_rate
+
         old_value = self.portfolio_value
         self.portfolio_value += pnl
     
-        # FIX 7: Clip reward to prevent explosive values
+        # Clip reward to prevent explosive values
         daily_return = pnl / max(1e-8, old_value)
-        daily_return = np.clip(daily_return, -0.5, 0.5)  # Cap at ±50% daily return
+        daily_return = np.clip(daily_return, -1, 1)  # Cap at ±100% daily return
     
         self.cum_returns = (self.portfolio_value / self.initial_capital - 1) * 100
         self.peak = max(self.peak, self.portfolio_value)
