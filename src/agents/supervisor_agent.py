@@ -130,26 +130,61 @@ class SupervisorAgent:
             raise Exception(f"Gemini API call failed: {str(e)}")
 
     def generate_explanation(self, metrics: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
-
-        if not self.use_gemini or not actions:
-            return f"Rule-based analysis: {len(actions)} interventions recommended."
-
-        system_instruction = "You are an expert quantitative supervisor overseeing algorithmic trading agents."
+        """
+        Generate natural language explanation of portfolio performance and actions using Gemini.
         
-        prompt = f"""Given the portfolio metrics below, explain in natural language why the following actions are being taken.
+        Args:
+            metrics: Dictionary of portfolio metrics
+            actions: List of action dictionaries
+            
+        Returns:
+            Natural language explanation string
+        """
+        if not self.use_gemini:
+            if not actions:
+                return "Portfolio is performing within acceptable parameters. No interventions required."
+            return f"Rule-based analysis: {len(actions)} interventions recommended based on risk thresholds."
 
-                  Metrics:
-                  {json.dumps(metrics, indent=2, default=str)}
+        system_instruction = """You are an expert quantitative supervisor overseeing algorithmic trading agents. 
+          Your role is to analyze portfolio performance metrics and explain risk management decisions in clear, 
+          professional language. Focus on actionable insights and risk implications."""
+              
+        prompt = f"""Analyze the following portfolio performance metrics and explain the rationale behind the recommended actions.
 
-                  Actions:
-                  {json.dumps(actions, indent=2, default=str)}
+          PORTFOLIO METRICS:
+          {json.dumps(metrics, indent=2, default=str)}
 
-                  Explain clearly and concisely the reasoning behind each action, including risk management implications."""
+          RECOMMENDED ACTIONS:
+          {json.dumps(actions, indent=2, default=str)}
+
+          Provide a concise executive summary that:
+          1. Highlights the most important performance indicators (Sharpe, Sortino, drawdown, win rate)
+          2. Identifies key risks or concerns based on the metrics
+          3. Explains why each action is being taken and its risk management purpose
+          4. Offers a brief outlook on portfolio health
+
+          Keep the explanation professional, clear, and actionable. Limit to 3-4 paragraphs."""
         
         try:
-            return self._call_gemini(prompt, system_instruction=system_instruction)
+            explanation = self._call_gemini(prompt, system_instruction=system_instruction)
+            return explanation
         except Exception as e:
-            return f"Simple rule-based explanation: {len(actions)} actions triggered based on portfolio metrics. (Gemini explanation failed: {str(e)})"
+            # Fallback explanation if Gemini fails
+            fallback = f"Portfolio Analysis Summary:\n\n"
+            fallback += f"Performance: Sharpe {metrics.get('sharpe_ratio', 0):.2f}, "
+            fallback += f"Sortino {metrics.get('sortino_ratio', 0):.2f}, "
+            fallback += f"Win Rate {metrics.get('win_rate', 0):.1%}\n\n"
+            
+            if actions:
+                fallback += f"Risk Management: {len(actions)} action(s) triggered - "
+                fallback += ", ".join([a['action'] for a in actions])
+                fallback += "\n\n"
+            else:
+                fallback += "No risk interventions required at this time.\n\n"
+            
+            fallback += f"(Note: Gemini explanation unavailable: {str(e)})"
+            return fallback
+
 
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -189,7 +224,7 @@ class SupervisorAgent:
         if all_returns:
             var_95 = float(np.percentile(all_returns, 5))
             cvar_95 = float(np.mean([r for r in all_returns if r <= var_95]) 
-                           if any(r <= var_95 for r in all_returns) else var_95)
+                          if any(r <= var_95 for r in all_returns) else var_95)
         
         # Win rate and profitability metrics
         positive_returns = sum(1 for r in all_returns if r > 0)
@@ -266,7 +301,7 @@ class SupervisorAgent:
                 "severity": "medium"
             })
         
-        if win_rate < 0.5:
+        if win_rate < 0.4:
             actions.append({
                 "action": "review_entry_exit",
                 "reason": "low_win_rate",
@@ -318,6 +353,52 @@ class SupervisorAgent:
         self.graph.export(os.path.join(self.storage_dir, "supervisor_graph.json"))
         
         return summary
+
+
+def _calculate_portfolio_sharpe(self, returns: List[float], 
+                                risk_free_rate: float = None) -> float:
+    """Calculate annualized Sharpe ratio from returns."""
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    
+    if len(returns) == 0:
+        return 0.0
+    
+    rf_daily = risk_free_rate / 252
+    excess_returns = [r - rf_daily for r in returns]
+    
+    mean_excess = np.mean(excess_returns)
+    std_excess = np.std(excess_returns, ddof=1)
+    
+    if std_excess == 0:
+        return 0.0
+    
+    return (mean_excess / std_excess) * np.sqrt(252)
+
+
+def _calculate_portfolio_sortino(self, returns: List[float], 
+                                 risk_free_rate: float = None) -> float:
+    """Calculate annualized Sortino ratio from returns."""
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    
+    if len(returns) == 0:
+        return 0.0
+    
+    rf_daily = risk_free_rate / 252
+    excess_returns = [r - rf_daily for r in returns]
+    downside_returns = [r for r in excess_returns if r < 0]
+    
+    if len(downside_returns) == 0:
+        return float('inf')
+    
+    mean_excess = np.mean(excess_returns)
+    downside_std = np.sqrt(np.mean([r**2 for r in downside_returns]))
+    
+    if downside_std == 0:
+        return float('inf')
+    
+    return (mean_excess / downside_std) * np.sqrt(252)
     
     def _calculate_portfolio_sharpe(self, returns: List[float], 
                                     risk_free_rate: float = None) -> float:
