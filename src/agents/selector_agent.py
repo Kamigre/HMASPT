@@ -23,8 +23,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from config import CONFIG
-from utils import half_life as compute_half_life, compute_spread
-from agents.message_bus import MessageBus, JSONLogger
 
 import torch
 import torch.nn as nn
@@ -729,51 +727,3 @@ class SelectorAgent:
         self._log_event("pairs_scored", {"n_pairs": len(results), "top_10": topk})
 
         return results
-
-    def validate_pairs(self, df_pairs: pd.DataFrame, validation_window: Tuple[pd.Timestamp, pd.Timestamp],
-                      half_life_max: float = 60, min_crossings_per_year: int = 24):
-
-        start, end = validation_window
-        validated = []
-        prices = self.df.pivot(index="date", columns="ticker", values="adj_close").sort_index()
-
-        for _, row in df_pairs.iterrows():
-            self._check_for_commands()
-
-            x, y = row["x"], row["y"]
-            if x not in prices.columns or y not in prices.columns:
-                continue
-
-            series_x = prices[x].loc[start:end].dropna()
-            series_y = prices[y].loc[start:end].dropna()
-            if min(len(series_x), len(series_y)) < 60:
-                continue
-
-            spread = compute_spread(series_x, series_y)
-            if spread.empty:
-                continue
-
-            crossings = ((spread - spread.mean()).shift(1) * (spread - spread.mean()) < 0).sum()
-            days = (series_x.index[-1] - series_x.index[0]).days
-            crossings_per_year = crossings / (days / 252)
-            if crossings_per_year < min_crossings_per_year:
-                continue
-
-            try:
-                adf_stat, adf_p, *_ = adfuller(spread.dropna())
-            except Exception:
-                adf_p = 1.0
-
-            hl = compute_half_life(spread.values)
-
-            pass_criteria = (adf_p < 0.05) and (hl < half_life_max)
-
-            validated.append({
-                "x": x, "y": y, "score": row["score"],
-                "adf_p": float(adf_p), "half_life": float(hl),
-                "mean_crossings": int(crossings),
-                "pass": pass_criteria
-            })
-
-        self._log_event("pairs_validated", {"n_validated": len(validated)})
-        return pd.DataFrame(validated)
