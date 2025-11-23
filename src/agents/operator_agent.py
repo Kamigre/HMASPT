@@ -76,10 +76,10 @@ class PairTradingEnv(gym.Env):
         spread_mean = self.spread_shocked.rolling(self.lookback).mean()
         spread_std = self.spread_shocked.rolling(self.lookback).std()
 
-        spread_std = spread_std.clip(lower=1e-8)
+        spread_std = spread_std
         self.zscores = (self.spread_shocked - spread_mean) / spread_std
         
-        self.vols = self.spread_shocked.rolling(5).std().clip(lower=1e-8)
+        self.vols = self.spread_shocked.rolling(5).std()
         self.rx = self.align.iloc[:, 0].pct_change()
         self.ry = self.align.iloc[:, 1].pct_change()
         self.corrs = self.rx.rolling(5).corr(self.ry)
@@ -92,7 +92,7 @@ class PairTradingEnv(gym.Env):
         
         # Normalize volatility for stable features
         self.vol_mean = np.nanmean(self.vols_np)
-        self.vol_std = np.nanstd(self.vols_np) + 1e-8
+        self.vol_std = np.nanstd(self.vols_np)
 
     def _compute_features(self, idx: int):
         
@@ -288,9 +288,9 @@ class OperatorAgent:
         rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess_rets = rets - rf_daily
 
-        sharpe = np.mean(excess_rets) / (np.std(excess_rets, ddof=1) + 1e-8) * np.sqrt(252)
+        sharpe = np.mean(excess_rets) / (np.std(excess_rets, ddof=1)) * np.sqrt(252)
         downside = excess_rets[excess_rets < 0]
-        sortino = (np.mean(excess_rets) / (np.std(downside, ddof=1) + 1e-8) * np.sqrt(252)) if len(downside) else np.inf
+        sortino = (np.mean(excess_rets) / (np.std(downside, ddof=1)) * np.sqrt(252)) if len(downside) else np.inf
 
         trace = {
             "pair": (x, y),
