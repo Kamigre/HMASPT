@@ -799,17 +799,16 @@ class SelectorAgent:
                             prev_graph.get("edge_times", None),
                             current_time=prev_graph.get("time", i - 1)
                         )
-                
-                                
-                                # Current batch for prediction
-                                edge_index = graph["edge_index"]
-                                edge_attr = graph.get("edge_attr", None)
-                                edge_times = graph.get("edge_times", None)
-                                current_time = graph.get("time", i)
-                                
-                                if edge_index.numel() == 0:
-                                    prev_graph = graph
-                                    continue
+              
+                        # Current batch for prediction
+                        edge_index = graph["edge_index"]
+                        edge_attr = graph.get("edge_attr", None)
+                        edge_times = graph.get("edge_times", None)
+                        current_time = graph.get("time", i)
+                        
+                        if edge_index.numel() == 0:
+                            prev_graph = graph
+                            continue
                 
                 # Positive samples
                 src = edge_index[0]
