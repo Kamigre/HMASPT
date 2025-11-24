@@ -181,55 +181,55 @@ class TemporalGraphAttention(nn.Module):
         num_nodes = h.size(0)
         time_zero = self.time_encoder(torch.zeros(1, device=h.device))
         
-# Vectorized batched attention
-all_indices = []
-all_kv = []
-all_q = []
+        # Vectorized batched attention
+        all_indices = []
+        all_kv = []
+        all_q = []
 
-for i in range(num_nodes):
-    # Prepare query
-    q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-    q = self.query_proj[layer_idx](q_concat)
-    all_q.append(q)
-    
-    # Prepare keys/values
-    if i in neighbors and len(neighbors[i][0]) > 0:
-        neighbor_indices, neighbor_times = neighbors[i]
-        time_diffs = current_time - neighbor_times
-        time_encs = self.time_encoder(time_diffs)
-        kv_nodes = torch.cat([h[neighbor_indices], time_encs], dim=-1)
-        self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-        kv_nodes = torch.cat([self_concat, kv_nodes], dim=0)
-        kv_proj = self.kv_proj[layer_idx](kv_nodes)
-        all_kv.append(kv_proj)
-        all_indices.append(i)
-    else:
-        # Single query as KV if no neighbors
-        kv_proj = q.unsqueeze(0)
-        all_kv.append(kv_proj)
-        all_indices.append(i)
+        for i in range(num_nodes):
+            # Prepare query
+            q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+            q = self.query_proj[layer_idx](q_concat)
+            all_q.append(q)
+            
+            # Prepare keys/values
+            if i in neighbors and len(neighbors[i][0]) > 0:
+                neighbor_indices, neighbor_times = neighbors[i]
+                time_diffs = current_time - neighbor_times
+                time_encs = self.time_encoder(time_diffs)
+                kv_nodes = torch.cat([h[neighbor_indices], time_encs], dim=-1)
+                self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+                kv_nodes = torch.cat([self_concat, kv_nodes], dim=0)
+                kv_proj = self.kv_proj[layer_idx](kv_nodes)
+                all_kv.append(kv_proj)
+                all_indices.append(i)
+            else:
+                # Single query as KV if no neighbors
+                kv_proj = q.unsqueeze(0)
+                all_kv.append(kv_proj)
+                all_indices.append(i)
 
-        # Stack all queries and KV sequences
-        q_batch = torch.stack(all_q, dim=0)  # [num_nodes, d]
-        # Note: KV sequences can be padded to same length and attention_mask used
-        # For simplicity, you can use PyG or torch.nn.MultiheadAttention with padding_mask
-        
-        # Example simplified: compute attention per node (still batched as tensor ops)
-        h_next = []
-        for i, kv_proj in zip(all_indices, all_kv):
-            attn_out, _ = self.mhas[layer_idx](
-                q_batch[i:i+1].unsqueeze(0),  # Q: [1, 1, d]
-                kv_proj.unsqueeze(0),          # K: [1, N, d]
-                kv_proj.unsqueeze(0)           # V: [1, N, d]
-            )
-            z_tilde = attn_out.squeeze(0).squeeze(0)
-            combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
-            h_i = self.mlps[layer_idx](combined)
-            h_i = F.relu(h_i)
-            h_i = F.dropout(h_i, p=self.dropout, training=self.training)
-            h_next.append(h_i)
-        
-        h_next = torch.cat(h_next, dim=0)
+                # Stack all queries and KV sequences
+                q_batch = torch.stack(all_q, dim=0)  # [num_nodes, d]
+                # Note: KV sequences can be padded to same length and attention_mask used
+                # For simplicity, you can use PyG or torch.nn.MultiheadAttention with padding_mask
+                
+                # Example simplified: compute attention per node (still batched as tensor ops)
+                h_next = []
+                for i, kv_proj in zip(all_indices, all_kv):
+                    attn_out, _ = self.mhas[layer_idx](
+                        q_batch[i:i+1].unsqueeze(0),  # Q: [1, 1, d]
+                        kv_proj.unsqueeze(0),          # K: [1, N, d]
+                        kv_proj.unsqueeze(0)           # V: [1, N, d]
+                    )
+                    z_tilde = attn_out.squeeze(0).squeeze(0)
+                    combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
+                    h_i = self.mlps[layer_idx](combined)
+                    h_i = F.relu(h_i)
+                    h_i = F.dropout(h_i, p=self.dropout, training=self.training)
+                    h_next.append(h_i)
+                
+                h_next = torch.cat(h_next, dim=0)
 
     
     def clear_cache(self):
