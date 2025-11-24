@@ -181,40 +181,56 @@ class TemporalGraphAttention(nn.Module):
         num_nodes = h.size(0)
         time_zero = self.time_encoder(torch.zeros(1, device=h.device))
         
-        # Process all nodes
-        h_next = []
+# Vectorized batched attention
+all_indices = []
+all_kv = []
+all_q = []
+
+for i in range(num_nodes):
+    # Prepare query
+    q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+    q = self.query_proj[layer_idx](q_concat)
+    all_q.append(q)
+    
+    # Prepare keys/values
+    if i in neighbors and len(neighbors[i][0]) > 0:
+        neighbor_indices, neighbor_times = neighbors[i]
+        time_diffs = current_time - neighbor_times
+        time_encs = self.time_encoder(time_diffs)
+        kv_nodes = torch.cat([h[neighbor_indices], time_encs], dim=-1)
+        self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+        kv_nodes = torch.cat([self_concat, kv_nodes], dim=0)
+        kv_proj = self.kv_proj[layer_idx](kv_nodes)
+        all_kv.append(kv_proj)
+        all_indices.append(i)
+    else:
+        # Single query as KV if no neighbors
+        kv_proj = q.unsqueeze(0)
+        all_kv.append(kv_proj)
+        all_indices.append(i)
+
+        # Stack all queries and KV sequences
+        q_batch = torch.stack(all_q, dim=0)  # [num_nodes, d]
+        # Note: KV sequences can be padded to same length and attention_mask used
+        # For simplicity, you can use PyG or torch.nn.MultiheadAttention with padding_mask
         
-        for i in range(num_nodes):
-            # Query
-            q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-            q = self.query_proj[layer_idx](q_concat).unsqueeze(0)
-            
-            # Keys and Values
-            if i in neighbors and len(neighbors[i][0]) > 0:
-                neighbor_indices, neighbor_times = neighbors[i]
-                
-                time_diffs = current_time - neighbor_times
-                time_encs = self.time_encoder(time_diffs)
-                
-                kv_concat = torch.cat([h[neighbor_indices], time_encs], dim=-1)
-                self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-                kv_concat = torch.cat([self_concat, kv_concat], dim=0)
-                kv = self.kv_proj[layer_idx](kv_concat).unsqueeze(0)
-            else:
-                kv = q
-            
-            # Attention
-            attn_out, _ = self.mhas[layer_idx](q, kv, kv)
-            z_tilde = attn_out.squeeze(0)
-            
-            # MLP
+        # Example simplified: compute attention per node (still batched as tensor ops)
+        h_next = []
+        for i, kv_proj in zip(all_indices, all_kv):
+            attn_out, _ = self.mhas[layer_idx](
+                q_batch[i:i+1].unsqueeze(0),  # Q: [1, 1, d]
+                kv_proj.unsqueeze(0),          # K: [1, N, d]
+                kv_proj.unsqueeze(0)           # V: [1, N, d]
+            )
+            z_tilde = attn_out.squeeze(0).squeeze(0)
             combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
             h_i = self.mlps[layer_idx](combined)
             h_i = F.relu(h_i)
             h_i = F.dropout(h_i, p=self.dropout, training=self.training)
             h_next.append(h_i)
         
-        return torch.cat(h_next, dim=0)
+        h_next = torch.cat(h_next, dim=0)
+
     
     def clear_cache(self):
         """Clear neighbor cache to free memory."""
@@ -370,53 +386,51 @@ class MemoryTGNN(nn.Module):
         message_counts = torch.zeros(num_nodes, device=self.device)
         
         if edge_index.numel() > 0:
-            for idx in range(edge_index.size(1)):
-                i = edge_index[0, idx].item()
-                j = edge_index[1, idx].item()
-                
-                # Get edge features
-                e_ij = edge_attr[idx:idx+1] if edge_attr is not None else torch.zeros(1, 1, device=self.device)
-                
-                # Time encoding ψ(t - t'_i) and ψ(t - t'_j)
-                time_diff_i = current_time - self.last_event_time[i]
-                time_diff_j = current_time - self.last_event_time[j]
-                time_enc_i = self.time_encoder(time_diff_i.unsqueeze(0))
-                time_enc_j = self.time_encoder(time_diff_j.unsqueeze(0))
-                
-                # Compute messages for both nodes (Equation 1)
-                m_i = self.message_function(
-                    self.node_memory[i:i+1],
-                    self.node_memory[j:j+1],
-                    e_ij,
-                    time_enc_i
-                )
-                
-                m_j = self.message_function(
-                    self.node_memory[j:j+1],
-                    self.node_memory[i:i+1],
-                    e_ij,
-                    time_enc_j
-                )
-                
-                # Recent message aggregator: keep most recent message
-                messages[i] = m_i.squeeze(0)
-                messages[j] = m_j.squeeze(0)
-                message_counts[i] = 1
-                message_counts[j] = 1
-                
-                # Update last event time
-                self.last_event_time[i] = current_time
-                self.last_event_time[j] = current_time
+            src = edge_index[0]
+            dst = edge_index[1]
         
-        # MEMORY MODULE: Update memory for nodes with messages (Equation 2)
-        updated_memory = self.node_memory.clone()
-        for i in range(num_nodes):
-            if message_counts[i] > 0:
-                updated_memory[i] = self.memory_module(
-                    messages[i:i+1],
-                    self.node_memory[i:i+1]
-                ).squeeze(0)
+            # Time differences
+            time_diff_i = current_time - self.last_event_time[src]
+            time_diff_j = current_time - self.last_event_time[dst]
         
+            time_enc_i = self.time_encoder(time_diff_i.unsqueeze(1))
+            time_enc_j = self.time_encoder(time_diff_j.unsqueeze(1))
+        
+            s_i = self.node_memory[src]
+            s_j = self.node_memory[dst]
+        
+            # Edge features (broadcast if None)
+            if edge_attr is None:
+                edge_attr = torch.zeros((edge_index.size(1), 1), device=self.device)
+        
+            # Compute messages in batch
+            m_i = self.message_function(s_i, s_j, edge_attr, time_enc_i)
+            m_j = self.message_function(s_j, s_i, edge_attr, time_enc_j)
+        
+            # Aggregate messages per node (keep most recent)
+            messages = torch.zeros_like(self.node_memory)
+            messages.index_copy_(0, src, m_i)
+            messages.index_copy_(0, dst, m_j)
+        
+            message_counts = torch.zeros(self.node_memory.size(0), device=self.device)
+            message_counts.index_fill_(0, src, 1)
+            message_counts.index_fill_(0, dst, 1)
+        
+            # Update last event times
+            self.last_event_time.index_copy_(0, src, torch.full_like(src, current_time, dtype=torch.float))
+            self.last_event_time.index_copy_(0, dst, torch.full_like(dst, current_time, dtype=torch.float))
+            
+        # MEMORY MODULE: Vectorized update
+        mask = message_counts > 0
+        if mask.any():
+            # Only update nodes with messages
+            updated_memory = self.node_memory.clone()
+            updated_memory[mask] = self.memory_module(
+                messages[mask],
+                self.node_memory[mask]
+            )
+            self.node_memory = updated_memory
+
         self.node_memory = updated_memory
         
         # EMBEDDING MODULE: Generate embeddings (Equation 3)
@@ -590,29 +604,31 @@ class SelectorAgent:
             "path": path
         })
 
-    def build_node_features(self, windows=[5, 15, 30], train_end_date=None) -> pd.DataFrame:
+    def build_node_features(self, windows=[2, 4], train_end_date=None) -> pd.DataFrame:
+
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
-        
+
         if train_end_date is not None:
             self.train_end_date = pd.to_datetime(train_end_date)
+
+        # Compute biweekly returns
+        df["log_return"] = np.log(df["adj_close"] / df["adj_close"].shift(1))
         
-        # Engineer features
+        # Engineer rolling features
         for window in windows:
-            df[f"mean_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: x.rolling(window).mean()
+
+            df[f"biweek_std_{window}"] = df.groupby("ticker")["adj_close"].transform(
+                lambda x: x.rolling(window * 10).std()
             )
-            df[f"std_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: x.rolling(window).std()
+            df[f"biweek_cumret_{window}"] = df.groupby("ticker")["log_return"].transform(
+                lambda x: x.rolling(window * 10).sum()
             )
-            df[f"cum_return_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: np.log(x / x.shift(1)).rolling(window).sum()
-            )
-        
+
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df["eps_yoy_growth"] = df.get("eps_yoy_growth", 0.0).fillna(0.0)
         df["peg_adj"] = df.get("peg_adj", 0.0).fillna(0.0)
-        
+
         # One-hot encode sectors
         all_sectors = sorted(self.df["sector"].unique())
         encoder = OneHotEncoder(sparse_output=False, dtype=int, categories=[all_sectors])
@@ -620,32 +636,25 @@ class SelectorAgent:
         sector_df = pd.DataFrame(sector_encoded, columns=encoder.get_feature_names_out())
         df = pd.concat([df.reset_index(drop=True), sector_df.reset_index(drop=True)], axis=1)
         df.drop(columns=["sector"], inplace=True, errors="ignore")
-        
+
         df.fillna(0.0, inplace=True)
-        
+
         exclude_cols = ["date", "ticker"]
-        numeric_cols = [c for c in df.columns 
-                       if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
-        
-        # Fit scaler only on training data
+        numeric_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
+
+        # Fit scaler on training data
         if self.scaler is None:
             self.scaler = MinMaxScaler()
-            
             if train_end_date is not None:
                 train_mask = df["date"] < self.train_end_date
                 train_data = df.loc[train_mask, numeric_cols]
                 self.scaler.fit(train_data)
-                self._log_event("scaler_fit", {
-                    "train_end_date": str(self.train_end_date),
-                    "train_samples": len(train_data),
-                    "total_samples": len(df)
-                })
             else:
                 self.scaler.fit(df[numeric_cols])
-                self._log_event("scaler_fit_warning", {
-                    "message": "Scaler fit on entire dataset - potential data leakage!",
-                    "total_samples": len(df)
-                })
+
+        df[numeric_cols] = self.scaler.transform(df[numeric_cols])
+        self.node_features = df
+        return df
         
         df[numeric_cols] = self.scaler.transform(df[numeric_cols])
         
@@ -655,144 +664,79 @@ class SelectorAgent:
             "windows": windows,
             "train_end_date": str(self.train_end_date) if self.train_end_date else None
         })
+        
         return df
 
     def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
         """
-        Build temporal graphs following Algorithm 2 from the paper.
+        Build biweekly temporal graphs.
         """
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
         if holdout_years is None:
             holdout_years = self.holdout_years
-        
-        # Determine split dates
+
         df_dates = self.df.copy()
         df_dates["date"] = pd.to_datetime(df_dates["date"])
-        
         last_date = df_dates["date"].max()
         holdout_start = last_date - pd.DateOffset(years=holdout_years)
-        mid_point = holdout_start + pd.DateOffset(months=6)
-        
-        val_start = holdout_start
-        val_end = mid_point - pd.DateOffset(days=1)
-        test_start = mid_point
-        test_end = last_date
-        train_end = val_start - pd.DateOffset(days=1)
-        
-        self.val_period = (val_start, val_end)
-        self.test_period = (test_start, test_end)
-        self.holdout_period = (val_start, test_end)
-        
-        # Build features with proper train_end_date
-        self.build_node_features(train_end_date=train_end)
-        
-        self.temporal_graphs = []
+
+        # Define biweekly periods
         df = self.node_features.copy()
         df["date"] = pd.to_datetime(df["date"])
-        tickers = sorted(df["ticker"].unique().tolist())
-        
-        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", 
-                       "div_amount", "volume"]
-        feature_cols = [c for c in df.columns 
-                       if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
-        
-        # Split data
-        train_df = df[df["date"] < val_start].copy()
-        val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)].copy()
-        test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
-        
-        # Add month column to training data
-        train_df["month"] = train_df["date"].dt.to_period("M")
-        unique_months = sorted(train_df["month"].unique())
-        
-        print(f"Building {len(unique_months)} monthly temporal graphs...")
-        
-        # Process each month (Algorithm 2)
-        for month_idx, month_period in enumerate(unique_months):
-            self._check_for_commands()
-            
-            month_data = train_df[train_df["month"] == month_period]
-            
-            if month_data.empty or len(month_data) < 10:
+        df["biweek"] = ((df["date"] - df["date"].min()).dt.days // 14).astype(int)
+
+        tickers = sorted(df["ticker"].unique())
+        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", "div_amount", "volume"]
+        feature_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
+
+        train_df = df[df["date"] < holdout_start].copy()
+        self.temporal_graphs = []
+
+        unique_biweeks = sorted(train_df["biweek"].unique())
+        print(f"Building {len(unique_biweeks)} biweekly temporal graphs...")
+
+        for biweek_idx in unique_biweeks:
+            biweek_data = train_df[train_df["biweek"] == biweek_idx]
+            if biweek_data.empty or len(biweek_data) < 2:
                 continue
-            
-            # Aggregate features for the month
-            monthly_features = month_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
+
+            monthly_features = biweek_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
             monthly_features = monthly_features.reindex(tickers, fill_value=0.0)
-            
+
             if len(monthly_features) < 2:
                 continue
-            
-            # Compute correlation matrix S(P_i(Δ_k), P_j(Δ_k))
+
+            # Correlation matrix
             corr_matrix = np.corrcoef(monthly_features.values)
             corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Create edges where S >= γ (correlation threshold)
+
+            # Create edges
             edges = np.argwhere(np.abs(corr_matrix) >= corr_threshold)
             edges = edges[edges[:, 0] < edges[:, 1]]
-            
             num_nodes = len(tickers)
             edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
-            
+
             edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
-            edge_attr = torch.tensor(
-                [[corr_matrix[i, j]] for i, j in edges],
-                dtype=torch.float,
-                device=self.device
-            )
-            
-            # Assign t = (k - 0.5) * δ as in the paper
-            edge_times = torch.ones(len(edges), device=self.device) * month_idx
-            
+            edge_attr = torch.tensor([[corr_matrix[i, j]] for i, j in edges], dtype=torch.float, device=self.device)
+            edge_times = torch.ones(len(edges), device=self.device) * biweek_idx
+
             self.temporal_graphs.append({
-                "month": str(month_period),
-                "start": str(month_period.start_time.date()),
-                "end": str(month_period.end_time.date()),
+                "biweek": biweek_idx,
                 "edge_index": edge_index,
                 "edge_attr": edge_attr,
                 "edge_times": edge_times,
-                "time": month_idx,
+                "time": biweek_idx,
                 "num_edges": len(edges)
             })
-        
-        train_df.drop(columns=["month"], inplace=True, errors="ignore")
-        
-        self._log_event("temporal_graphs_built", {
-            "n_graphs": len(self.temporal_graphs),
-            "frequency": "monthly",
-            "train_end": str(train_end.date()),
-            "val_period": (str(self.val_period[0].date()), str(self.val_period[1].date())),
-            "test_period": (str(self.test_period[0].date()), str(self.test_period[1].date())),
-            "corr_threshold": corr_threshold
-        })
-        
-        avg_edges = np.mean([g["num_edges"] for g in self.temporal_graphs]) if self.temporal_graphs else 0
-        
-        print(f"✅ Temporal graphs built: {len(self.temporal_graphs)} monthly graphs")
-        print(f"   Average edges per graph: {avg_edges:.1f}")
-        print(f"   Training period: up to {train_end.date()}")
-        print(f"   Validation: {self.val_period[0].date()} → {self.val_period[1].date()}")
-        print(f"   Test: {self.test_period[0].date()} → {self.test_period[1].date()}")
-        
-        return self.temporal_graphs, val_df, test_df
+
+        print(f"✅ Biweekly temporal graphs built: {len(self.temporal_graphs)} snapshots")
+        return self.temporal_graphs
 
     def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, 
                                    neg_sample_ratio=1, accumulation_steps=1,
                                    use_amp=True, skip_memory_replay=False):
-        """
-        Training procedure following Algorithm 1 from the paper.
-        Uses lag-one temporal batching with optimizations.
-        
-        Args:
-            optimizer: torch optimizer
-            batch_size: batch size for processing
-            epochs: number of training epochs
-            neg_sample_ratio: ratio of negative to positive samples
-            accumulation_steps: gradient accumulation steps (helps with memory)
-            use_amp: use automatic mixed precision for faster training
-            skip_memory_replay: skip replaying previous graph (faster but less accurate)
-        """
+ 
         # Get unique tickers and build node-level features
         tickers = sorted(self.node_features["ticker"].unique().tolist())
         num_nodes = len(tickers)
@@ -844,37 +788,28 @@ class SelectorAgent:
             for i, graph in enumerate(self.temporal_graphs):
                 self._check_for_commands()
                 
-                # Use previous batch to update memory (optional for speed)
+                # Optimized memory replay: skip edge processing if memory exists
                 if prev_graph is not None and not skip_memory_replay:
                     with torch.no_grad():
-                        if use_amp and scaler:
-                            with torch.amp.autocast('cuda'):
-                                _, memory = self.model(
-                                    x, prev_graph["edge_index"],
-                                    prev_graph.get("edge_attr", None),
-                                    prev_graph.get("edge_times", None),
-                                    prev_graph.get("time", i - 1),
-                                    pair_index=None, memory=self.model.node_memory
-                                )
-                        else:
-                            _, memory = self.model(
-                                x, prev_graph["edge_index"],
-                                prev_graph.get("edge_attr", None),
-                                prev_graph.get("edge_times", None),
-                                prev_graph.get("time", i - 1),
-                                pair_index=None, memory=self.model.node_memory
-                            )
-                        self.model.node_memory = memory.detach()
+                        # Only update memory using stored previous memory and node embeddings
+                        self.model.node_memory, _ = self.model.process_event_batch(
+                            x, 
+                            prev_graph["edge_index"], 
+                            prev_graph.get("edge_attr", None),
+                            prev_graph.get("edge_times", None),
+                            current_time=prev_graph.get("time", i - 1)
+                        )
                 
-                # Current batch for prediction
-                edge_index = graph["edge_index"]
-                edge_attr = graph.get("edge_attr", None)
-                edge_times = graph.get("edge_times", None)
-                current_time = graph.get("time", i)
-                
-                if edge_index.numel() == 0:
-                    prev_graph = graph
-                    continue
+                                
+                                # Current batch for prediction
+                                edge_index = graph["edge_index"]
+                                edge_attr = graph.get("edge_attr", None)
+                                edge_times = graph.get("edge_times", None)
+                                current_time = graph.get("time", i)
+                                
+                                if edge_index.numel() == 0:
+                                    prev_graph = graph
+                                    continue
                 
                 # Positive samples
                 src = edge_index[0]
@@ -883,29 +818,45 @@ class SelectorAgent:
                 total_events += E
                 
                 pos_pairs = torch.stack([src, dst], dim=0)
-                
-                # Negative sampling
+    
+                # Vectorized negative sampling
                 num_neg = int(E * neg_sample_ratio)
                 if num_neg > 0:
-                    rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
-                    src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
+                    # Random negative targets
+                    neg_dst = torch.randint(0, num_nodes, (num_neg,), device=self.device)
                     
-                    # Ensure negative samples are different from source
-                    mask_equal = rand_idx == src_for_neg
-                    if mask_equal.any():
-                        rand_idx[mask_equal] = torch.randint(
-                            0, num_nodes, (mask_equal.sum().item(),), device=self.device
-                        )
-                    
-                    neg_pairs = torch.stack([src_for_neg, rand_idx], dim=0)
-                    all_pairs = torch.cat([pos_pairs, neg_pairs], dim=1)
-                    labels = torch.cat([
-                        torch.ones(E, device=self.device),
-                        torch.zeros(num_neg, device=self.device)
-                    ])
+                    # Random negative sources sampled from positive src repeated
+                    neg_src = src.repeat((neg_sample_ratio,))[:num_neg]
+                
+                    # Avoid trivial pairs (src != dst)
+                    neq_mask = neg_dst == neg_src
+                    while neq_mask.any():
+                        neg_dst[neq_mask] = torch.randint(0, num_nodes, (neq_mask.sum().item(),), device=self.device)
+                        neq_mask = neg_dst == neg_src
+                
+                    # Combine positive and negative
+                    all_pairs = torch.cat([pos_pairs, torch.stack([neg_src, neg_dst], dim=0)], dim=1)
+                    labels = torch.cat([torch.ones(E, device=self.device), torch.zeros(num_neg, device=self.device)])
                 else:
                     all_pairs = pos_pairs
                     labels = torch.ones(E, device=self.device)
+                
+                # Forward pass in **batches** to reduce memory overhead
+                batch_size_pairs = 4096
+                scores_list = []
+                
+                for start in range(0, all_pairs.size(1), batch_size_pairs):
+                    end = min(start + batch_size_pairs, all_pairs.size(1))
+                    batch_pairs = all_pairs[:, start:end]
+                
+                    scores, memory = self.model(
+                        x, edge_index, edge_attr, edge_times,
+                        current_time, pair_index=batch_pairs,
+                        memory=self.model.node_memory
+                    )
+                    scores_list.append(scores)
+                
+                scores = torch.cat(scores_list)
                 
                 # Forward pass with AMP
                 if use_amp and scaler:
