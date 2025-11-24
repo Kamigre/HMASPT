@@ -809,7 +809,7 @@ class SelectorAgent:
         
         print(f"Node features shape: {x.shape} (num_nodes={num_nodes}, features={x.shape[1]})")
         
-        bce_loss_fn = nn.BCELoss(reduction="mean")
+        bce_loss_fn = torch.nn.BCEWithLogitsLoss()
         
         # Setup mixed precision training
         scaler = torch.amp.GradScaler('cuda') if use_amp and self.device == 'cuda' else None
