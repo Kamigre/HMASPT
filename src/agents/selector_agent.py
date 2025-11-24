@@ -59,13 +59,18 @@ class MessageFunction(nn.Module):
     """
     Message function msg(.) from Equation 1.
     Computes messages for node memory updates.
+    Projects concatenated features to memory dimension.
     """
     def __init__(self, memory_dim, edge_dim, time_dim):
         super().__init__()
-        # Identity message function: concatenate inputs
+        # Identity message function concatenates inputs, then projects
         self.memory_dim = memory_dim
         self.edge_dim = edge_dim
         self.time_dim = time_dim
+        
+        # Project concatenated features to memory dimension
+        concat_dim = memory_dim * 2 + edge_dim + time_dim
+        self.projection = nn.Linear(concat_dim, memory_dim)
         
     def forward(self, s_i, s_j, e_ij, time_enc):
         """
@@ -75,10 +80,12 @@ class MessageFunction(nn.Module):
             e_ij: edge features
             time_enc: time encoding ψ(t - t'_i)
         Returns:
-            message vector
+            message vector (projected to memory_dim)
         """
         # Concatenate all inputs (identity message function)
-        return torch.cat([s_i, s_j, e_ij, time_enc], dim=-1)
+        concatenated = torch.cat([s_i, s_j, e_ij, time_enc], dim=-1)
+        # Project to memory dimension
+        return self.projection(concatenated)
 
 
 class MemoryModule(nn.Module):
@@ -86,14 +93,15 @@ class MemoryModule(nn.Module):
     Memory module mem(.) from Equation 2.
     Updates node memory using GRU.
     """
-    def __init__(self, message_dim, memory_dim):
+    def __init__(self, memory_dim):
         super().__init__()
-        self.gru = nn.GRUCell(message_dim, memory_dim)
+        # Message is now projected to memory_dim, so input/hidden dims match
+        self.gru = nn.GRUCell(memory_dim, memory_dim)
         
     def forward(self, message, memory):
         """
         Args:
-            message: computed message m_i(t)
+            message: computed message m_i(t) (already projected to memory_dim)
             memory: previous memory state s_i(t-)
         Returns:
             updated memory s_i(t)
@@ -267,12 +275,11 @@ class MemoryTGNN(nn.Module):
         # Time encoder
         self.time_encoder = TimeEncoder(hidden_dim)
         
-        # Message function (identity: concatenation)
-        message_dim = hidden_dim * 2 + edge_feature_dim + hidden_dim  # s_i + s_j + e_ij + time_enc
+        # Message function (projects concatenation to hidden_dim)
         self.message_function = MessageFunction(hidden_dim, edge_feature_dim, hidden_dim)
         
-        # Memory module (GRU)
-        self.memory_module = MemoryModule(message_dim, hidden_dim)
+        # Memory module (GRU with matching dimensions)
+        self.memory_module = MemoryModule(hidden_dim)
         
         # Embedding module (temporal graph attention)
         self.embedding_module = TemporalGraphAttention(
