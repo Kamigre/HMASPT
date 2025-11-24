@@ -31,25 +31,36 @@ import torch.nn.functional as F
 
 from agents.message_bus import MessageBus, JSONLogger
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+
 class MemoryTGNN(nn.Module):
-    """
-    Memory-based TGNN using GATConv for vectorized message passing.
-    """
-    def __init__(self, node_feature_dim, hidden_dim=48, num_heads=2, dropout=0.2, device=None):
+
+    def __init__(self, node_feature_dim, hidden_dim=48, num_heads=2, num_layers=2, dropout=0.2, device=None):
         super().__init__()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.dropout = dropout
         
-        # Node encoder
+        # Node feature encoder
         self.node_encoder = nn.Sequential(
             nn.Linear(node_feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # GATConv for vectorized message passing
-        self.gat = GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
+        # Memory module (GRU)
+        self.memory_module = nn.GRUCell(hidden_dim, hidden_dim)
+        
+        # GAT layers
+        self.gat_layers = nn.ModuleList([
+            GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout, concat=True)
+            for _ in range(num_layers)
+        ])
         
         # Decoder for pair scoring
         self.decoder = nn.Sequential(
@@ -59,42 +70,60 @@ class MemoryTGNN(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
         
-        self._reset_parameters()
+        # Node memories and last event times
+        self.node_memory = None
+        self.last_event_time = None
+        
         self.to(self.device)
-    
-    def _reset_parameters(self):
+        self.reset_parameters()
+
+    def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def forward(self, node_features, edge_index, pair_index=None):
-        """
-        Args:
-            node_features: node features (num_nodes, feature_dim)
-            edge_index: edge connectivity (2, num_edges)
-            pair_index: optional pairs to score
-        Returns:
-            embeddings, and optionally pair scores
-        """
-        x = node_features.to(self.device)
+    def reset_memory(self, num_nodes):
+        
+        self.node_memory = torch.zeros(num_nodes, self.hidden_dim, device=self.device)
+        self.last_event_time = torch.zeros(num_nodes, device=self.device)
+    
+    def forward(self, node_features, edge_index=None, pair_index=None, current_time=0.0, memory=None):
+
+        node_features = node_features.to(self.device)
+        num_nodes = node_features.size(0)
+        
+        # Initialize memory if not set
+        if memory is not None:
+            self.node_memory = memory.to(self.device)
+        elif self.node_memory is None:
+            self.reset_memory(num_nodes)
         
         # Encode node features
-        h = self.node_encoder(x)
+        x_encoded = self.node_encoder(node_features)
         
-        # Vectorized message passing
-        if edge_index.numel() > 0:
-            h = self.gat(h, edge_index)
-            h = F.elu(h)
-        h = F.normalize(h, p=2, dim=1)
+        # Combine with memory
+        h = self.node_memory + x_encoded
         
+        # GAT message passing
+        if edge_index is not None and edge_index.numel() > 0:
+            for gat in self.gat_layers:
+                h = gat(h, edge_index)
+                h = F.relu(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+        
+        # Update memory
+        self.node_memory = self.memory_module(h, self.node_memory)
+        embeddings = F.normalize(self.node_memory, p=2, dim=1)
+        
+        # Score pairs if requested
         if pair_index is not None:
             src_idx = pair_index[0].long().to(self.device)
             dst_idx = pair_index[1].long().to(self.device)
-            pair_features = torch.cat([h[src_idx], h[dst_idx]], dim=1)
+            pair_features = torch.cat([embeddings[src_idx], embeddings[dst_idx]], dim=1)
             scores = self.decoder(pair_features)
-            return scores.view(-1), h
+            return scores.view(-1), self.node_memory
         
-        return h, h
+        return embeddings, self.node_memory
 
 @dataclass
 class SelectorAgent:
