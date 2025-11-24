@@ -31,7 +31,6 @@ import torch.nn.functional as F
 
 from agents.message_bus import MessageBus, JSONLogger
 
-
 class TimeEncoder(nn.Module):
     """
     Time encoding function ψ(.) from the paper.
@@ -275,56 +274,33 @@ class TemporalGraphAttention(nn.Module):
         
         return neighbors
 
-
 class MemoryTGNN(nn.Module):
     """
-    Memory-based Temporal Graph Neural Network following the paper exactly.
-    Encoder-decoder architecture with message, memory, and embedding modules.
+    Memory-based TGNN using GATConv for vectorized message passing.
     """
-    
-    def __init__(self, node_feature_dim, edge_feature_dim, hidden_dim=48, 
-                 num_heads=2, num_layers=2, dropout=0.2, device=None):
+    def __init__(self, node_feature_dim, hidden_dim=48, num_heads=2, dropout=0.2, device=None):
         super().__init__()
-        
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.num_layers = num_layers
         
-        # Node feature encoder
+        # Node encoder
         self.node_encoder = nn.Sequential(
             nn.Linear(node_feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Time encoder
-        self.time_encoder = TimeEncoder(hidden_dim)
+        # GATConv for vectorized message passing
+        self.gat = GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
         
-        # Message function (projects concatenation to hidden_dim)
-        self.message_function = MessageFunction(hidden_dim, edge_feature_dim, hidden_dim)
-        
-        # Memory module (GRU with matching dimensions)
-        self.memory_module = MemoryModule(hidden_dim)
-        
-        # Embedding module (temporal graph attention)
-        self.embedding_module = TemporalGraphAttention(
-            hidden_dim, num_heads, num_layers, dropout
-        )
-        
-        # Decoder (two-layer MLP + sigmoid)
+        # Decoder for pair scoring
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
         )
-        
-        # Node memories (initialized to zero)
-        self.node_memory = None
-        
-        # Track last event time for each node
-        self.last_event_time = None
         
         self._reset_parameters()
         self.to(self.device)
@@ -334,154 +310,34 @@ class MemoryTGNN(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def reset_memory(self, num_nodes):
-        """Initialize/reset node memories to zero."""
-        self.node_memory = torch.zeros(
-            num_nodes, self.hidden_dim, device=self.device
-        )
-        self.last_event_time = torch.zeros(num_nodes, device=self.device)
-    
-    def process_event_batch(self, node_features, edge_index, edge_attr, 
-                           edge_times, current_time):
+    def forward(self, node_features, edge_index, pair_index=None):
         """
-        Process a batch of events (temporal batch from paper).
-        
         Args:
-            node_features: X_i(t) for all nodes
-            edge_index: edge indices in batch
-            edge_attr: edge features
-            edge_times: timestamp for each edge
-            current_time: current timestamp
-            
+            node_features: node features (num_nodes, feature_dim)
+            edge_index: edge connectivity (2, num_edges)
+            pair_index: optional pairs to score
         Returns:
-            updated embeddings and memory
+            embeddings, and optionally pair scores
         """
-        num_nodes = node_features.size(0)
-        
-        # Initialize memory if needed
-        if self.node_memory is None:
-            self.reset_memory(num_nodes)
+        x = node_features.to(self.device)
         
         # Encode node features
-        x_encoded = self.node_encoder(node_features)
+        h = self.node_encoder(x)
         
-        # MESSAGE MODULE: Compute messages for all events
-        messages = torch.zeros(num_nodes, self.node_memory.size(1), device=self.device)
-        message_counts = torch.zeros(num_nodes, device=self.device)
-        
+        # Vectorized message passing
         if edge_index.numel() > 0:
-            for idx in range(edge_index.size(1)):
-                i = edge_index[0, idx].item()
-                j = edge_index[1, idx].item()
-                
-                # Get edge features
-                e_ij = edge_attr[idx:idx+1] if edge_attr is not None else torch.zeros(1, 1, device=self.device)
-                
-                # Time encoding ψ(t - t'_i) and ψ(t - t'_j)
-                time_diff_i = current_time - self.last_event_time[i]
-                time_diff_j = current_time - self.last_event_time[j]
-                time_enc_i = self.time_encoder(time_diff_i.unsqueeze(0))
-                time_enc_j = self.time_encoder(time_diff_j.unsqueeze(0))
-                
-                # Compute messages for both nodes (Equation 1)
-                m_i = self.message_function(
-                    self.node_memory[i:i+1],
-                    self.node_memory[j:j+1],
-                    e_ij,
-                    time_enc_i
-                )
-                
-                m_j = self.message_function(
-                    self.node_memory[j:j+1],
-                    self.node_memory[i:i+1],
-                    e_ij,
-                    time_enc_j
-                )
-                
-                # Recent message aggregator: keep most recent message
-                messages[i] = m_i.squeeze(0)
-                messages[j] = m_j.squeeze(0)
-                message_counts[i] = 1
-                message_counts[j] = 1
-                
-                # Update last event time
-                self.last_event_time[i] = current_time
-                self.last_event_time[j] = current_time
+            h = self.gat(h, edge_index)
+            h = F.elu(h)
+        h = F.normalize(h, p=2, dim=1)
         
-        # MEMORY MODULE: Update memory for nodes with messages (Equation 2)
-        updated_memory = self.node_memory.clone()
-        for i in range(num_nodes):
-            if message_counts[i] > 0:
-                updated_memory[i] = self.memory_module(
-                    messages[i:i+1],
-                    self.node_memory[i:i+1]
-                ).squeeze(0)
-        
-        self.node_memory = updated_memory
-        
-        # EMBEDDING MODULE: Generate embeddings (Equation 3)
-        # z_i^(0)(t) = s_i(t) + X_i(t)
-        z_0 = self.node_memory + x_encoded
-        
-        # L-layer temporal graph attention
-        z = self.embedding_module(
-            z_0, edge_index, edge_times, current_time
-        )
-        
-        # Normalize embeddings
-        z = F.normalize(z, p=2, dim=1)
-        
-        return z, self.node_memory
-    
-    def forward(self, node_features, edge_index, edge_attr=None, 
-                edge_times=None, current_time=0.0, pair_index=None, memory=None):
-        """
-        Forward pass following the paper's architecture.
-        
-        Args:
-            node_features: node features X_i(t)
-            edge_index: edge connectivity
-            edge_attr: edge features
-            edge_times: timestamp for each edge
-            current_time: current timestamp
-            pair_index: optional pairs to score
-            memory: optional external memory state
-            
-        Returns:
-            embeddings (and optionally pair scores)
-        """
-        node_features = node_features.to(self.device)
-        num_nodes = node_features.size(0)
-        
-        # Use external memory if provided
-        if memory is not None:
-            self.node_memory = memory.to(self.device)
-        elif self.node_memory is None:
-            self.reset_memory(num_nodes)
-        
-        # Handle edge_times
-        if edge_times is None and edge_index is not None and edge_index.numel() > 0:
-            edge_times = torch.ones(edge_index.size(1), device=self.device) * current_time
-        
-        # Process event batch
-        z, memory = self.process_event_batch(
-            node_features, edge_index, edge_attr, edge_times, current_time
-        )
-        
-        # DECODER: Score pairs if requested (Equation 4)
         if pair_index is not None:
             src_idx = pair_index[0].long().to(self.device)
             dst_idx = pair_index[1].long().to(self.device)
-            
-            # Concatenate embeddings
-            pair_features = torch.cat([z[src_idx], z[dst_idx]], dim=1)
-            
-            # MLP decoder with sigmoid
+            pair_features = torch.cat([h[src_idx], h[dst_idx]], dim=1)
             scores = self.decoder(pair_features)
-            return scores.view(-1), memory
+            return scores.view(-1), h
         
-        return z, memory
-
+        return h, h
 
 @dataclass
 class SelectorAgent:
@@ -1063,36 +919,25 @@ class SelectorAgent:
         
         print("Memory state initialized. Scoring all pairs...")
         
-        # Now score all pairs using holdout features
+        # Generate node embeddings for holdout period
+        x_holdout = torch.from_numpy(holdout_features.values).float().to(self.device)
+        
         with torch.no_grad():
-            # Generate all possible pairs
-            src_idx, dst_idx = np.triu_indices(num_nodes, k=1)
+            embeddings, _ = self.model(x_holdout, edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device))
             
-            # Process in batches to avoid memory issues
+            # Score all pairs
+            src_idx, dst_idx = np.triu_indices(num_nodes, k=1)
             batch_size = 10000
             all_scores = []
-            
+        
             for start in range(0, len(src_idx), batch_size):
                 end = min(start + batch_size, len(src_idx))
-                
                 batch_src = torch.tensor(src_idx[start:end], device=self.device)
                 batch_dst = torch.tensor(dst_idx[start:end], device=self.device)
                 pair_index = torch.stack([batch_src, batch_dst], dim=0)
-                
-                # Score this batch of pairs
-                # Use no edges (just final embeddings from memory)
-                scores, _ = self.model(
-                    x_holdout,
-                    edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device),  # Empty edges
-                    edge_attr=None,
-                    edge_times=None,
-                    current_time=len(self.temporal_graphs),  # Time after training
-                    pair_index=pair_index,
-                    memory=self.model.node_memory
-                )
-                
+                scores, _ = self.model(x_holdout, edge_index=torch.empty((2,0), dtype=torch.long, device=self.device), pair_index=pair_index)
                 all_scores.append(scores.cpu().numpy())
-        
+
         # Combine all scores
         all_scores = np.concatenate(all_scores)
         
