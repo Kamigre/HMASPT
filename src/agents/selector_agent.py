@@ -230,8 +230,8 @@ class TemporalGraphAttention(nn.Module):
                     h_next.append(h_i)
                 
                 h_next = torch.cat(h_next, dim=0)
+                return h_next
 
-    
     def clear_cache(self):
         """Clear neighbor cache to free memory."""
         self._neighbor_cache = {}
@@ -668,70 +668,109 @@ class SelectorAgent:
         return df
 
     def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
-        """
-        Build biweekly temporal graphs.
-        """
+        """ Build biweekly temporal graphs following Algorithm 2 from the paper. """
+
         if corr_threshold is None:
             corr_threshold = self.corr_threshold
         if holdout_years is None:
             holdout_years = self.holdout_years
 
+        # Determine split dates
         df_dates = self.df.copy()
         df_dates["date"] = pd.to_datetime(df_dates["date"])
         last_date = df_dates["date"].max()
         holdout_start = last_date - pd.DateOffset(years=holdout_years)
+        mid_point = holdout_start + pd.DateOffset(months=6)
 
-        # Define biweekly periods
+        val_start = holdout_start
+        val_end = mid_point - pd.DateOffset(days=1)
+        test_start = mid_point
+        test_end = last_date
+        train_end = val_start - pd.DateOffset(days=1)
+
+        self.val_period = (val_start, val_end)
+        self.test_period = (test_start, test_end)
+        self.holdout_period = (val_start, test_end)
+
+        # Build features
+        self.build_node_features(train_end_date=train_end)
+        self.temporal_graphs = []
+
         df = self.node_features.copy()
         df["date"] = pd.to_datetime(df["date"])
-        df["biweek"] = ((df["date"] - df["date"].min()).dt.days // 14).astype(int)
-
-        tickers = sorted(df["ticker"].unique())
+        tickers = sorted(df["ticker"].unique().tolist())
         exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", "div_amount", "volume"]
         feature_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
 
-        train_df = df[df["date"] < holdout_start].copy()
-        self.temporal_graphs = []
+        # Split data
+        train_df = df[df["date"] < val_start].copy()
+        val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)].copy()
+        test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
 
+        # Add biweekly column
+        train_df = train_df.sort_values("date")
+        train_df["biweek"] = ((train_df["date"] - train_df["date"].min()).dt.days // 14).astype(int)
         unique_biweeks = sorted(train_df["biweek"].unique())
         print(f"Building {len(unique_biweeks)} biweekly temporal graphs...")
 
-        for biweek_idx in unique_biweeks:
-            biweek_data = train_df[train_df["biweek"] == biweek_idx]
-            if biweek_data.empty or len(biweek_data) < 2:
-                continue
+        for bw_idx, bw in enumerate(unique_biweeks):
+            self._check_for_commands()
+            bw_data = train_df[train_df["biweek"] == bw]
 
-            monthly_features = biweek_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
-            monthly_features = monthly_features.reindex(tickers, fill_value=0.0)
+            # Aggregate features for the biweek
+            bw_features = bw_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
+            bw_features = bw_features.reindex(tickers, fill_value=0.0)
 
-            if len(monthly_features) < 2:
-                continue
+            # Compute correlation matrix
+            if len(bw_features) >= 2:
+                corr_matrix = np.corrcoef(bw_features.values)
+                corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Correlation matrix
-            corr_matrix = np.corrcoef(monthly_features.values)
-            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # Create edges
-            edges = np.argwhere(np.abs(corr_matrix) >= corr_threshold)
-            edges = edges[edges[:, 0] < edges[:, 1]]
-            num_nodes = len(tickers)
-            edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
+                # Create edges where correlation >= threshold
+                edges = np.argwhere(np.abs(corr_matrix) >= corr_threshold)
+                edges = edges[edges[:, 0] < edges[:, 1]]
+                num_nodes = len(tickers)
+                edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
+            else:
+                edges = np.empty((0, 2), dtype=int)
 
             edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
-            edge_attr = torch.tensor([[corr_matrix[i, j]] for i, j in edges], dtype=torch.float, device=self.device)
-            edge_times = torch.ones(len(edges), device=self.device) * biweek_idx
+            edge_attr = torch.tensor(
+                [[corr_matrix[i, j]] for i, j in edges] if edges.size > 0 else [],
+                dtype=torch.float, device=self.device
+            )
+            edge_times = torch.ones(edge_index.size(1), device=self.device) if edge_index.numel() > 0 else torch.empty(0, device=self.device)
 
             self.temporal_graphs.append({
-                "biweek": biweek_idx,
+                "biweek": bw,
+                "start": str(bw_data["date"].min().date()) if not bw_data.empty else None,
+                "end": str(bw_data["date"].max().date()) if not bw_data.empty else None,
                 "edge_index": edge_index,
                 "edge_attr": edge_attr,
                 "edge_times": edge_times,
-                "time": biweek_idx,
+                "time": bw_idx,
                 "num_edges": len(edges)
             })
 
-        print(f"✅ Biweekly temporal graphs built: {len(self.temporal_graphs)} snapshots")
-        return self.temporal_graphs
+        train_df.drop(columns=["biweek"], inplace=True, errors="ignore")
+
+        self._log_event("temporal_graphs_built", {
+            "n_graphs": len(self.temporal_graphs),
+            "frequency": "biweekly",
+            "train_end": str(train_end.date()),
+            "val_period": (str(self.val_period[0].date()), str(self.val_period[1].date())),
+            "test_period": (str(self.test_period[0].date()), str(self.test_period[1].date())),
+            "corr_threshold": corr_threshold
+        })
+
+        avg_edges = np.mean([g["num_edges"] for g in self.temporal_graphs]) if self.temporal_graphs else 0
+        print(f"✅ Temporal graphs built: {len(self.temporal_graphs)} biweekly graphs")
+        print(f" Average edges per graph: {avg_edges:.1f}")
+        print(f" Training period: up to {train_end.date()}")
+        print(f" Validation: {self.val_period[0].date()} → {self.val_period[1].date()}")
+        print(f" Test: {self.test_period[0].date()} → {self.test_period[1].date()}")
+
+        return self.temporal_graphs, val_df, test_df
 
     def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, 
                                    neg_sample_ratio=1, accumulation_steps=1,
@@ -787,30 +826,19 @@ class SelectorAgent:
             
             for i, graph in enumerate(self.temporal_graphs):
                 self._check_for_commands()
-                
-                # Optimized memory replay: skip edge processing if memory exists
-                if prev_graph is not None and not skip_memory_replay:
-                    with torch.no_grad():
-                        # Only update memory using stored previous memory and node embeddings
-                        self.model.node_memory, _ = self.model.process_event_batch(
-                            x, 
-                            prev_graph["edge_index"], 
-                            prev_graph.get("edge_attr", None),
-                            prev_graph.get("edge_times", None),
-                            current_time=prev_graph.get("time", i - 1)
-                        )
-              
-                        # Current batch for prediction
-                        edge_index = graph["edge_index"]
-                        edge_attr = graph.get("edge_attr", None)
-                        edge_times = graph.get("edge_times", None)
-                        current_time = graph.get("time", i)
-                        
-                        if edge_index.numel() == 0:
-                            prev_graph = graph
-                            continue
-                
-                # Positive samples
+
+                # Always assign these first
+                edge_index = graph.get("edge_index", torch.empty((2, 0), dtype=torch.long, device=self.device))
+                edge_attr = graph.get("edge_attr", None)
+                edge_times = graph.get("edge_times", None)
+                current_time = graph.get("time", i)
+
+                # Skip empty graphs
+                if edge_index.numel() == 0:
+                    prev_graph = graph
+                    continue
+
+                # Now proceed with positive samples
                 src = edge_index[0]
                 dst = edge_index[1]
                 E = src.size(0)
@@ -847,6 +875,8 @@ class SelectorAgent:
                 for start in range(0, all_pairs.size(1), batch_size_pairs):
                     end = min(start + batch_size_pairs, all_pairs.size(1))
                     batch_pairs = all_pairs[:, start:end]
+                    if batch_pairs.ndim == 1:
+                        batch_pairs = batch_pairs.unsqueeze(1)  # ensure shape (2, 1)
                 
                     scores, memory = self.model(
                         x, edge_index, edge_attr, edge_times,
