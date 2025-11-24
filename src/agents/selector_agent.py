@@ -113,6 +113,7 @@ class TemporalGraphAttention(nn.Module):
     """
     Temporal graph attention from Equation 3.
     L-layer temporal graph attention with time encodings.
+    Optimized with batched attention and cached neighbors.
     """
     def __init__(self, d, num_heads, num_layers, dropout=0.2):
         super().__init__()
@@ -122,17 +123,30 @@ class TemporalGraphAttention(nn.Module):
         
         self.time_encoder = TimeEncoder(d)
         
-        # MLP and multi-head attention for each layer
+        # MLP for each layer - takes concatenated input
         self.mlps = nn.ModuleList([
             nn.Linear(d * 2, d) for _ in range(num_layers)
         ])
         
+        # Multi-head attention for each layer
         self.mhas = nn.ModuleList([
             nn.MultiheadAttention(d, num_heads, dropout=dropout, batch_first=True)
             for _ in range(num_layers)
         ])
         
+        # Projection layers to handle concatenated features
+        self.query_proj = nn.ModuleList([
+            nn.Linear(d * 2, d) for _ in range(num_layers)
+        ])
+        
+        self.kv_proj = nn.ModuleList([
+            nn.Linear(d * 2, d) for _ in range(num_layers)
+        ])
+        
         self.dropout = dropout
+        
+        # Cache for temporal neighbors
+        self._neighbor_cache = {}
         
     def forward(self, z, edge_index, edge_times, current_time, N=10):
         """
@@ -147,61 +161,64 @@ class TemporalGraphAttention(nn.Module):
         """
         num_nodes = z.size(0)
         
-        # Build temporal neighborhood for each node
-        # π_i = {e_π_i(1)(t_π_i(1)), ..., e_π_i(N)(t_π_i(N))}
-        neighbors = self._build_temporal_neighbors(
-            edge_index, edge_times, num_nodes, N
-        )
+        # Build temporal neighborhood (with caching)
+        cache_key = (edge_index.data_ptr() if edge_index is not None else 0, current_time)
+        if cache_key not in self._neighbor_cache:
+            neighbors = self._build_temporal_neighbors(edge_index, edge_times, num_nodes, N)
+            self._neighbor_cache[cache_key] = neighbors
+        else:
+            neighbors = self._neighbor_cache[cache_key]
         
         # L layers of attention
         h = z
         for l in range(self.num_layers):
-            h_next = []
-            
-            for i in range(num_nodes):
-                # Query: q_i^(l)(t) = z_i^(l-1) || ψ(0)
-                time_zero = self.time_encoder(torch.zeros(1, device=z.device))
-                q = torch.cat([h[i:i+1], time_zero], dim=-1)
-                
-                # Keys and Values: neighbors with time encodings
-                if i in neighbors and len(neighbors[i]) > 0:
-                    neighbor_indices, neighbor_times = neighbors[i]
-                    
-                    # Time encodings for neighbors
-                    time_diffs = current_time - neighbor_times
-                    time_encs = self.time_encoder(time_diffs)
-                    
-                    # K_i^(l)(t) = V_i^(l)(t) = [z_i^(l-1) || e_π_i(k) || ψ(t - t_π_i(k))]
-                    # Simplified: use neighbor embeddings with time encoding
-                    kv = torch.cat([
-                        h[neighbor_indices],
-                        time_encs
-                    ], dim=-1)
-                    
-                    # Add self-connection
-                    kv = torch.cat([
-                        torch.cat([h[i:i+1], time_zero], dim=-1),
-                        kv
-                    ], dim=0).unsqueeze(0)
-                    
-                    # Multi-head attention
-                    q_input = q.unsqueeze(0)  # (1, 1, d*2)
-                    attn_out, _ = self.mhas[l](q_input, kv, kv)
-                    z_tilde = attn_out.squeeze(0)
-                else:
-                    # No neighbors: use self
-                    z_tilde = q
-                
-                # MLP: z_i^(l) = mlp^(l)(z^(l-1) || z_tilde^(l))
-                combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
-                h_i = self.mlps[l](combined)
-                h_i = F.relu(h_i)
-                h_i = F.dropout(h_i, p=self.dropout, training=self.training)
-                h_next.append(h_i)
-            
-            h = torch.cat(h_next, dim=0)
+            h = self._apply_layer_batched(h, neighbors, current_time, l)
         
         return h
+    
+    def _apply_layer_batched(self, h, neighbors, current_time, layer_idx):
+        """Apply attention layer with batched operations where possible."""
+        num_nodes = h.size(0)
+        time_zero = self.time_encoder(torch.zeros(1, device=h.device))
+        
+        # Process all nodes
+        h_next = []
+        
+        for i in range(num_nodes):
+            # Query
+            q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+            q = self.query_proj[layer_idx](q_concat).unsqueeze(0)
+            
+            # Keys and Values
+            if i in neighbors and len(neighbors[i][0]) > 0:
+                neighbor_indices, neighbor_times = neighbors[i]
+                
+                time_diffs = current_time - neighbor_times
+                time_encs = self.time_encoder(time_diffs)
+                
+                kv_concat = torch.cat([h[neighbor_indices], time_encs], dim=-1)
+                self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
+                kv_concat = torch.cat([self_concat, kv_concat], dim=0)
+                kv = self.kv_proj[layer_idx](kv_concat).unsqueeze(0)
+            else:
+                kv = q
+            
+            # Attention
+            attn_out, _ = self.mhas[layer_idx](q, kv, kv)
+            z_tilde = attn_out.squeeze(0)
+            
+            # MLP
+            combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
+            h_i = self.mlps[layer_idx](combined)
+            h_i = F.relu(h_i)
+            h_i = F.dropout(h_i, p=self.dropout, training=self.training)
+            h_next.append(h_i)
+        
+        return torch.cat(h_next, dim=0)
+    
+    def clear_cache(self):
+        """Clear neighbor cache to free memory."""
+        self._neighbor_cache = {}
     
     def _build_temporal_neighbors(self, edge_index, edge_times, num_nodes, N):
         """
@@ -210,14 +227,19 @@ class TemporalGraphAttention(nn.Module):
         """
         neighbors = {i: ([], []) for i in range(num_nodes)}
         
-        if edge_index.numel() == 0:
+        if edge_index is None or edge_index.numel() == 0:
+            for i in range(num_nodes):
+                neighbors[i] = (
+                    torch.tensor([], device=edge_index.device if edge_index is not None else 'cpu', dtype=torch.long),
+                    torch.tensor([], device=edge_index.device if edge_index is not None else 'cpu', dtype=torch.float)
+                )
             return neighbors
         
         # For each edge, add to both nodes' neighborhoods
         for idx in range(edge_index.size(1)):
             src = edge_index[0, idx].item()
             dst = edge_index[1, idx].item()
-            t = edge_times[idx] if edge_times is not None else 0.0
+            t = edge_times[idx].item() if edge_times is not None else 0.0
             
             neighbors[src][0].append(dst)
             neighbors[src][1].append(t)
@@ -237,15 +259,19 @@ class TemporalGraphAttention(nn.Module):
                 if sorted_pairs:
                     times, indices = zip(*sorted_pairs)
                     neighbors[i] = (
-                        torch.tensor(indices, device=edge_index.device),
+                        torch.tensor(indices, device=edge_index.device, dtype=torch.long),
                         torch.tensor(times, device=edge_index.device, dtype=torch.float)
                     )
                 else:
-                    neighbors[i] = (torch.tensor([], device=edge_index.device), 
-                                  torch.tensor([], device=edge_index.device))
+                    neighbors[i] = (
+                        torch.tensor([], device=edge_index.device, dtype=torch.long),
+                        torch.tensor([], device=edge_index.device, dtype=torch.float)
+                    )
             else:
-                neighbors[i] = (torch.tensor([], device=edge_index.device), 
-                              torch.tensor([], device=edge_index.device))
+                neighbors[i] = (
+                    torch.tensor([], device=edge_index.device, dtype=torch.long),
+                    torch.tensor([], device=edge_index.device, dtype=torch.float)
+                )
         
         return neighbors
 
@@ -452,7 +478,7 @@ class MemoryTGNN(nn.Module):
             
             # MLP decoder with sigmoid
             scores = self.decoder(pair_features)
-            return torch.sigmoid(scores.view(-1)), memory
+            return scores.view(-1), memory
         
         return z, memory
 
@@ -751,27 +777,52 @@ class SelectorAgent:
         
         return self.temporal_graphs, val_df, test_df
 
-    def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, neg_sample_ratio=1):
+    def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, 
+                                   neg_sample_ratio=1, accumulation_steps=1,
+                                   use_amp=True, skip_memory_replay=False):
         """
         Training procedure following Algorithm 1 from the paper.
-        Uses lag-one temporal batching.
+        Uses lag-one temporal batching with optimizations.
+        
+        Args:
+            optimizer: torch optimizer
+            batch_size: batch size for processing
+            epochs: number of training epochs
+            neg_sample_ratio: ratio of negative to positive samples
+            accumulation_steps: gradient accumulation steps (helps with memory)
+            use_amp: use automatic mixed precision for faster training
+            skip_memory_replay: skip replaying previous graph (faster but less accurate)
         """
-        numeric_features = self.node_features.drop(
-            columns=["date", "ticker"], errors="ignore"
-        ).select_dtypes(include=[np.number])
-        
-        x = torch.from_numpy(numeric_features.values).float().to(self.device)
-        
+        # Get unique tickers and build node-level features
         tickers = sorted(self.node_features["ticker"].unique().tolist())
         num_nodes = len(tickers)
         
+        exclude_cols = ["date", "ticker"]
+        feature_cols = [c for c in self.node_features.columns 
+                       if c not in exclude_cols and np.issubdtype(self.node_features[c].dtype, np.number)]
+        
+        # Aggregate features per node (average across all time)
+        node_features_agg = self.node_features.groupby("ticker")[feature_cols].mean().fillna(0.0)
+        node_features_agg = node_features_agg.reindex(tickers, fill_value=0.0)
+        
+        x = torch.from_numpy(node_features_agg.values).float().to(self.device)
+        
+        print(f"Node features shape: {x.shape} (num_nodes={num_nodes}, features={x.shape[1]})")
+        
         bce_loss_fn = nn.BCELoss(reduction="mean")
+        
+        # Setup mixed precision training
+        scaler = torch.amp.GradScaler('cuda') if use_amp and self.device == 'cuda' else None
         
         self._log_event("tgn_training_started", {
             "n_snapshots": len(self.temporal_graphs),
-            "epochs": epochs
+            "epochs": epochs,
+            "num_nodes": num_nodes,
+            "use_amp": use_amp,
+            "accumulation_steps": accumulation_steps
         })
         print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
+        print(f"Optimizations: AMP={use_amp}, Accumulation={accumulation_steps}")
         
         # Initialize memory
         self.model.reset_memory(num_nodes)
@@ -779,7 +830,7 @@ class SelectorAgent:
         # Early stopping
         best_loss = float('inf')
         patience_counter = 0
-        patience = 5
+        patience = 3  # Reduced patience for faster convergence check
         
         for epoch in range(epochs):
             self.model.train()
@@ -788,23 +839,31 @@ class SelectorAgent:
             
             # Lag-one scheme: use B_{i-1} to predict B_i
             prev_graph = None
+            optimizer.zero_grad()
             
             for i, graph in enumerate(self.temporal_graphs):
                 self._check_for_commands()
-                optimizer.zero_grad()
                 
-                # Use previous batch to update memory and embeddings
-                if prev_graph is not None:
+                # Use previous batch to update memory (optional for speed)
+                if prev_graph is not None and not skip_memory_replay:
                     with torch.no_grad():
-                        _, memory = self.model(
-                            x,
-                            prev_graph["edge_index"],
-                            prev_graph.get("edge_attr", None),
-                            prev_graph.get("edge_times", None),
-                            prev_graph.get("time", i - 1),
-                            pair_index=None,
-                            memory=self.model.node_memory
-                        )
+                        if use_amp and scaler:
+                            with torch.amp.autocast('cuda'):
+                                _, memory = self.model(
+                                    x, prev_graph["edge_index"],
+                                    prev_graph.get("edge_attr", None),
+                                    prev_graph.get("edge_times", None),
+                                    prev_graph.get("time", i - 1),
+                                    pair_index=None, memory=self.model.node_memory
+                                )
+                        else:
+                            _, memory = self.model(
+                                x, prev_graph["edge_index"],
+                                prev_graph.get("edge_attr", None),
+                                prev_graph.get("edge_times", None),
+                                prev_graph.get("time", i - 1),
+                                pair_index=None, memory=self.model.node_memory
+                            )
                         self.model.node_memory = memory.detach()
                 
                 # Current batch for prediction
@@ -825,78 +884,90 @@ class SelectorAgent:
                 
                 pos_pairs = torch.stack([src, dst], dim=0)
                 
-                # Get embeddings and score positive pairs
-                pos_scores, memory = self.model(
-                    x,
-                    edge_index,
-                    edge_attr,
-                    edge_times,
-                    current_time,
-                    pair_index=pos_pairs,
-                    memory=self.model.node_memory
-                )
-                
-                pos_labels = torch.ones_like(pos_scores)
-                
                 # Negative sampling
                 num_neg = int(E * neg_sample_ratio)
                 if num_neg > 0:
-                    # Random negative sampling
                     rand_idx = torch.randint(0, num_nodes, (num_neg,), device=self.device)
                     src_for_neg = src.repeat((neg_sample_ratio,))[:num_neg]
                     
                     # Ensure negative samples are different from source
                     mask_equal = rand_idx == src_for_neg
-                    while mask_equal.any():
+                    if mask_equal.any():
                         rand_idx[mask_equal] = torch.randint(
                             0, num_nodes, (mask_equal.sum().item(),), device=self.device
                         )
-                        mask_equal = rand_idx == src_for_neg
                     
                     neg_pairs = torch.stack([src_for_neg, rand_idx], dim=0)
-                    
-                    # Score negative pairs
-                    neg_scores, _ = self.model(
-                        x,
-                        edge_index,
-                        edge_attr,
-                        edge_times,
-                        current_time,
-                        pair_index=neg_pairs,
-                        memory=memory.detach()
-                    )
-                    
-                    neg_labels = torch.zeros_like(neg_scores)
-                    
-                    # Combine positive and negative
-                    scores = torch.cat([pos_scores, neg_scores])
-                    labels = torch.cat([pos_labels, neg_labels])
+                    all_pairs = torch.cat([pos_pairs, neg_pairs], dim=1)
+                    labels = torch.cat([
+                        torch.ones(E, device=self.device),
+                        torch.zeros(num_neg, device=self.device)
+                    ])
                 else:
-                    scores = pos_scores
-                    labels = pos_labels
+                    all_pairs = pos_pairs
+                    labels = torch.ones(E, device=self.device)
                 
-                # Loss (Equation 5)
-                loss = bce_loss_fn(scores, labels)
-                loss.backward()
+                # Forward pass with AMP
+                if use_amp and scaler:
+                    with torch.amp.autocast('cuda'):
+                        scores, memory = self.model(
+                            x, edge_index, edge_attr, edge_times,
+                            current_time, pair_index=all_pairs,
+                            memory=self.model.node_memory
+                        )
+                        loss = bce_loss_fn(scores, labels)
+                        loss = loss / accumulation_steps  # Scale loss for accumulation
+                    
+                    scaler.scale(loss).backward()
+                else:
+                    scores, memory = self.model(
+                        x, edge_index, edge_attr, edge_times,
+                        current_time, pair_index=all_pairs,
+                        memory=self.model.node_memory
+                    )
+                    loss = bce_loss_fn(scores, labels)
+                    loss = loss / accumulation_steps
+                    loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
+                # Gradient accumulation
+                if (i + 1) % accumulation_steps == 0:
+                    if use_amp and scaler:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                    
+                    optimizer.zero_grad()
                 
-                total_loss += loss.item() * (E + num_neg)
-                
-                # Update memory for next iteration
+                total_loss += loss.item() * accumulation_steps * len(labels)
                 self.model.node_memory = memory.detach()
-                
-                # Store as previous graph for lag-one scheme
                 prev_graph = graph
             
+            # Final optimizer step if needed
+            if len(self.temporal_graphs) % accumulation_steps != 0:
+                if use_amp and scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+            
             avg_loss = total_loss / max(total_events, 1)
+            
+            # Clear attention cache periodically
+            if hasattr(self.model.embedding_module, 'clear_cache'):
+                self.model.embedding_module.clear_cache()
             
             self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
             print(f"Epoch {epoch+1}/{epochs} complete. Avg loss: {avg_loss:.6f}")
             
             # Early stopping
-            if avg_loss < best_loss:
+            if avg_loss < best_loss - 1e-4:  # Require meaningful improvement
                 best_loss = avg_loss
                 patience_counter = 0
                 self._save_checkpoint(epoch, avg_loss)
@@ -950,7 +1021,7 @@ class SelectorAgent:
             (self.node_features["date"] <= period_end)
         ].copy()
         
-        # Aggregate features for the holdout period
+        # Aggregate features for the holdout period (per node)
         exclude_cols = ["date", "ticker"]
         feature_cols = [c for c in df_holdout.columns 
                        if c not in exclude_cols and np.issubdtype(df_holdout[c].dtype, np.number)]
@@ -960,19 +1031,22 @@ class SelectorAgent:
         
         x_holdout = torch.from_numpy(holdout_features.values).float().to(self.device)
         
+        print(f"Holdout features shape: {x_holdout.shape}")
+        
         # Set model to eval mode
         self.model.eval()
         
         # Reset memory to state after training
-        # (In practice, you'd want to replay training graphs to get final memory state)
         self.model.reset_memory(num_nodes)
         
         # Replay all training graphs to get proper memory state
         print("Replaying training graphs to initialize memory...")
-        numeric_features = self.node_features.drop(
-            columns=["date", "ticker"], errors="ignore"
-        ).select_dtypes(include=[np.number])
-        x_train = torch.from_numpy(numeric_features.values).float().to(self.device)
+        
+        # Aggregate training features per node
+        train_df = self.node_features[self.node_features["date"] < period_start].copy()
+        train_features_agg = train_df.groupby("ticker")[feature_cols].mean().fillna(0.0)
+        train_features_agg = train_features_agg.reindex(tickers, fill_value=0.0)
+        x_train = torch.from_numpy(train_features_agg.values).float().to(self.device)
         
         with torch.no_grad():
             for i, graph in enumerate(self.temporal_graphs):
@@ -1009,7 +1083,7 @@ class SelectorAgent:
                 # Use no edges (just final embeddings from memory)
                 scores, _ = self.model(
                     x_holdout,
-                    edge_index=None,  # No edges in holdout
+                    edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device),  # Empty edges
                     edge_attr=None,
                     edge_times=None,
                     current_time=len(self.temporal_graphs),  # Time after training
@@ -1041,4 +1115,3 @@ class SelectorAgent:
         print(f"   Mean score: {results['score'].mean():.4f}")
         
         return results
-            "
