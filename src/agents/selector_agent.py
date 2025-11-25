@@ -1,1097 +1,600 @@
 """
-Selector Agent for identifying cointegrated stock pairs using Temporal Graph Neural Networks.
-Implementation following the paper's methodology exactly.
+Optimized Temporal GNN Selector with fundamental features and weekly snapshots.
+
+Key optimizations over original:
+1. No persistent GRU memory (stateless per-snapshot processing)
+2. Single-layer GAT (PyG optimized)
+3. Weekly snapshots (more granular than biweekly)
+4. Batched operations throughout
+5. Includes fundamentals (EPS, PEG) and industry encoding
 """
 
 import os
 import json
 import datetime
-import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
-
-from statsmodels.tsa.stattools import adfuller
-
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from config import CONFIG
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from agents.message_bus import MessageBus, JSONLogger
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
 
 
-class TimeEncoder(nn.Module):
+class SimplifiedTGNN(nn.Module):
     """
-    Time encoding function ψ(.) from the paper.
-    Maps time differences to d-dimensional vectors.
-    """
-    def __init__(self, d):
-        super().__init__()
-        self.d = d
-        self.w = nn.Linear(1, d)
-        
-    def forward(self, t):
-        """
-        Args:
-            t: time differences, shape (batch_size,) or (batch_size, 1)
-        Returns:
-            d-dimensional time encoding
-        """
-        if t.dim() == 1:
-            t = t.unsqueeze(1)
-        # Use harmonic encoding as in the paper reference [22]
-        return torch.cos(self.w(t))
-
-
-class MessageFunction(nn.Module):
-    """
-    Message function msg(.) from Equation 1.
-    Computes messages for node memory updates.
-    Projects concatenated features to memory dimension.
-    """
-    def __init__(self, memory_dim, edge_dim, time_dim):
-        super().__init__()
-        # Identity message function concatenates inputs, then projects
-        self.memory_dim = memory_dim
-        self.edge_dim = edge_dim
-        self.time_dim = time_dim
-        
-        # Project concatenated features to memory dimension
-        concat_dim = memory_dim * 2 + edge_dim + time_dim
-        self.projection = nn.Linear(concat_dim, memory_dim)
-        
-    def forward(self, s_i, s_j, e_ij, time_enc):
-        """
-        Args:
-            s_i: memory state of source node
-            s_j: memory state of target node
-            e_ij: edge features
-            time_enc: time encoding ψ(t - t'_i)
-        Returns:
-            message vector (projected to memory_dim)
-        """
-        # Concatenate all inputs (identity message function)
-        concatenated = torch.cat([s_i, s_j, e_ij, time_enc], dim=-1)
-        # Project to memory dimension
-        return self.projection(concatenated)
-
-
-class MemoryModule(nn.Module):
-    """
-    Memory module mem(.) from Equation 2.
-    Updates node memory using GRU.
-    """
-    def __init__(self, memory_dim):
-        super().__init__()
-        # Message is now projected to memory_dim, so input/hidden dims match
-        self.gru = nn.GRUCell(memory_dim, memory_dim)
-        
-    def forward(self, message, memory):
-        """
-        Args:
-            message: computed message m_i(t) (already projected to memory_dim)
-            memory: previous memory state s_i(t-)
-        Returns:
-            updated memory s_i(t)
-        """
-        return self.gru(message, memory)
-
-
-class TemporalGraphAttention(nn.Module):
-    """
-    Temporal graph attention from Equation 3.
-    L-layer temporal graph attention with time encodings.
-    Optimized with batched attention and cached neighbors.
-    """
-    def __init__(self, d, num_heads, num_layers, dropout=0.2):
-        super().__init__()
-        self.d = d
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        
-        self.time_encoder = TimeEncoder(d)
-        
-        # MLP for each layer - takes concatenated input
-        self.mlps = nn.ModuleList([
-            nn.Linear(d * 2, d) for _ in range(num_layers)
-        ])
-        
-        # Multi-head attention for each layer
-        self.mhas = nn.ModuleList([
-            nn.MultiheadAttention(d, num_heads, dropout=dropout, batch_first=True)
-            for _ in range(num_layers)
-        ])
-        
-        # Projection layers to handle concatenated features
-        self.query_proj = nn.ModuleList([
-            nn.Linear(d * 2, d) for _ in range(num_layers)
-        ])
-        
-        self.kv_proj = nn.ModuleList([
-            nn.Linear(d * 2, d) for _ in range(num_layers)
-        ])
-        
-        self.dropout = dropout
-        
-        # Cache for temporal neighbors
-        self._neighbor_cache = {}
-        
-    def forward(self, z, edge_index, edge_times, current_time, N=10):
-        """
-        Args:
-            z: initial embeddings z^(0) = s_i(t) + X_i(t)
-            edge_index: edge indices
-            edge_times: timestamps of edges
-            current_time: current timestamp t
-            N: number of most recent neighbors to consider
-        Returns:
-            final embeddings z^(L)
-        """
-        num_nodes = z.size(0)
-        
-        # Build temporal neighborhood (with caching)
-        cache_key = (edge_index.data_ptr() if edge_index is not None else 0, current_time)
-        if cache_key not in self._neighbor_cache:
-            neighbors = self._build_temporal_neighbors(edge_index, edge_times, num_nodes, N)
-            self._neighbor_cache[cache_key] = neighbors
-        else:
-            neighbors = self._neighbor_cache[cache_key]
-        
-        # L layers of attention
-        h = z
-        for l in range(self.num_layers):
-            h = self._apply_layer_batched(h, neighbors, current_time, l)
-        
-        return h
-    
-    def _apply_layer_batched(self, h, neighbors, current_time, layer_idx):
-        """Apply attention layer with batched operations where possible."""
-        num_nodes = h.size(0)
-        time_zero = self.time_encoder(torch.zeros(1, device=h.device))
-        
-        # Vectorized batched attention
-        all_indices = []
-        all_kv = []
-        all_q = []
-
-        for i in range(num_nodes):
-            # Prepare query
-            q_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-            q = self.query_proj[layer_idx](q_concat)
-            all_q.append(q)
-            
-            # Prepare keys/values
-            if i in neighbors and len(neighbors[i][0]) > 0:
-                neighbor_indices, neighbor_times = neighbors[i]
-                time_diffs = current_time - neighbor_times
-                time_encs = self.time_encoder(time_diffs)
-                kv_nodes = torch.cat([h[neighbor_indices], time_encs], dim=-1)
-                self_concat = torch.cat([h[i:i+1], time_zero], dim=-1)
-                kv_nodes = torch.cat([self_concat, kv_nodes], dim=0)
-                kv_proj = self.kv_proj[layer_idx](kv_nodes)
-                all_kv.append(kv_proj)
-                all_indices.append(i)
-            else:
-                # Single query as KV if no neighbors
-                kv_proj = q.unsqueeze(0)
-                all_kv.append(kv_proj)
-                all_indices.append(i)
-
-                # Stack all queries and KV sequences
-                q_batch = torch.stack(all_q, dim=0)  # [num_nodes, d]
-                # Note: KV sequences can be padded to same length and attention_mask used
-                # For simplicity, you can use PyG or torch.nn.MultiheadAttention with padding_mask
-                
-                # Example simplified: compute attention per node (still batched as tensor ops)
-                h_next = []
-                for i, kv_proj in zip(all_indices, all_kv):
-                    attn_out, _ = self.mhas[layer_idx](
-                        q_batch[i:i+1].unsqueeze(0),  # Q: [1, 1, d]
-                        kv_proj.unsqueeze(0),          # K: [1, N, d]
-                        kv_proj.unsqueeze(0)           # V: [1, N, d]
-                    )
-                    z_tilde = attn_out.squeeze(0).squeeze(0)
-                    combined = torch.cat([h[i:i+1], z_tilde], dim=-1)
-                    h_i = self.mlps[layer_idx](combined)
-                    h_i = F.relu(h_i)
-                    h_i = F.dropout(h_i, p=self.dropout, training=self.training)
-                    h_next.append(h_i)
-                
-                h_next = torch.cat(h_next, dim=0)
-                return h_next
-
-    def clear_cache(self):
-        """Clear neighbor cache to free memory."""
-        self._neighbor_cache = {}
-    
-    def _build_temporal_neighbors(self, edge_index, edge_times, num_nodes, N):
-        """
-        Build temporal neighborhood π_i for each node.
-        Returns dict mapping node_id -> (neighbor_indices, neighbor_times)
-        """
-        neighbors = {i: ([], []) for i in range(num_nodes)}
-        
-        if edge_index is None or edge_index.numel() == 0:
-            for i in range(num_nodes):
-                neighbors[i] = (
-                    torch.tensor([], device=edge_index.device if edge_index is not None else 'cpu', dtype=torch.long),
-                    torch.tensor([], device=edge_index.device if edge_index is not None else 'cpu', dtype=torch.float)
-                )
-            return neighbors
-        
-        # For each edge, add to both nodes' neighborhoods
-        for idx in range(edge_index.size(1)):
-            src = edge_index[0, idx].item()
-            dst = edge_index[1, idx].item()
-            t = edge_times[idx].item() if edge_times is not None else 0.0
-            
-            neighbors[src][0].append(dst)
-            neighbors[src][1].append(t)
-            
-            neighbors[dst][0].append(src)
-            neighbors[dst][1].append(t)
-        
-        # Keep only N most recent neighbors for each node
-        for i in range(num_nodes):
-            if len(neighbors[i][0]) > 0:
-                indices = neighbors[i][0]
-                times = neighbors[i][1]
-                
-                # Sort by time (most recent first)
-                sorted_pairs = sorted(zip(times, indices), reverse=True)[:N]
-                
-                if sorted_pairs:
-                    times, indices = zip(*sorted_pairs)
-                    neighbors[i] = (
-                        torch.tensor(indices, device=edge_index.device, dtype=torch.long),
-                        torch.tensor(times, device=edge_index.device, dtype=torch.float)
-                    )
-                else:
-                    neighbors[i] = (
-                        torch.tensor([], device=edge_index.device, dtype=torch.long),
-                        torch.tensor([], device=edge_index.device, dtype=torch.float)
-                    )
-            else:
-                neighbors[i] = (
-                    torch.tensor([], device=edge_index.device, dtype=torch.long),
-                    torch.tensor([], device=edge_index.device, dtype=torch.float)
-                )
-        
-        return neighbors
-
-
-class MemoryTGNN(nn.Module):
-    """
-    Memory-based Temporal Graph Neural Network following the paper exactly.
-    Encoder-decoder architecture with message, memory, and embedding modules.
+    Streamlined TGNN without persistent memory.
+    Each snapshot is processed independently.
     """
     
-    def __init__(self, node_feature_dim, edge_feature_dim, hidden_dim=48, 
-                 num_heads=2, num_layers=2, dropout=0.2, device=None):
+    def __init__(self, node_dim, hidden_dim=32, num_heads=2, dropout=0.1):
         super().__init__()
         
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.num_layers = num_layers
+        # Node encoder (single layer)
+        self.node_encoder = nn.Linear(node_dim, hidden_dim)
         
-        # Node feature encoder
-        self.node_encoder = nn.Sequential(
-            nn.Linear(node_feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+        # Graph attention (single layer GAT)
+        self.gat = GATConv(
+            hidden_dim, 
+            hidden_dim, 
+            heads=num_heads,
+            concat=False,
+            dropout=dropout
         )
         
-        # Time encoder
-        self.time_encoder = TimeEncoder(hidden_dim)
-        
-        # Message function (projects concatenation to hidden_dim)
-        self.message_function = MessageFunction(hidden_dim, edge_feature_dim, hidden_dim)
-        
-        # Memory module (GRU with matching dimensions)
-        self.memory_module = MemoryModule(hidden_dim)
-        
-        # Embedding module (temporal graph attention)
-        self.embedding_module = TemporalGraphAttention(
-            hidden_dim, num_heads, num_layers, dropout
-        )
-        
-        # Decoder (two-layer MLP + sigmoid)
-        self.decoder = nn.Sequential(
+        # Pair scorer
+        self.scorer = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
         )
         
-        # Node memories (initialized to zero)
-        self.node_memory = None
-        
-        # Track last event time for each node
-        self.last_event_time = None
-        
-        self._reset_parameters()
-        self.to(self.device)
+        self.dropout = dropout
     
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-    
-    def reset_memory(self, num_nodes):
-        """Initialize/reset node memories to zero."""
-        self.node_memory = torch.zeros(
-            num_nodes, self.hidden_dim, device=self.device
-        )
-        self.last_event_time = torch.zeros(num_nodes, device=self.device)
-    
-    def process_event_batch(self, node_features, edge_index, edge_attr, 
-                           edge_times, current_time):
+    def forward(self, x, edge_index, edge_weight=None, pair_index=None):
         """
-        Process a batch of events (temporal batch from paper).
-        
         Args:
-            node_features: X_i(t) for all nodes
-            edge_index: edge indices in batch
-            edge_attr: edge features
-            edge_times: timestamp for each edge
-            current_time: current timestamp
-            
-        Returns:
-            updated embeddings and memory
+            x: node features [N, D]
+            edge_index: graph connectivity [2, E]
+            edge_weight: optional edge weights [E]
+            pair_index: pairs to score [2, P]
         """
-        num_nodes = node_features.size(0)
+        # Encode nodes
+        h = self.node_encoder(x)
+        h = F.relu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
         
-        # Initialize memory if needed
-        if self.node_memory is None:
-            self.reset_memory(num_nodes)
-        
-        # Encode node features
-        x_encoded = self.node_encoder(node_features)
-        
-        # MESSAGE MODULE: Compute messages for all events
-        messages = torch.zeros(num_nodes, self.node_memory.size(1), device=self.device)
-        message_counts = torch.zeros(num_nodes, device=self.device)
-        
+        # Graph attention
         if edge_index.numel() > 0:
-            src = edge_index[0]
-            dst = edge_index[1]
-        
-            # Time differences
-            time_diff_i = current_time - self.last_event_time[src]
-            time_diff_j = current_time - self.last_event_time[dst]
-        
-            time_enc_i = self.time_encoder(time_diff_i.unsqueeze(1))
-            time_enc_j = self.time_encoder(time_diff_j.unsqueeze(1))
-        
-            s_i = self.node_memory[src]
-            s_j = self.node_memory[dst]
-        
-            # Edge features (broadcast if None)
-            if edge_attr is None:
-                edge_attr = torch.zeros((edge_index.size(1), 1), device=self.device)
-        
-            # Compute messages in batch
-            m_i = self.message_function(s_i, s_j, edge_attr, time_enc_i)
-            m_j = self.message_function(s_j, s_i, edge_attr, time_enc_j)
-        
-            # Aggregate messages per node (keep most recent)
-            messages = torch.zeros_like(self.node_memory)
-            messages.index_copy_(0, src, m_i)
-            messages.index_copy_(0, dst, m_j)
-        
-            message_counts = torch.zeros(self.node_memory.size(0), device=self.device)
-            message_counts.index_fill_(0, src, 1)
-            message_counts.index_fill_(0, dst, 1)
-        
-            # Update last event times
-            self.last_event_time.index_copy_(0, src, torch.full_like(src, current_time, dtype=torch.float))
-            self.last_event_time.index_copy_(0, dst, torch.full_like(dst, current_time, dtype=torch.float))
-            
-        # MEMORY MODULE: Vectorized update
-        mask = message_counts > 0
-        if mask.any():
-            # Only update nodes with messages
-            updated_memory = self.node_memory.clone()
-            updated_memory[mask] = self.memory_module(
-                messages[mask],
-                self.node_memory[mask]
-            )
-            self.node_memory = updated_memory
-
-        self.node_memory = updated_memory
-        
-        # EMBEDDING MODULE: Generate embeddings (Equation 3)
-        # z_i^(0)(t) = s_i(t) + X_i(t)
-        z_0 = self.node_memory + x_encoded
-        
-        # L-layer temporal graph attention
-        z = self.embedding_module(
-            z_0, edge_index, edge_times, current_time
-        )
+            h = self.gat(h, edge_index, edge_attr=edge_weight)
+            h = F.relu(h)
         
         # Normalize embeddings
-        z = F.normalize(z, p=2, dim=1)
+        h = F.normalize(h, p=2, dim=1)
         
-        return z, self.node_memory
-    
-    def forward(self, node_features, edge_index, edge_attr=None, 
-                edge_times=None, current_time=0.0, pair_index=None, memory=None):
-        """
-        Forward pass following the paper's architecture.
-        
-        Args:
-            node_features: node features X_i(t)
-            edge_index: edge connectivity
-            edge_attr: edge features
-            edge_times: timestamp for each edge
-            current_time: current timestamp
-            pair_index: optional pairs to score
-            memory: optional external memory state
-            
-        Returns:
-            embeddings (and optionally pair scores)
-        """
-        node_features = node_features.to(self.device)
-        num_nodes = node_features.size(0)
-        
-        # Use external memory if provided
-        if memory is not None:
-            self.node_memory = memory.to(self.device)
-        elif self.node_memory is None:
-            self.reset_memory(num_nodes)
-        
-        # Handle edge_times
-        if edge_times is None and edge_index is not None and edge_index.numel() > 0:
-            edge_times = torch.ones(edge_index.size(1), device=self.device) * current_time
-        
-        # Process event batch
-        z, memory = self.process_event_batch(
-            node_features, edge_index, edge_attr, edge_times, current_time
-        )
-        
-        # DECODER: Score pairs if requested (Equation 4)
+        # Score pairs if requested
         if pair_index is not None:
-            src_idx = pair_index[0].long().to(self.device)
-            dst_idx = pair_index[1].long().to(self.device)
-            
-            # Concatenate embeddings
-            pair_features = torch.cat([z[src_idx], z[dst_idx]], dim=1)
-            
-            # MLP decoder with sigmoid
-            scores = self.decoder(pair_features)
-            return scores.view(-1), memory
+            src_emb = h[pair_index[0]]
+            dst_emb = h[pair_index[1]]
+            pair_features = torch.cat([src_emb, dst_emb], dim=1)
+            scores = self.scorer(pair_features).squeeze(-1)
+            return scores
         
-        return z, memory
+        return h
 
 
 @dataclass
-class SelectorAgent:
+class OptimizedSelectorAgent:
     """
-    Selector Agent using Memory-based TGNN for pairs trading.
-    Follows Algorithm 1 and 2 from the paper.
+    Optimized pairs selector with fundamentals and weekly snapshots.
     """
     
     df: pd.DataFrame
-    logger: JSONLogger = None
-    message_bus: MessageBus = None
-    fundamentals: Optional[pd.DataFrame] = None
-    model: Any = None
-    scaler: Optional[MinMaxScaler] = None
-    edge_index: Optional[Any] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    trace_path: str = None
-    corr_threshold: float = 0.8
+    trace_path: str = "traces/selector.jsonl"
+    corr_threshold: float = 0.7
+    lookback_weeks: int = 4  # Rolling window for correlation (4 weeks)
     holdout_years: int = 1
-    node_features: Optional[pd.DataFrame] = None
-    temporal_graphs: Optional[List[Dict[str, Any]]] = field(default_factory=list)
+    hidden_dim: int = 32
+    num_heads: int = 2
+    model: Any = None
+    scaler: Optional[StandardScaler] = None
+    industry_encoder: Optional[OneHotEncoder] = None
+    tickers: Optional[List[str]] = None
+    ticker_to_idx: Optional[Dict[str, int]] = None
+    train_df: Optional[pd.DataFrame] = None
+    val_df: Optional[pd.DataFrame] = None
+    test_df: Optional[pd.DataFrame] = None
     val_period: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
     test_period: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
-    holdout_period: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
-    train_end_date: Optional[pd.Timestamp] = None
-
+    node_features: Optional[pd.DataFrame] = None
+    temporal_graphs: Optional[List[Dict[str, Any]]] = field(default_factory=list)
+    
     def __post_init__(self):
         os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
-        if self.message_bus is None:
-            self.message_bus = MessageBus()
-        self._log_event("init", {"device": self.device, "corr_threshold": self.corr_threshold})
-
+        self._log_event("init", {
+            "device": self.device, 
+            "corr_threshold": self.corr_threshold,
+            "lookback_weeks": self.lookback_weeks
+        })
+    
     def _log_event(self, event: str, details: Dict[str, Any]):
+        """Log event to trace file."""
         entry = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "agent": "selector",
             "event": event,
             "details": details,
         }
-        if self.logger:
-            self.logger.log("selector", event, details)
         with open(self.trace_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
-        if self.message_bus:
-            try:
-                self.message_bus.publish(entry)
-            except Exception:
-                pass
-
-    def _check_for_commands(self):
-        if self.message_bus is None:
-            return
-        while True:
-            cmd = self.message_bus.get_command_for("selector", timeout=0.0)
-            if cmd is None:
-                break
-            try:
-                self._apply_command(cmd)
-                self._log_event("command_applied", {"command": cmd})
-            except Exception as e:
-                self._log_event("command_failed", {"command": cmd, "error": str(e)})
-
-    def _apply_command(self, cmd: Dict[str, Any]):
-        c = cmd.get("command")
-        
-        if c == "adjust_threshold":
-            self.corr_threshold = float(cmd.get("value", self.corr_threshold))
-            self._log_event("threshold_changed", {"new_threshold": self.corr_threshold})
-        elif c == "set_holdout_years":
-            self.holdout_years = int(cmd.get("value", self.holdout_years))
-            self._log_event("holdout_changed", {"holdout_years": self.holdout_years})
-        elif c == "rebuild_node_features":
-            windows = cmd.get("windows", [5, 15, 30])
-            self.build_node_features(windows=windows)
-            self._log_event("node_features_rebuilt", {"windows": windows})
-        elif c == "dump_state":
-            path = cmd.get("path", "traces/selector_state.json")
-            state = {
-                "corr_threshold": self.corr_threshold,
-                "holdout_years": self.holdout_years,
-                "num_temporal_graphs": len(self.temporal_graphs) if self.temporal_graphs else 0
-            }
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(state, f, default=str, indent=2)
-            self._log_event("state_dumped", {"path": path})
-        else:
-            self._log_event("unknown_command", {"command": cmd})
-
-    def _save_checkpoint(self, epoch, loss, path=None):
-        if path is None:
-            directory = os.path.dirname(self.trace_path) or "."
-            path = os.path.join(directory, "selector_checkpoint.pt")
-        
-        checkpoint = {
-            "epoch": epoch,
-            "loss": loss,
-            "model_state": self.model.state_dict() if self.model else None,
-            "scaler": self.scaler
-        }
-        
-        torch.save(checkpoint, path)
-        self._log_event("checkpoint_saved", {
-            "epoch": epoch,
-            "loss": float(loss),
-            "path": path
-        })
-
-    def build_node_features(self, windows=[2, 4], train_end_date=None) -> pd.DataFrame:
-
+    
+    def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
+        """
+        Build node features with fundamentals and industry encoding.
+        Windows are in weeks (1w, 2w, 4w for weekly granularity).
+        """
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
-
-        if train_end_date is not None:
-            self.train_end_date = pd.to_datetime(train_end_date)
-
-        # Compute biweekly returns
-        df["log_return"] = np.log(df["adj_close"] / df["adj_close"].shift(1))
         
-        # Engineer rolling features
+        # Basic returns
+        df["returns"] = df.groupby("ticker")["adj_close"].pct_change()
+        df["log_returns"] = np.log1p(df["returns"])
+        
+        # Rolling features per window (in weeks, ~5 trading days per week)
         for window in windows:
-
-            df[f"biweek_std_{window}"] = df.groupby("ticker")["adj_close"].transform(
-                lambda x: x.rolling(window * 10).std()
+            days = window * 5  # Convert weeks to trading days
+            
+            df[f"volatility_{window}w"] = df.groupby("ticker")["returns"].transform(
+                lambda x: x.rolling(days, min_periods=max(1, days//2)).std()
             )
-            df[f"biweek_cumret_{window}"] = df.groupby("ticker")["log_return"].transform(
-                lambda x: x.rolling(window * 10).sum()
+            df[f"momentum_{window}w"] = df.groupby("ticker")["adj_close"].transform(
+                lambda x: x.pct_change(days)
             )
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        
+        # Fundamental features
         df["eps_yoy_growth"] = df.get("eps_yoy_growth", 0.0).fillna(0.0)
         df["peg_adj"] = df.get("peg_adj", 0.0).fillna(0.0)
-
-        # One-hot encode sectors
-        all_sectors = sorted(self.df["sector"].unique())
-        encoder = OneHotEncoder(sparse_output=False, dtype=int, categories=[all_sectors])
-        sector_encoded = encoder.fit_transform(df[["sector"]])
-        sector_df = pd.DataFrame(sector_encoded, columns=encoder.get_feature_names_out())
-        df = pd.concat([df.reset_index(drop=True), sector_df.reset_index(drop=True)], axis=1)
-        df.drop(columns=["sector"], inplace=True, errors="ignore")
-
+        
+        # Handle infinities and NaNs
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        
+        # One-hot encode industry
+        if "sector" in df.columns:
+            all_industries = sorted(df["sector"].unique())
+            self.industry_encoder = OneHotEncoder(
+                sparse_output=False, 
+                dtype=int, 
+                categories=[all_industries],
+                handle_unknown='ignore'
+            )
+            industry_encoded = self.industry_encoder.fit_transform(df[["sector"]])
+            industry_df = pd.DataFrame(
+                industry_encoded, 
+                columns=self.industry_encoder.get_feature_names_out()
+            )
+            df = pd.concat([df.reset_index(drop=True), industry_df.reset_index(drop=True)], axis=1)
+            df.drop(columns=["sector"], inplace=True, errors="ignore")
+        
+        # Fill remaining NaNs
         df.fillna(0.0, inplace=True)
-
-        exclude_cols = ["date", "ticker"]
-        numeric_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
-
-        # Fit scaler on training data
+        
+        # Identify numeric feature columns
+        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", 
+                       "div_amount", "volume", "adj_close"]
+        numeric_cols = [c for c in df.columns 
+                       if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
+        
+        # Fit scaler on training data only
         if self.scaler is None:
-            self.scaler = MinMaxScaler()
+            self.scaler = StandardScaler()
             if train_end_date is not None:
-                train_mask = df["date"] < self.train_end_date
+                train_mask = df["date"] < pd.to_datetime(train_end_date)
                 train_data = df.loc[train_mask, numeric_cols]
                 self.scaler.fit(train_data)
             else:
                 self.scaler.fit(df[numeric_cols])
-
-        df[numeric_cols] = self.scaler.transform(df[numeric_cols])
-        self.node_features = df
-        return df
         
+        # Scale features
         df[numeric_cols] = self.scaler.transform(df[numeric_cols])
         
         self.node_features = df
+        
         self._log_event("node_features_built", {
             "n_rows": len(df),
+            "n_features": len(numeric_cols),
             "windows": windows,
-            "train_end_date": str(self.train_end_date) if self.train_end_date else None
+            "train_end_date": str(train_end_date) if train_end_date else None
         })
         
         return df
-
-    def build_temporal_graphs(self, corr_threshold: float = None, holdout_years: int = None):
-        """ Build biweekly temporal graphs following Algorithm 2 from the paper. """
-
-        if corr_threshold is None:
-            corr_threshold = self.corr_threshold
-        if holdout_years is None:
-            holdout_years = self.holdout_years
-
-        # Determine split dates
-        df_dates = self.df.copy()
-        df_dates["date"] = pd.to_datetime(df_dates["date"])
-        last_date = df_dates["date"].max()
-        holdout_start = last_date - pd.DateOffset(years=holdout_years)
-        mid_point = holdout_start + pd.DateOffset(months=6)
-
-        val_start = holdout_start
-        val_end = mid_point - pd.DateOffset(days=1)
-        test_start = mid_point
-        test_end = last_date
-        train_end = val_start - pd.DateOffset(days=1)
-
-        self.val_period = (val_start, val_end)
-        self.test_period = (test_start, test_end)
-        self.holdout_period = (val_start, test_end)
-
+    
+    def prepare_data(self, train_end_date: str = None):
+        """Prepare data with train/val/test split."""
+        if train_end_date is None:
+            # Auto-split based on holdout_years
+            last_date = self.df["date"].max()
+            train_end_date = last_date - pd.DateOffset(years=self.holdout_years)
+        
+        train_end = pd.to_datetime(train_end_date)
+        
         # Build features
         self.build_node_features(train_end_date=train_end)
-        self.temporal_graphs = []
-
+        
         df = self.node_features.copy()
         df["date"] = pd.to_datetime(df["date"])
-        tickers = sorted(df["ticker"].unique().tolist())
-        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", "div_amount", "volume"]
-        feature_cols = [c for c in df.columns if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
-
+        
+        # Store tickers
+        self.tickers = sorted(df["ticker"].unique())
+        self.ticker_to_idx = {t: i for i, t in enumerate(self.tickers)}
+        
+        # Calculate split dates
+        last_date = df["date"].max()
+        holdout_start = train_end
+        mid_point = holdout_start + (last_date - holdout_start) / 2
+        
+        val_start = holdout_start
+        val_end = mid_point
+        test_start = mid_point
+        test_end = last_date
+        
+        self.val_period = (val_start, val_end)
+        self.test_period = (test_start, test_end)
+        
         # Split data
-        train_df = df[df["date"] < val_start].copy()
-        val_df = df[(df["date"] >= val_start) & (df["date"] <= val_end)].copy()
-        test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
-
-        # Add biweekly column
-        train_df = train_df.sort_values("date")
-        train_df["biweek"] = ((train_df["date"] - train_df["date"].min()).dt.days // 14).astype(int)
-        unique_biweeks = sorted(train_df["biweek"].unique())
-        print(f"Building {len(unique_biweeks)} biweekly temporal graphs...")
-
-        for bw_idx, bw in enumerate(unique_biweeks):
-            self._check_for_commands()
-            bw_data = train_df[train_df["biweek"] == bw]
-
-            # Aggregate features for the biweek
-            bw_features = bw_data.groupby("ticker")[feature_cols].mean().fillna(0.0)
-            bw_features = bw_features.reindex(tickers, fill_value=0.0)
-
-            # Compute correlation matrix
-            if len(bw_features) >= 2:
-                corr_matrix = np.corrcoef(bw_features.values)
-                corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-                # Create edges where correlation >= threshold
-                edges = np.argwhere(np.abs(corr_matrix) >= corr_threshold)
-                edges = edges[edges[:, 0] < edges[:, 1]]
-                num_nodes = len(tickers)
-                edges = edges[(edges[:, 0] < num_nodes) & (edges[:, 1] < num_nodes)]
-            else:
-                edges = np.empty((0, 2), dtype=int)
-
-            edge_index = torch.tensor(edges.T, dtype=torch.long, device=self.device)
-            edge_attr = torch.tensor(
-                [[corr_matrix[i, j]] for i, j in edges] if edges.size > 0 else [],
-                dtype=torch.float, device=self.device
-            )
-            edge_times = torch.ones(edge_index.size(1), device=self.device) if edge_index.numel() > 0 else torch.empty(0, device=self.device)
-
-            self.temporal_graphs.append({
-                "biweek": bw,
-                "start": str(bw_data["date"].min().date()) if not bw_data.empty else None,
-                "end": str(bw_data["date"].max().date()) if not bw_data.empty else None,
-                "edge_index": edge_index,
-                "edge_attr": edge_attr,
-                "edge_times": edge_times,
-                "time": bw_idx,
-                "num_edges": len(edges)
-            })
-
-        train_df.drop(columns=["biweek"], inplace=True, errors="ignore")
-
-        self._log_event("temporal_graphs_built", {
-            "n_graphs": len(self.temporal_graphs),
-            "frequency": "biweekly",
+        self.train_df = df[df["date"] < val_start].copy()
+        self.val_df = df[(df["date"] >= val_start) & (df["date"] < val_end)].copy()
+        self.test_df = df[df["date"] >= test_start].copy()
+        
+        self._log_event("data_prepared", {
+            "n_tickers": len(self.tickers),
+            "train_samples": len(self.train_df),
+            "val_samples": len(self.val_df),
+            "test_samples": len(self.test_df),
             "train_end": str(train_end.date()),
-            "val_period": (str(self.val_period[0].date()), str(self.val_period[1].date())),
-            "test_period": (str(self.test_period[0].date()), str(self.test_period[1].date())),
-            "corr_threshold": corr_threshold
+            "val_period": (str(val_start.date()), str(val_end.date())),
+            "test_period": (str(test_start.date()), str(test_end.date()))
         })
-
-        avg_edges = np.mean([g["num_edges"] for g in self.temporal_graphs]) if self.temporal_graphs else 0
-        print(f"✅ Temporal graphs built: {len(self.temporal_graphs)} biweekly graphs")
-        print(f" Average edges per graph: {avg_edges:.1f}")
-        print(f" Training period: up to {train_end.date()}")
-        print(f" Validation: {self.val_period[0].date()} → {self.val_period[1].date()}")
-        print(f" Test: {self.test_period[0].date()} → {self.test_period[1].date()}")
-
-        return self.temporal_graphs, val_df, test_df
-
-    def train_tgn_temporal_batches(self, optimizer, batch_size=32, epochs=3, 
-                                   neg_sample_ratio=1, accumulation_steps=1,
-                                   use_amp=True, skip_memory_replay=False):
- 
-        # Get unique tickers and build node-level features
-        tickers = sorted(self.node_features["ticker"].unique().tolist())
-        num_nodes = len(tickers)
         
-        exclude_cols = ["date", "ticker"]
-        feature_cols = [c for c in self.node_features.columns 
-                       if c not in exclude_cols and np.issubdtype(self.node_features[c].dtype, np.number)]
+        print(f"✅ Data prepared: {len(self.tickers)} tickers")
+        print(f"   Training: {len(self.train_df)} samples (up to {train_end.date()})")
+        print(f"   Validation: {len(self.val_df)} samples ({val_start.date()} → {val_end.date()})")
+        print(f"   Test: {len(self.test_df)} samples ({test_start.date()} → {test_end.date()})")
         
-        # Aggregate features per node (average across all time)
-        node_features_agg = self.node_features.groupby("ticker")[feature_cols].mean().fillna(0.0)
-        node_features_agg = node_features_agg.reindex(tickers, fill_value=0.0)
+        return self.train_df, self.val_df, self.test_df
+    
+    def build_temporal_snapshots(self, df: pd.DataFrame, window_days: int = 20):
+        """
+        Build weekly temporal correlation snapshots.
         
-        x = torch.from_numpy(node_features_agg.values).float().to(self.device)
+        Args:
+            df: DataFrame with node features
+            window_days: Lookback window for correlation (default 20 days = 4 weeks)
         
-        print(f"Node features shape: {x.shape} (num_nodes={num_nodes}, features={x.shape[1]})")
+        Returns:
+            List of snapshot dictionaries
+        """
+        df = df.sort_values('date')
         
-        bce_loss_fn = torch.nn.BCEWithLogitsLoss(size_average=True)
+        # Pivot returns
+        returns_pivot = df.pivot(
+            index='date', 
+            columns='ticker', 
+            values='log_returns'
+        ).fillna(0)
         
-        # Setup mixed precision training
-        scaler = torch.amp.GradScaler('cuda') if use_amp and self.device == 'cuda' else None
+        # Ensure all tickers present
+        returns_pivot = returns_pivot.reindex(columns=self.tickers, fill_value=0)
         
-        self._log_event("tgn_training_started", {
-            "n_snapshots": len(self.temporal_graphs),
+        snapshots = []
+        dates = returns_pivot.index
+        
+        # Create weekly snapshots (every 5 trading days)
+        for i in range(window_days, len(dates), 5):  # Step by 5 days (1 week)
+            end_date = dates[i]
+            start_idx = max(0, i - window_days)
+            
+            # Get window of returns
+            window_returns = returns_pivot.iloc[start_idx:i+1]
+            
+            # Compute correlation for this window
+            corr_matrix = window_returns.corr().values
+            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+            
+            # Build edges
+            edges = np.argwhere(np.abs(corr_matrix) >= self.corr_threshold)
+            edges = edges[edges[:, 0] < edges[:, 1]]
+            
+            if len(edges) == 0:
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+                edge_weights = torch.empty(0, dtype=torch.float)
+            else:
+                edge_index = torch.tensor(edges.T, dtype=torch.long)
+                edge_weights = torch.tensor(
+                    [corr_matrix[i, j] for i, j in edges], 
+                    dtype=torch.float
+                )
+            
+            snapshots.append({
+                'date': end_date,
+                'edge_index': edge_index,
+                'edge_weights': edge_weights,
+                'num_edges': len(edges)
+            })
+        
+        return snapshots
+    
+    def create_snapshot_features(self, df: pd.DataFrame, snapshot_date):
+        """Create node features for a specific snapshot date."""
+        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", 
+                       "div_amount", "volume", "adj_close"]
+        feature_cols = [c for c in df.columns 
+                       if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)]
+        
+        # Get data up to snapshot date (last 5 days for averaging)
+        snapshot_df = df[df['date'] <= snapshot_date].groupby('ticker').tail(5)
+        
+        # Aggregate features per ticker
+        node_features = snapshot_df.groupby('ticker')[feature_cols].mean()
+        node_features = node_features.reindex(self.tickers, fill_value=0.0)
+        
+        # Features are already scaled
+        return torch.tensor(node_features.values, dtype=torch.float)
+    
+    def train(self, epochs: int = 5, lr: float = 0.001, batch_size: int = 512, 
+              snapshot_stride: int = 2):
+        """
+        Train TGNN on weekly temporal snapshots.
+        
+        Args:
+            epochs: Number of training epochs
+            lr: Learning rate
+            batch_size: Batch size for pair scoring
+            snapshot_stride: Use every Nth snapshot (2 = every 2 weeks for speed)
+        """
+        if self.train_df is None:
+            raise ValueError("Call prepare_data() first")
+        
+        # Get number of features
+        exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", 
+                       "div_amount", "volume", "adj_close"]
+        feature_cols = [c for c in self.train_df.columns 
+                       if c not in exclude_cols and np.issubdtype(self.train_df[c].dtype, np.number)]
+        num_features = len(feature_cols)
+        
+        # Initialize model
+        self.model = SimplifiedTGNN(
+            node_dim=num_features,
+            hidden_dim=self.hidden_dim,
+            num_heads=self.num_heads
+        ).to(self.device)
+        
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        criterion = nn.BCEWithLogitsLoss()
+        
+        # Build temporal snapshots
+        print("Building weekly temporal snapshots...")
+        self.temporal_graphs = self.build_temporal_snapshots(
+            self.train_df, 
+            window_days=self.lookback_weeks * 5
+        )
+        
+        # Subsample snapshots for faster training
+        snapshots = self.temporal_graphs[::snapshot_stride]
+        
+        self._log_event("training_started", {
+            "n_snapshots": len(snapshots),
+            "total_snapshots": len(self.temporal_graphs),
+            "snapshot_stride": snapshot_stride,
             "epochs": epochs,
-            "num_nodes": num_nodes,
-            "use_amp": use_amp,
-            "accumulation_steps": accumulation_steps
+            "n_nodes": len(self.tickers),
+            "hidden_dim": self.hidden_dim
         })
-        print(f"Starting TGNN training on {len(self.temporal_graphs)} temporal snapshots.")
-        print(f"Optimizations: AMP={use_amp}, Accumulation={accumulation_steps}")
         
-        # Initialize memory
-        self.model.reset_memory(num_nodes)
+        print(f"\nTraining TGNN:")
+        print(f"  Nodes: {len(self.tickers)}")
+        print(f"  Snapshots: {len(snapshots)} (stride={snapshot_stride})")
+        print(f"  Hidden dim: {self.hidden_dim}")
         
-        # Early stopping
-        best_loss = float('inf')
-        patience_counter = 0
-        patience = 3  # Reduced patience for faster convergence check
+        num_nodes = len(self.tickers)
         
         for epoch in range(epochs):
             self.model.train()
             total_loss = 0.0
-            total_events = 0
+            num_batches = 0
             
-            # Lag-one scheme: use B_{i-1} to predict B_i
-            prev_graph = None
-            optimizer.zero_grad()
-            
-            for i, graph in enumerate(self.temporal_graphs):
-                self._check_for_commands()
-
-                # Always assign these first
-                edge_index = graph.get("edge_index", torch.empty((2, 0), dtype=torch.long, device=self.device))
-                edge_attr = graph.get("edge_attr", None)
-                edge_times = graph.get("edge_times", None)
-                current_time = graph.get("time", i)
-
-                # Skip empty graphs
+            # Process each temporal snapshot
+            for snap_idx, snapshot in enumerate(snapshots):
+                edge_index = snapshot['edge_index'].to(self.device)
+                edge_weights = snapshot['edge_weights'].to(self.device)
+                
+                # Skip snapshots with no edges
                 if edge_index.numel() == 0:
-                    prev_graph = graph
                     continue
-
-                # Now proceed with positive samples
-                src = edge_index[0]
-                dst = edge_index[1]
-                E = src.size(0)
-                total_events += E
                 
-                pos_pairs = torch.stack([src, dst], dim=0)
-    
-                # Vectorized negative sampling
-                num_neg = int(E * neg_sample_ratio)
-                if num_neg > 0:
-                    # Random negative targets
-                    neg_dst = torch.randint(0, num_nodes, (num_neg,), device=self.device)
-                    
-                    # Random negative sources sampled from positive src repeated
-                    neg_src = src.repeat((neg_sample_ratio,))[:num_neg]
+                # Create features for this snapshot
+                x = self.create_snapshot_features(
+                    self.train_df, 
+                    snapshot['date']
+                ).to(self.device)
                 
-                    # Avoid trivial pairs (src != dst)
-                    neq_mask = neg_dst == neg_src
-                    while neq_mask.any():
-                        neg_dst[neq_mask] = torch.randint(0, num_nodes, (neq_mask.sum().item(),), device=self.device)
-                        neq_mask = neg_dst == neg_src
+                # Positive pairs from edges
+                pos_pairs = edge_index.T
+                num_pos = len(pos_pairs)
                 
-                    # Combine positive and negative
-                    all_pairs = torch.cat([pos_pairs, torch.stack([neg_src, neg_dst], dim=0)], dim=1)
-                    labels = torch.cat([torch.ones(E, device=self.device), torch.zeros(num_neg, device=self.device)])
-                else:
-                    all_pairs = pos_pairs
-                    labels = torch.ones(E, device=self.device)
+                if num_pos == 0:
+                    continue
                 
-                # Forward pass in **batches** to reduce memory overhead
-                batch_size_pairs = 4096
-                scores_list = []
+                # Negative sampling
+                neg_src = torch.randint(0, num_nodes, (num_pos,), device=self.device)
+                neg_dst = torch.randint(0, num_nodes, (num_pos,), device=self.device)
                 
-                for start in range(0, all_pairs.size(1), batch_size_pairs):
-                    end = min(start + batch_size_pairs, all_pairs.size(1))
-                    batch_pairs = all_pairs[:, start:end]
-                    if batch_pairs.ndim == 1:
-                        batch_pairs = batch_pairs.unsqueeze(1)  # ensure shape (2, 1)
+                # Ensure neg_src != neg_dst
+                mask = neg_src == neg_dst
+                while mask.any():
+                    neg_dst[mask] = torch.randint(0, num_nodes, (mask.sum(),), device=self.device)
+                    mask = neg_src == neg_dst
                 
-                    scores, memory = self.model(
-                        x, edge_index, edge_attr, edge_times,
-                        current_time, pair_index=batch_pairs,
-                        memory=self.model.node_memory
-                    )
-                    scores_list.append(scores)
+                neg_pairs = torch.stack([neg_src, neg_dst], dim=1)
                 
-                scores = torch.cat(scores_list)
+                # Combine positive and negative
+                all_pairs = torch.cat([pos_pairs, neg_pairs], dim=0)
+                labels = torch.cat([
+                    torch.ones(num_pos, device=self.device),
+                    torch.zeros(num_pos, device=self.device)
+                ])
                 
-                # Forward pass with AMP
-                if use_amp and scaler:
-                    with torch.amp.autocast('cuda'):
-                        scores, memory = self.model(
-                            x, edge_index, edge_attr, edge_times,
-                            current_time, pair_index=all_pairs,
-                            memory=self.model.node_memory
-                        )
-                        loss = bce_loss_fn(scores, labels)
-                        loss = loss / accumulation_steps  # Scale loss for accumulation
-                    
-                    scaler.scale(loss).backward()
-                else:
-                    scores, memory = self.model(
-                        x, edge_index, edge_attr, edge_times,
-                        current_time, pair_index=all_pairs,
-                        memory=self.model.node_memory
-                    )
-                    loss = bce_loss_fn(scores, labels)
-                    loss = loss / accumulation_steps
-                    loss.backward()
+                # Shuffle
+                perm = torch.randperm(len(all_pairs))
+                all_pairs = all_pairs[perm]
+                labels = labels[perm]
                 
-                # Gradient accumulation
-                if (i + 1) % accumulation_steps == 0:
-                    if use_amp and scaler:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        optimizer.step()
+                # Mini-batch training on this snapshot
+                for i in range(0, len(all_pairs), batch_size):
+                    batch_pairs = all_pairs[i:i+batch_size].T
+                    batch_labels = labels[i:i+batch_size]
                     
                     optimizer.zero_grad()
-                
-                total_loss += loss.item() * accumulation_steps * len(labels)
-                self.model.node_memory = memory.detach()
-                prev_graph = graph
-            
-            # Final optimizer step if needed
-            if len(self.temporal_graphs) % accumulation_steps != 0:
-                if use_amp and scaler:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # Forward pass
+                    scores = self.model(
+                        x, 
+                        edge_index, 
+                        edge_weights,
+                        pair_index=batch_pairs
+                    )
+                    
+                    loss = criterion(scores, batch_labels)
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    
                     optimizer.step()
+                    
+                    total_loss += loss.item()
+                    num_batches += 1
             
-            avg_loss = total_loss / max(total_events, 1)
+            avg_loss = total_loss / max(num_batches, 1)
             
-            # Clear attention cache periodically
-            if hasattr(self.model.embedding_module, 'clear_cache'):
-                self.model.embedding_module.clear_cache()
+            self._log_event("epoch_complete", {
+                "epoch": epoch + 1,
+                "avg_loss": avg_loss
+            })
             
-            self._log_event("tgn_epoch_complete", {"epoch": epoch + 1, "avg_loss": avg_loss})
-            print(f"Epoch {epoch+1}/{epochs} complete. Avg loss: {avg_loss:.6f}")
-            
-            # Early stopping
-            if avg_loss < best_loss - 1e-4:  # Require meaningful improvement
-                best_loss = avg_loss
-                patience_counter = 0
-                self._save_checkpoint(epoch, avg_loss)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    self._log_event("early_stopping", {"epoch": epoch + 1})
-                    print(f"⛔ Early stopping triggered at epoch {epoch+1}")
-                    break
+            print(f"  Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
         
-        self._log_event("tgn_training_complete", {"epochs": epoch + 1})
-        print("✅ TGNN training complete.")
-
-    def score_all_pairs_holdout(self, use_validation=False):
+        self._log_event("training_complete", {"epochs": epochs})
+        print("✅ Training complete")
+    
+    def score_pairs(self, use_validation: bool = True, top_k: int = 100):
         """
-        Score all pairs in the holdout period (validation or test).
+        Score all pairs using trained model.
         
         Args:
-            use_validation: If True, score validation period. If False, score test period.
-            
+            use_validation: If True, score validation period. If False, score test.
+            top_k: Return top K pairs
+        
         Returns:
-            DataFrame with columns: x, y, score (sorted by score descending)
+            DataFrame with top pairs and scores
         """
-        if self.node_features is None:
-            raise ValueError("Node features not built. Call build_temporal_graphs() first.")
-        
         if self.model is None:
-            raise ValueError("Model not initialized.")
+            raise ValueError("Model not trained. Call train() first")
         
-        # Determine which period to score
+        # Select period
         if use_validation:
-            if self.val_period is None:
-                raise ValueError("Validation period not set.")
+            df = self.val_df
             period_start, period_end = self.val_period
             period_name = "validation"
         else:
-            if self.test_period is None:
-                raise ValueError("Test period not set.")
+            df = self.test_df
             period_start, period_end = self.test_period
             period_name = "test"
         
-        print(f"Scoring pairs on {period_name} period: {period_start.date()} → {period_end.date()}")
+        if df is None or len(df) == 0:
+            raise ValueError(f"No {period_name} data available")
         
-        # Get tickers
-        tickers = sorted(self.node_features["ticker"].unique().tolist())
-        num_nodes = len(tickers)
-        
-        # Filter data for holdout period
-        df_holdout = self.node_features[
-            (self.node_features["date"] >= period_start) &
-            (self.node_features["date"] <= period_end)
-        ].copy()
-        
-        # Aggregate features for the holdout period (per node)
-        exclude_cols = ["date", "ticker"]
-        feature_cols = [c for c in df_holdout.columns 
-                       if c not in exclude_cols and np.issubdtype(df_holdout[c].dtype, np.number)]
-        
-        holdout_features = df_holdout.groupby("ticker")[feature_cols].mean().fillna(0.0)
-        holdout_features = holdout_features.reindex(tickers, fill_value=0.0)
-        
-        x_holdout = torch.from_numpy(holdout_features.values).float().to(self.device)
-        
-        print(f"Holdout features shape: {x_holdout.shape}")
-        
-        # Set model to eval mode
         self.model.eval()
         
-        # Reset memory to state after training
-        self.model.reset_memory(num_nodes)
+        # Build temporal snapshots for scoring period
+        print(f"\nScoring pairs on {period_name} period...")
+        snapshots = self.build_temporal_snapshots(
+            df, 
+            window_days=self.lookback_weeks * 5
+        )
         
-        # Replay all training graphs to get proper memory state
-        print("Replaying training graphs to initialize memory...")
+        if len(snapshots) == 0:
+            raise ValueError("No snapshots created for scoring period")
         
-        # Aggregate training features per node
-        train_df = self.node_features[self.node_features["date"] < period_start].copy()
-        train_features_agg = train_df.groupby("ticker")[feature_cols].mean().fillna(0.0)
-        train_features_agg = train_features_agg.reindex(tickers, fill_value=0.0)
-        x_train = torch.from_numpy(train_features_agg.values).float().to(self.device)
+        # Use the most recent snapshot
+        recent_snapshot = snapshots[-1]
+        
+        edge_index = recent_snapshot['edge_index'].to(self.device)
+        edge_weights = recent_snapshot['edge_weights'].to(self.device)
+        
+        self._log_event("scoring_started", {
+            "period": period_name,
+            "scoring_date": str(recent_snapshot['date'].date()),
+            "num_edges": recent_snapshot['num_edges']
+        })
+        
+        print(f"  Scoring date: {recent_snapshot['date'].date()}")
+        print(f"  Period edges: {edge_index.size(1)}")
+        
+        # Create features for most recent period
+        x = self.create_snapshot_features(df, recent_snapshot['date']).to(self.device)
+        
+        # Score all possible pairs in batches
+        num_nodes = len(self.tickers)
+        src_idx, dst_idx = np.triu_indices(num_nodes, k=1)
+        
+        all_scores = []
+        batch_size = 10000
         
         with torch.no_grad():
-            for i, graph in enumerate(self.temporal_graphs):
-                _, memory = self.model(
-                    x_train,
-                    graph["edge_index"],
-                    graph.get("edge_attr", None),
-                    graph.get("edge_times", None),
-                    graph.get("time", i),
-                    pair_index=None,
-                    memory=self.model.node_memory
+            for i in range(0, len(src_idx), batch_size):
+                batch_src = torch.tensor(
+                    src_idx[i:i+batch_size], 
+                    device=self.device
                 )
-                self.model.node_memory = memory.detach()
-        
-        print("Memory state initialized. Scoring all pairs...")
-        
-        # Now score all pairs using holdout features
-        with torch.no_grad():
-            # Generate all possible pairs
-            src_idx, dst_idx = np.triu_indices(num_nodes, k=1)
-            
-            # Process in batches to avoid memory issues
-            batch_size = 10000
-            all_scores = []
-            
-            for start in range(0, len(src_idx), batch_size):
-                end = min(start + batch_size, len(src_idx))
-                
-                batch_src = torch.tensor(src_idx[start:end], device=self.device)
-                batch_dst = torch.tensor(dst_idx[start:end], device=self.device)
+                batch_dst = torch.tensor(
+                    dst_idx[i:i+batch_size], 
+                    device=self.device
+                )
                 pair_index = torch.stack([batch_src, batch_dst], dim=0)
                 
-                # Score this batch of pairs
-                # Use no edges (just final embeddings from memory)
-                scores, _ = self.model(
-                    x_holdout,
-                    edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device),  # Empty edges
-                    edge_attr=None,
-                    edge_times=None,
-                    current_time=len(self.temporal_graphs),  # Time after training
-                    pair_index=pair_index,
-                    memory=self.model.node_memory
+                scores = self.model(
+                    x, 
+                    edge_index, 
+                    edge_weights,
+                    pair_index=pair_index
                 )
                 
                 all_scores.append(scores.cpu().numpy())
         
-        # Combine all scores
         all_scores = np.concatenate(all_scores)
         
         # Create results DataFrame
         results = pd.DataFrame({
-            "x": np.array(tickers)[src_idx],
-            "y": np.array(tickers)[dst_idx],
-            "score": all_scores
-        }).sort_values("score", ascending=False).reset_index(drop=True)
+            'x': [self.tickers[i] for i in src_idx],
+            'y': [self.tickers[i] for i in dst_idx],
+            'score': all_scores
+        }).sort_values('score', ascending=False).reset_index(drop=True)
         
-        topk = results.head(10).to_dict(orient="records")
-        self._log_event("pairs_scored_holdout", {
+        top_pairs = results.head(top_k)
+        
+        topk_dict = top_pairs.head(10).to_dict(orient="records")
+        self._log_event("scoring_complete", {
             "period": period_name,
             "n_pairs": len(results),
-            "top_10": topk
+            "top_10": topk_dict
         })
         
-        print(f"✅ Scored {len(results)} pairs on {period_name} period")
-        print(f"   Top score: {results.iloc[0]['score']:.4f} ({results.iloc[0]['x']}-{results.iloc[0]['y']})")
-        print(f"   Mean score: {results['score'].mean():.4f}")
+        print(f"✅ Scored {len(results)} pairs")
+        print(f"   Top pair: {top_pairs.iloc[0]['x']}-{top_pairs.iloc[0]['y']} "
+              f"(score: {top_pairs.iloc[0]['score']:.4f})")
         
-        return results
+        return top_pairs
