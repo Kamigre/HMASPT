@@ -11,7 +11,7 @@ Multi-agent system for pairs trading:
 from .message_bus import MessageBus, JSONLogger, Graph, SwarmOrchestrator
 from .operator_agent import OperatorAgent, train_operator_on_pairs, PairTradingEnv
 from .supervisor_agent import SupervisorAgent
-from .selector_agent import SelectorAgent, MemoryTGNN
+from .selector_agent import OptimizedSelectorAgent, SimplifiedMemoryTGNN
 
 __all__ = [
     "MessageBus",
