@@ -1,12 +1,5 @@
 """
 Operator Agent for executing pairs trading strategies using Reinforcement Learning.
-FIXED VERSION with:
-- Correct action mapping
-- 10x position scaling for better learning signal
-- 500k timesteps (increased from 20k)
-- Better PPO hyperparameters
-- Curriculum learning option
-- No transaction costs during training (added back in testing)
 """
 
 import os
@@ -259,13 +252,19 @@ class PairTradingEnv(gym.Env):
         # 2. Mean-reversion signal from zscore_short
         # normalized_features[0] is the normalized z-score short
         signal = -self.normalized_features[0][self.idx]   # Correct mean-reversion direction
-        mean_rev_bonus = 0.001 * signal * (target_position / self.position_scale)
+        mean_rev_bonus = 0.0001 * signal * (target_position / self.position_scale)
 
         # Final reward
         reward = (
             daily_return
-            + mean_rev_bonus
+            # + mean_rev_bonus
         )
+
+        # Add small penalty for excessive holding
+        if abs(self.position) > 0 and self.days_in_position > 30:
+          reward -= 0.0001
+
+        reward = reward * 100
 
         # --------------------------
 
@@ -335,13 +334,6 @@ class OperatorAgent:
                       lookback: int = None, timesteps: int = None,
                       shock_prob: float = None, shock_scale: float = None,
                       use_curriculum: bool = False):
-        """
-        IMPROVED training with:
-        - 500k timesteps (was 20k)
-        - Better PPO hyperparameters
-        - Position scaling (10x)
-        - Optional curriculum learning
-        """
 
         if not self.active:
             return None
@@ -364,69 +356,26 @@ class OperatorAgent:
         print(f"  Data length: {len(series_x)} days")
         print(f"  Timesteps: {timesteps:,}")
         print(f"  Position scale: 10x")
-        print(f"  Curriculum learning: {use_curriculum}")
         print(f"{'='*70}")
 
-        if use_curriculum:
-            # CURRICULUM LEARNING: Start easy, get harder
-            print("\n🎓 Stage 1/3: Training without transaction costs...")
-            env = PairTradingEnv(
-                series_x, series_y, lookback, shock_prob, shock_scale,
-                position_scale=10, enable_transaction_costs=False
-            )
-            model = PPO(
-                "MlpPolicy",
-                env,
-                learning_rate=0.0003,
-                n_steps=2048,
-                batch_size=64,
-                n_epochs=10,
-                gamma=0.99,
-                ent_coef=0.01,  # Encourage exploration
-                verbose=0,
-                device="cpu"
-            )
-            model.learn(total_timesteps=timesteps // 3)
-
-            print("\n🎓 Stage 2/3: Adding 50% transaction costs...")
-            original_cost = CONFIG.get("transaction_cost", 0.0005)
-            CONFIG["transaction_cost"] = original_cost * 0.5
-            env = PairTradingEnv(
-                series_x, series_y, lookback, shock_prob, shock_scale,
-                position_scale=10, enable_transaction_costs=True
-            )
-            model.set_env(env)
-            model.learn(total_timesteps=timesteps // 3)
-
-            print("\n🎓 Stage 3/3: Full transaction costs...")
-            CONFIG["transaction_cost"] = original_cost
-            env = PairTradingEnv(
-                series_x, series_y, lookback, shock_prob, shock_scale,
-                position_scale=10, enable_transaction_costs=True
-            )
-            model.set_env(env)
-            model.learn(total_timesteps=timesteps // 3)
-
-        else:
-            # STANDARD TRAINING (no transaction costs)
-            print("\n🚀 Training with standard approach (no costs)...")
-            env = PairTradingEnv(
-                series_x, series_y, lookback, shock_prob, shock_scale,
-                position_scale=10, enable_transaction_costs=False  # Train without costs
-            )
-            model = PPO(
-                "MlpPolicy",
-                env,
-                learning_rate=0.0003,
-                n_steps=2048,
-                batch_size=64,
-                n_epochs=10,
-                gamma=0.99,
-                ent_coef=0.01,
-                verbose=1,  # Show progress
-                device="cpu"
-            )
-            model.learn(total_timesteps=timesteps)
+        print("\n🚀 Training with standard approach (no costs)...")
+        env = PairTradingEnv(
+            series_x, series_y, lookback, shock_prob, shock_scale,
+            position_scale=10, enable_transaction_costs=True  # Train without costs
+        )
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=0.001,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=20,
+            gamma=0.99,
+            ent_coef=0.01,
+            verbose=1,  # Show progress
+            device="cpu"
+        )
+        model.learn(total_timesteps=timesteps)
 
         # Save model
         model_path = os.path.join(self.storage_dir, f"operator_model_{x}_{y}.zip")
@@ -504,7 +453,7 @@ class OperatorAgent:
 
 
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
-                        pairs: list, max_workers: int = None, use_curriculum: bool = False):
+                        pairs: list, max_workers: int = None):
 
     if max_workers is None:
         max_workers = CONFIG.get("max_workers", 2)
@@ -513,7 +462,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
 
     def train(pair):
         x, y = pair
-        return operator.train_on_pair(prices, x, y, use_curriculum=use_curriculum)
+        return operator.train_on_pair(prices, x, y)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(train, pair) for pair in pairs]
@@ -622,12 +571,77 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
             operator.current_step = global_step
 
         print(f"  ✓ Complete: {len(episode_traces)} steps")
+        
+        # Extract values
+        daily_returns = np.array([t["return"] for t in episode_traces])
+        pnls = np.array([t["pnl"] for t in episode_traces])
+        positions = np.array([t["position"] for t in episode_traces])
+
+        # ---------- TRADE DETECTION ----------
+        trades = []
+        last_position = 0
+        for t in episode_traces:
+            pos = t["position"]
+            if pos != last_position:
+                trades.append({"position": pos, "pnl": t["pnl"]})
+            last_position = pos
+
+        n_trades = len(trades)
+        wins = [1 for tr in trades if tr["pnl"] > 0]
+        losses = [1 for tr in trades if tr["pnl"] < 0]
+
+        win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
+        avg_trade_pnl = np.mean([tr["pnl"] for tr in trades]) if n_trades > 0 else 0.0
+
+        # ---------- POSITION USAGE ----------
+        unique_positions, pos_counts = np.unique(positions, return_counts=True)
+        pos_usage = {
+            int(p): float(c) / len(positions)
+            for p, c in zip(unique_positions, pos_counts)
+        }
+
+        # ---------- RETURN METRICS ----------
+        ret_mean = np.mean(daily_returns)
+        ret_std = np.std(daily_returns)
+        ret_median = np.median(daily_returns)
+
+        # ---------- DRAWDOWN ----------
+        max_dd = max(t["max_drawdown"] for t in episode_traces)
+
+        # Sharpe and Sortino
+        sharpe = calculate_sharpe(episode_traces)
+        sortino = calculate_sortino(episode_traces)
+
+        # ============================
+        # STORE IN LOGGING / TRACE
+        # ============================
+        extra_stats = {
+            "trades": n_trades,
+            "win_rate": win_rate,
+            "avg_trade_pnl": avg_trade_pnl,
+            "position_usage": pos_usage,
+            "return_mean": ret_mean,
+            "return_std": ret_std,
+            "return_median": ret_median,
+            "max_drawdown": max_dd
+        }
+
+        print(f"  Trades: {n_trades}")
+        print(f"  Win rate: {win_rate*100:.2f}%")
+        print(f"  Avg trade P&L: {avg_trade_pnl:.4f}")
+        print(f"  Position usage: {pos_usage}")
+
+        if operator.logger:
+            operator.logger.log("operator", "episode_metrics", {
+                "pair": f"{pair[0]}-{pair[1]}",
+                **extra_stats,
+                "sharpe": sharpe,
+                "sortino": sortino
+            })
+
         if len(episode_traces) > 0:
             print(f"  Final return: {episode_traces[-1]['cum_reward']*100:.2f}%")
             print(f"  Total P&L: ${sum(t['pnl'] for t in episode_traces):.2f}")
-
-        sharpe = calculate_sharpe(episode_traces)
-        sortino = calculate_sortino(episode_traces)
 
         if operator.logger:
             operator.logger.log("operator", "episode_complete", {
