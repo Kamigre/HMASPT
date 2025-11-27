@@ -1,14 +1,3 @@
-"""
-Optimized Temporal GNN Selector with fundamental features and weekly snapshots.
-
-Key optimizations over original:
-1. No persistent GRU memory (stateless per-snapshot processing)
-2. Single-layer GAT (PyG optimized)
-3. Weekly snapshots (more granular than biweekly)
-4. Batched operations throughout
-5. Includes fundamentals (EPS, PEG) and industry encoding
-"""
-
 import os
 import json
 import datetime
@@ -24,10 +13,6 @@ from dataclasses import dataclass, field
 
 
 class SimplifiedTGNN(nn.Module):
-    """
-    Streamlined TGNN without persistent memory.
-    Each snapshot is processed independently.
-    """
     
     def __init__(self, node_dim, hidden_dim=32, num_heads=2, dropout=0.1):
         super().__init__()
@@ -55,13 +40,7 @@ class SimplifiedTGNN(nn.Module):
         self.dropout = dropout
     
     def forward(self, x, edge_index, edge_weight=None, pair_index=None):
-        """
-        Args:
-            x: node features [N, D]
-            edge_index: graph connectivity [2, E]
-            edge_weight: optional edge weights [E]
-            pair_index: pairs to score [2, P]
-        """
+
         # Encode nodes
         h = self.node_encoder(x)
         h = F.relu(h)
@@ -88,10 +67,7 @@ class SimplifiedTGNN(nn.Module):
 
 @dataclass
 class OptimizedSelectorAgent:
-    """
-    Optimized pairs selector with fundamentals and weekly snapshots.
-    """
-    
+
     df: pd.DataFrame
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     trace_path: str = "traces/selector.jsonl"
@@ -114,6 +90,7 @@ class OptimizedSelectorAgent:
     temporal_graphs: Optional[List[Dict[str, Any]]] = field(default_factory=list)
     
     def __post_init__(self):
+
         os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
         self._log_event("init", {
             "device": self.device, 
@@ -122,7 +99,7 @@ class OptimizedSelectorAgent:
         })
     
     def _log_event(self, event: str, details: Dict[str, Any]):
-        """Log event to trace file."""
+
         entry = {
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "agent": "selector",
@@ -133,10 +110,7 @@ class OptimizedSelectorAgent:
             f.write(json.dumps(entry, default=str) + "\n")
     
     def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
-        """
-        Build node features with fundamentals and industry encoding.
-        Windows are in weeks (1w, 2w, 4w for weekly granularity).
-        """
+
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
         
@@ -213,7 +187,7 @@ class OptimizedSelectorAgent:
         return df
     
     def prepare_data(self, train_end_date: str = None):
-        """Prepare data with train/val/test split."""
+
         if train_end_date is None:
             # Auto-split based on holdout_years
             last_date = self.df["date"].max()
@@ -267,16 +241,7 @@ class OptimizedSelectorAgent:
         return self.train_df, self.val_df, self.test_df
     
     def build_temporal_snapshots(self, df: pd.DataFrame, window_days: int = 20):
-        """
-        Build weekly temporal correlation snapshots.
-        
-        Args:
-            df: DataFrame with node features
-            window_days: Lookback window for correlation (default 20 days = 4 weeks)
-        
-        Returns:
-            List of snapshot dictionaries
-        """
+
         df = df.sort_values('date')
         
         # Pivot returns
@@ -328,7 +293,7 @@ class OptimizedSelectorAgent:
         return snapshots
     
     def create_snapshot_features(self, df: pd.DataFrame, snapshot_date):
-        """Create node features for a specific snapshot date."""
+
         exclude_cols = ["date", "ticker", "close", "adj_factor", "split_factor", 
                        "div_amount", "volume", "adj_close"]
         feature_cols = [c for c in df.columns 
@@ -345,16 +310,8 @@ class OptimizedSelectorAgent:
         return torch.tensor(node_features.values, dtype=torch.float)
     
     def train(self, epochs: int = 5, lr: float = 0.001, batch_size: int = 512, 
-              snapshot_stride: int = 2):
-        """
-        Train TGNN on weekly temporal snapshots.
-        
-        Args:
-            epochs: Number of training epochs
-            lr: Learning rate
-            batch_size: Batch size for pair scoring
-            snapshot_stride: Use every Nth snapshot (2 = every 2 weeks for speed)
-        """
+              snapshot_stride: int = 1):
+
         if self.train_df is None:
             raise ValueError("Call prepare_data() first")
         
@@ -491,16 +448,7 @@ class OptimizedSelectorAgent:
         print("✅ Training complete")
     
     def score_pairs(self, use_validation: bool = True, top_k: int = 100):
-        """
-        Score all pairs using trained model.
-        
-        Args:
-            use_validation: If True, score validation period. If False, score test.
-            top_k: Return top K pairs
-        
-        Returns:
-            DataFrame with top pairs and scores
-        """
+
         if self.model is None:
             raise ValueError("Model not trained. Call train() first")
         
@@ -586,11 +534,11 @@ class OptimizedSelectorAgent:
         
         top_pairs = results.head(top_k)
         
-        topk_dict = top_pairs.head(10).to_dict(orient="records")
+        topk_dict = top_pairs.head(100).to_dict(orient="records")
         self._log_event("scoring_complete", {
             "period": period_name,
             "n_pairs": len(results),
-            "top_10": topk_dict
+            "top_100": topk_dict
         })
         
         print(f"✅ Scored {len(results)} pairs")
