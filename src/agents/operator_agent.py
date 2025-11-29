@@ -25,7 +25,7 @@ class PairTradingEnv(gym.Env):
     def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
                  shock_prob: float = None, shock_scale: float = None,
                  initial_capital: float = None, test_mode: bool = False,
-                 position_scale: int = 1, enable_transaction_costs: bool = True):
+                 position_scale: int = 100, enable_transaction_costs: bool = True):
 
         super().__init__()
 
@@ -260,6 +260,7 @@ class PairTradingEnv(gym.Env):
 
         # Record trade
         self.trades.append({
+            "portfolio_value": float(self.portfolio_value),
             "pnl": float(pnl),
             "return": float(daily_return),
             "position": int(self.position)
@@ -267,6 +268,7 @@ class PairTradingEnv(gym.Env):
 
         obs = self._get_observation(self.idx)
         info = {
+            "portfolio_value": float(self.portfolio_value),
             "pnl": float(pnl),
             "return": float(daily_return),
             "position": int(self.position),
@@ -520,7 +522,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
             shock_scale=0.0,
             initial_capital=CONFIG.get("initial_capital", 10000),
             test_mode=True,
-            position_scale=10,
+            position_scale=100,
             enable_transaction_costs=True
         )
 
@@ -540,6 +542,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
                 "step": global_step,
                 "local_step": local_step,
                 "reward": float(reward),
+                "portfolio_value": float(info.get("portfolio_value", 0.0)),
                 "pnl": float(info.get("pnl", 0.0)),
                 "return": float(info.get("return", 0.0)),
                 "cum_reward": float(info.get("cum_reward", 0)),
