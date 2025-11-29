@@ -481,16 +481,15 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     return all_traces
 
 
-def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_every_n_days=15):
-    """
-    TESTING: Apply transaction costs here (realistic evaluation)
-    """
-
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_interval=20):
+    
     operator.traces_buffer = []
     operator.current_step = 0
     operator.evaluation_in_progress = False
 
     global_step = 0
+    all_traces = []
+    skipped_pairs = []
 
     for pair in pairs:
         print(f"\n{'='*70}")
@@ -529,15 +528,17 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
             initial_capital=CONFIG.get("initial_capital", 10000),
             test_mode=True,
             position_scale=10,
-            enable_transaction_costs=True  # Costs enabled in testing
+            enable_transaction_costs=True
         )
 
         episode_traces = []
         local_step = 0
         obs, info = env.reset()
         terminated = False
+        skip_to_next_pair = False
 
-        while not terminated:
+        # Trading loop with supervisor monitoring
+        while not terminated and not skip_to_next_pair:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, _, info = env.step(action)
 
@@ -554,17 +555,75 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
             }
 
             episode_traces.append(trace)
+            all_traces.append(trace)
             operator.add_trace(trace)
+            
+            # Save detailed trace for visualization
+            if hasattr(operator, 'save_detailed_trace'):
+                operator.save_detailed_trace(trace)
+            
             if operator.logger:
                 operator.logger.log("operator", "holdout_step", trace)
+
+            # ============================================================
+            # SUPERVISOR MONITORING (every N steps)
+            # ============================================================
+            if local_step > 0 and local_step % check_interval == 0:
+                decision = supervisor.check_operator_performance(
+                    episode_traces, 
+                    pair
+                )
+                
+                if decision["action"] == "stop":
+                    print(f"\n⛔ SUPERVISOR INTERVENTION: Skipping to next pair")
+                    print(f"   Reason: {decision['reason']}")
+                    print(f"   Metrics: {decision['metrics']}")
+                    print(f"   Steps completed: {local_step}/{len(aligned)}")
+                    
+                    # Record skip information
+                    skip_info = {
+                        "pair": f"{pair[0]}-{pair[1]}",
+                        "reason": decision['reason'],
+                        "step_stopped": global_step,
+                        "local_step_stopped": local_step,
+                        "metrics": decision['metrics']
+                    }
+                    
+                    skipped_pairs.append(skip_info)
+                    skip_to_next_pair = True
+                    
+                    # Log the intervention
+                    if operator.logger:
+                        operator.logger.log("supervisor", "intervention", skip_info)
+                    
+                    continue
+                
+                elif decision["action"] == "adjust":
+                    print(f"\n⚠️  SUPERVISOR WARNING:")
+                    print(f"   {decision['reason']}")
+                    if 'suggestion' in decision:
+                        print(f"   Suggestion: {decision['suggestion']}")
+                
+                # Show periodic performance updates
+                if local_step % (check_interval * 2) == 0:
+                    metrics = decision["metrics"]
+                    print(f"\n📊 Step {local_step}: DD={metrics['drawdown']:.2%}, "
+                          f"Sharpe={metrics['sharpe']:.2f}, WinRate={metrics['win_rate']:.2%}")
 
             local_step += 1
             global_step += 1
             operator.current_step = global_step
 
-        print(f"  ✓ Complete: {len(episode_traces)} steps")
+        # ============================================================
+        # END OF PAIR SUMMARY
+        # ============================================================
         
-        # Extract values
+        if skip_to_next_pair:
+            print(f"⏭️  Pair skipped early at step {local_step}")
+        else:
+            print(f"  ✓ Complete: {len(episode_traces)} steps")
+        
+        # Extract values for metrics
         daily_returns = np.array([t["return"] for t in episode_traces])
         pnls = np.array([t["pnl"] for t in episode_traces])
         positions = np.array([t["position"] for t in episode_traces])
@@ -598,7 +657,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
         ret_median = np.median(daily_returns)
 
         # ---------- DRAWDOWN ----------
-        max_dd = max(t["max_drawdown"] for t in episode_traces)
+        max_dd = max(t["max_drawdown"] for t in episode_traces) if episode_traces else 0
 
         # Sharpe and Sortino
         sharpe = calculate_sharpe(episode_traces)
@@ -615,7 +674,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
             "return_mean": ret_mean,
             "return_std": ret_std,
             "return_median": ret_median,
-            "max_drawdown": max_dd
+            "max_drawdown": max_dd,
+            "was_skipped": skip_to_next_pair
         }
 
         print(f"  Trades: {n_trades}")
@@ -642,16 +702,35 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
                 "final_cum_return": episode_traces[-1]['cum_reward'] if episode_traces else 0,
                 "total_pnl": sum(t['pnl'] for t in episode_traces),
                 "sharpe": sharpe,
-                "sortino": sortino
+                "sortino": sortino,
+                "was_skipped": skip_to_next_pair
             })
 
+    # ============================================================
+    # FINAL SUMMARY
+    # ============================================================
+    
     print("\n" + "="*70)
     print("Holdout testing complete")
     print(f"Total steps: {global_step}")
+    print(f"Total pairs tested: {len(pairs)}")
+    print(f"Pairs skipped by supervisor: {len(skipped_pairs)}")
     print("="*70)
+    
+    # Print skipped pairs summary
+    if skipped_pairs:
+        print(f"\n{'='*70}")
+        print(f"SUPERVISOR SUMMARY: {len(skipped_pairs)} pairs skipped early")
+        print(f"{'='*70}")
+        for skip in skipped_pairs:
+            print(f"\n  {skip['pair']}:")
+            print(f"    Reason: {skip['reason']}")
+            print(f"    Stopped at step: {skip['local_step_stopped']}")
+            print(f"    Final metrics: DD={skip['metrics']['drawdown']:.2%}, "
+                  f"Sharpe={skip['metrics']['sharpe']:.2f}, "
+                  f"WinRate={skip['metrics']['win_rate']:.2%}")
 
-    return operator.traces_buffer
-
+    return all_traces, skipped_pairs
 
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
