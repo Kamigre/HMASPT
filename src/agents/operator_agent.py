@@ -212,7 +212,7 @@ class PairTradingEnv(gym.Env):
         # --------------------------
         # P&L calculation
         # --------------------------
-        pnl = -self.position * spread_change
+        pnl = self.position * spread_change
 
         # Transaction costs
         trade_size = abs(target_position - self.position)
@@ -238,10 +238,10 @@ class PairTradingEnv(gym.Env):
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
 
         # --------------------------
-        # NEW REWARD FUNCTION
+        # REWARD FUNCTION
         # --------------------------
 
-        # 2. Mean-reversion signal from zscore_short
+        # Mean-reversion signal from zscore_short
         # normalized_features[0] is the normalized z-score short
         signal = -self.normalized_features[0][self.idx]   # Correct mean-reversion direction
         mean_rev_bonus = 0.0001 * signal * (target_position / self.position_scale)
@@ -255,8 +255,6 @@ class PairTradingEnv(gym.Env):
         # Add small penalty for excessive holding
         if abs(self.position) > 0 and self.days_in_position > 30:
           reward -= 0.0001
-
-        reward = reward * 100
 
         # --------------------------
 
@@ -349,7 +347,7 @@ class OperatorAgent:
         print(f"  Position scale: 10x")
         print(f"{'='*70}")
 
-        print("\n🚀 Training...")
+        print("\n🚀 Training with standard approach (no costs)...")
         env = PairTradingEnv(
             series_x, series_y, lookback, shock_prob, shock_scale,
             position_scale=10, enable_transaction_costs=True
@@ -432,13 +430,6 @@ class OperatorAgent:
 
         if self.logger:
             self.logger.log("operator", "pair_trained", trace)
-        if self.message_bus:
-            self.message_bus.publish({
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "agent": "operator",
-                "event": "pair_trained",
-                "details": trace
-            })
 
         return trace
 
