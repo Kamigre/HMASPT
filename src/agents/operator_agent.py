@@ -700,3 +700,10 @@ def calculate_sortino(traces, risk_free_rate=None):
             return 0.0
     
     return (mean_excess / downside_deviation) * np.sqrt(252)
+
+def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
+    """Save detailed trace for visualization."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    
+    with open(filepath, "a") as f:
+        f.write(json.dumps(trace, default=str) + "\n")
