@@ -3,7 +3,7 @@ import json
 import time
 import datetime
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
 import gymnasium as gym
@@ -17,7 +17,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 from utils import half_life, compute_spread
-from agents.message_bus import MessageBus, JSONLogger
+from agents.message_bus import JSONLogger
 from statsmodels.tsa.stattools import coint
 
 class PairTradingEnv(gym.Env):
