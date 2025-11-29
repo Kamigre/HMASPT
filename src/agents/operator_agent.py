@@ -349,7 +349,7 @@ class OperatorAgent:
         print(f"  Position scale: 10x")
         print(f"{'='*70}")
 
-        print("\n🚀 Training with standard approach (no costs)...")
+        print("\n🚀 Training...")
         env = PairTradingEnv(
             series_x, series_y, lookback, shock_prob, shock_scale,
             position_scale=10, enable_transaction_costs=True
