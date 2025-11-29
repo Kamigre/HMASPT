@@ -1,7 +1,3 @@
-"""
-Operator Agent for executing pairs trading strategies using Reinforcement Learning.
-"""
-
 import os
 import json
 import time
@@ -10,23 +6,19 @@ from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 import pandas as pd
-
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 from utils import half_life, compute_spread
 from agents.message_bus import MessageBus, JSONLogger
 from statsmodels.tsa.stattools import coint
-
 
 class PairTradingEnv(gym.Env):
 
@@ -41,7 +33,7 @@ class PairTradingEnv(gym.Env):
         if lookback is None:
             lookback = CONFIG.get("rl_lookback", 30)
         if shock_prob is None:
-            shock_prob = CONFIG.get("shock_prob", 0.0)  # Default OFF
+            shock_prob = CONFIG.get("shock_prob", 0.0)
         if shock_scale is None:
             shock_scale = CONFIG.get("shock_scale", 0.0)
         if initial_capital is None:
@@ -338,11 +330,11 @@ class OperatorAgent:
         if not self.active:
             return None
 
-        # IMPROVED DEFAULTS
+        # Defaults
         if lookback is None:
-            lookback = CONFIG.get("rl_lookback", 20)  # Shorter = more responsive
+            lookback = CONFIG.get("rl_lookback", 20)
         if timesteps is None:
-            timesteps = CONFIG.get("rl_timesteps", 500000)  # INCREASED 25x
+            timesteps = CONFIG.get("rl_timesteps", 500000)
         if shock_prob is None:
             shock_prob = 0.0  # OFF by default
         if shock_scale is None:
@@ -361,7 +353,7 @@ class OperatorAgent:
         print("\n🚀 Training with standard approach (no costs)...")
         env = PairTradingEnv(
             series_x, series_y, lookback, shock_prob, shock_scale,
-            position_scale=10, enable_transaction_costs=True  # Train without costs
+            position_scale=10, enable_transaction_costs=True
         )
         model = PPO(
             "MlpPolicy",
@@ -382,11 +374,11 @@ class OperatorAgent:
         model.save(model_path)
         print(f"\n✅ Model saved to {model_path}")
 
-        # Evaluate on training data (without costs for fair comparison)
+        # Evaluate on training data
         print("\n📊 Evaluating on training data...")
         env_eval = PairTradingEnv(
             series_x, series_y, lookback, 0.0, 0.0,
-            position_scale=10, enable_transaction_costs=False,
+            position_scale=10, enable_transaction_costs=True,
             test_mode=False
         )
         
@@ -664,42 +656,47 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_ever
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-
-    returns = [t['return'] for t in traces]
-    if len(returns) == 0:
+    
+    returns = np.array([t['return'] for t in traces])
+    
+    if len(returns) < 2:  # Need at least 2 observations
         return 0.0
-
+    
     rf_daily = risk_free_rate / 252
-    excess_returns = [r - rf_daily for r in returns]
-
+    excess_returns = returns - rf_daily
+    
     mean_excess = np.mean(excess_returns)
-    std_excess = np.std(excess_returns, ddof=1) if len(excess_returns) > 1 else 0.0
-
-    if std_excess == 0:
+    std_excess = np.std(excess_returns, ddof=1)
+    
+    if std_excess < 1e-8:  # Essentially zero volatility
         return 0.0
-
+    
     return (mean_excess / std_excess) * np.sqrt(252)
 
 
 def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-
-    returns = [t['return'] for t in traces]
-    if len(returns) == 0:
+    
+    returns = np.array([t['return'] for t in traces])
+    
+    if len(returns) < 2:  # Need at least 2 observations
         return 0.0
-
+    
     rf_daily = risk_free_rate / 252
-    excess_returns = [r - rf_daily for r in returns]
-    downside_returns = [r for r in excess_returns if r < 0]
-
-    if len(downside_returns) == 0:
-        return float('inf')
-
+    excess_returns = returns - rf_daily
+    
     mean_excess = np.mean(excess_returns)
-    downside_std = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0.0
-
-    if downside_std == 0:
-        return float('inf')
-
-    return (mean_excess / downside_std) * np.sqrt(252)
+    
+    # CORRECT: Downside deviation (semi-deviation)
+    # Only penalize returns below the target (risk-free rate)
+    downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
+    
+    if downside_deviation < 1e-8:  # No downside risk
+        # All returns above risk-free rate
+        if mean_excess > 0:
+            return 100.0  # Or some large positive number
+        else:
+            return 0.0
+    
+    return (mean_excess / downside_deviation) * np.sqrt(252)
