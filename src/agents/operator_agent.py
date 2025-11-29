@@ -281,8 +281,7 @@ class PairTradingEnv(gym.Env):
 
 @dataclass
 class OperatorAgent:
-
-    message_bus: MessageBus = None
+  
     logger: JSONLogger = None
     storage_dir: str = "models/"
 
