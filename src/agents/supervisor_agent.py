@@ -65,6 +65,15 @@ class SupervisorAgent:
         if self.logger:
             self.logger.log("supervisor", event, details)
 
+    def format_skip_info(self, pair: Tuple[str, str], decision: Dict, step: int) -> Dict:
+    """Format skip information for visualization."""
+    return {
+        "pair": f"{pair[0]}-{pair[1]}",
+        "reason": decision['reason'],
+        "step_stopped": step,
+        "metrics": decision['metrics']
+    }
+
     # ===================================================================
     # 1. PAIR VALIDATION (used by Selector)
     # ===================================================================
