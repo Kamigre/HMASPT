@@ -272,7 +272,7 @@ class SupervisorAgent:
             traces_by_pair[pair].append(t)
 
         # ============================================================
-        # FIX: Recalculate true daily returns using pnl / prev_value
+        # Recalculate true daily returns using pnl / prev_value
         # ============================================================
         all_returns = []
         all_pnls = []
@@ -308,7 +308,7 @@ class SupervisorAgent:
         win_rate = positive / len(all_returns) if all_returns else 0
 
         # ============================================================
-        # Per-pair summaries (with corrected returns)
+        # Per-pair summaries
         # ============================================================
         pair_summaries = []
         for pair, traces in traces_by_pair.items():
@@ -338,7 +338,7 @@ class SupervisorAgent:
             pair_summaries.append({
                 "pair": pair,
                 "total_pnl": float(sum(pair_pnls)),
-                "final_return": float(traces[-1].get("cum_reward", 0)) if traces else 0,
+                "final_return": float(traces[-1].get("cum_return", 0)) if traces else 0,
                 "sharpe": float(pair_sharpe),
                 "sortino": float(pair_sortino),
                 "max_drawdown": float(pair_max_dd),
