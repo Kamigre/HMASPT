@@ -25,7 +25,7 @@ class PairTradingEnv(gym.Env):
     def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
                  shock_prob: float = None, shock_scale: float = None,
                  initial_capital: float = None, test_mode: bool = False,
-                 position_scale: int = 10, enable_transaction_costs: bool = True):
+                 position_scale: int = 1, enable_transaction_costs: bool = True):
 
         super().__init__()
 
@@ -45,8 +45,8 @@ class PairTradingEnv(gym.Env):
         self.lookback_long = max(60, lookback * 2)
         self.test_mode = test_mode
         self.initial_capital = initial_capital
-        self.position_scale = position_scale  # NEW: Scale positions
-        self.enable_transaction_costs = enable_transaction_costs  # NEW: Toggle costs
+        self.position_scale = position_scale
+        self.enable_transaction_costs = enable_transaction_costs
 
         # Action: 3 discrete actions
         self.action_space = spaces.Discrete(3)
@@ -104,7 +104,7 @@ class PairTradingEnv(gym.Env):
         )
 
         # Spread percentile in recent history
-        self.spread_percentile = self.spread.rolling(30).apply(
+        self.spread_percentile = self.spread.rolling(15).apply(
             lambda s: pd.Series(s).rank(pct=True).iloc[-1] if len(s) > 0 else 0.5
         )
 
@@ -118,7 +118,7 @@ class PairTradingEnv(gym.Env):
         self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0, posinf=5.0, neginf=-5.0)
         self.vol_short_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0, posinf=1.0, neginf=0.0)
 
-    def _rolling_cointegration(self, x, y, window=90):
+    def _rolling_cointegration(self, x, y, window=60):
         pvalues = []
         for i in range(len(x)):
             if i < window:
@@ -196,7 +196,7 @@ class PairTradingEnv(gym.Env):
         # Action 2 → Position +1 * scale (long)
 
         base_position = int(action) - 1
-        target_position = base_position * self.position_scale  # Scale to -10, 0, +10
+        target_position = base_position * self.position_scale
 
         current_idx = self.idx
         next_idx = current_idx + 1
@@ -252,9 +252,9 @@ class PairTradingEnv(gym.Env):
             # + mean_rev_bonus
         )
 
-        # Add small penalty for excessive holding
-        if abs(self.position) > 0 and self.days_in_position > 30:
-          reward -= 0.0001
+        # # Add small penalty for excessive holding
+        # if abs(self.position) > 0 and self.days_in_position > 30:
+        #   reward -= 0.0001
 
         # --------------------------
 
@@ -271,7 +271,7 @@ class PairTradingEnv(gym.Env):
             "return": float(daily_return),
             "position": int(self.position),
             "drawdown": float(drawdown),
-            "cum_reward": float(self.portfolio_value / self.initial_capital - 1)
+            "cum_return": float(self.portfolio_value / self.initial_capital - 1)
         }
 
         return obs, float(reward), terminated, False, info
@@ -350,7 +350,7 @@ class OperatorAgent:
         print("\n🚀 Training with standard approach (no costs)...")
         env = PairTradingEnv(
             series_x, series_y, lookback, shock_prob, shock_scale,
-            position_scale=10, enable_transaction_costs=True
+            position_scale=100, enable_transaction_costs=True
         )
         model = PPO(
             "MlpPolicy",
@@ -375,7 +375,7 @@ class OperatorAgent:
         print("\n📊 Evaluating on training data...")
         env_eval = PairTradingEnv(
             series_x, series_y, lookback, 0.0, 0.0,
-            position_scale=10, enable_transaction_costs=True,
+            position_scale=100, enable_transaction_costs=True,
             test_mode=False
         )
         
@@ -398,6 +398,8 @@ class OperatorAgent:
         sharpe = 0.0
         if len(excess_rets) > 1 and np.std(excess_rets, ddof=1) > 1e-8:
             sharpe = np.mean(excess_rets) / np.std(excess_rets, ddof=1) * np.sqrt(252)
+            print(np.mean(excess_rets))
+            print(np.std(excess_rets, ddof=1))
         
         downside = excess_rets[excess_rets < 0]
         sortino = 0.0
@@ -413,6 +415,7 @@ class OperatorAgent:
         print(f"  Sharpe Ratio: {sharpe:.3f}")
         print(f"  Sortino Ratio: {sortino:.3f}")
         print(f"  Positions used: {unique_positions}")
+
         for pos in unique_positions:
             count = np.sum(np.array(positions) == pos)
             pct = count / len(positions) * 100
@@ -420,7 +423,7 @@ class OperatorAgent:
 
         trace = {
             "pair": (x, y),
-            "cum_reward": final_return,
+            "cum_return": final_return,
             "max_drawdown": (env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value,
             "sharpe": sharpe,
             "sortino": sortino,
@@ -465,7 +468,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     print("="*70)
     for trace in all_traces:
         print(f"{trace['pair'][0]}-{trace['pair'][1]}: "
-              f"Return={trace['cum_reward']:.2f}%, Sharpe={trace['sharpe']:.2f}")
+              f"Return={trace['cum_return']:.2f}%, Sharpe={trace['sharpe']:.2f}")
     print("="*70)
     
     return all_traces
