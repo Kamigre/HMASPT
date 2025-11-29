@@ -4,7 +4,7 @@ CONFIG = {
     "transaction_cost": 0.0005,
     "rl_policy": "MlpPolicy",
     "windows": [1, 2, 4],
-    "rl_timesteps": 200000,
+    "rl_timesteps": 50000,
     "half_life_max": 60,
     "rl_lookback": 30,
     "shock_prob": 0.01,
