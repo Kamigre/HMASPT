@@ -186,6 +186,7 @@ class PairTradingEnv(gym.Env):
         self.portfolio_value = self.initial_capital
         self.peak_value = self.initial_capital
         self.trades = []
+        self.cum_reward = 0.0
 
         return self._get_observation(self.idx), {}
 
@@ -241,12 +242,16 @@ class PairTradingEnv(gym.Env):
         # REWARD FUNCTION
         # --------------------------
 
+        signal = -self.normalized_features[0][self.idx] 
+
         reward = (
             10.0 * daily_return              # Main objective
             - 8.0 * (drawdown ** 2)          # Quadratic drawdown penalty
             + 0.01 * signal * (target_position / self.position_scale)  # Signal alignment
             - 0.0005 * abs(trade_size)       # Subtle penalty for excessive trading
         )
+
+        self.cum_reward += reward
 
         # Record trade
         self.trades.append({
@@ -263,6 +268,8 @@ class PairTradingEnv(gym.Env):
             "return": float(daily_return),
             "position": int(self.position),
             "drawdown": float(drawdown),
+            "reward": float(reward),
+            "cum_reward": float(self.cum_reward),
             "cum_return": float(self.portfolio_value / self.initial_capital - 1)
         }
 
@@ -535,7 +542,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
                 "portfolio_value": float(info.get("portfolio_value", 0.0)),
                 "pnl": float(info.get("pnl", 0.0)),
                 "return": float(info.get("return", 0.0)),
-                "cum_reward": float(info.get("cum_reward", 0)),
+                "cum_return": float(info.get("cum_return", 0.0)),
+                "cum_reward": float(info.get("cum_reward", 0.0)),
                 "position": float(info.get("position", 0)),
                 "max_drawdown": float(info.get("drawdown", 0))
             }
