@@ -181,19 +181,17 @@ class SupervisorAgent:
         # Calculate current metrics
         returns = [t.get("daily_return", 0) for t in operator_traces]
         pnls = [t.get("realized_pnl_this_step", 0) for t in operator_traces]
-        
-        # Current drawdown
-        cum_returns = np.cumsum(returns)
-        peak = np.maximum.accumulate(cum_returns)
-        drawdown = (peak - cum_returns) / (np.abs(peak) + 1e-8)
-        max_dd = float(np.max(drawdown))
+        portfolio_value = operator_traces[-1].get("portfolio_value", 0)
+        max_portfolio_value = max([t.get("portfolio_value", 0) for t in operator_traces])
+
+        max_dd = (max_portfolio_value - portfolio_value) / max(max_portfolio_value, 1e-8)
         
         # Current Sharpe
         sharpe = self._calculate_sharpe(returns)
         
         # Win rate
-        positive_rets = sum(1 for r in returns if r > 0)
-        win_rate = positive_rets / len(returns)
+        positive_pnls = sum(1 for r in pnls if r > 0)
+        win_rate = positive_pnls / len(pnls)
         
         # Total P&L
         total_pnl = sum(pnls)
