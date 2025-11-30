@@ -38,7 +38,7 @@ class PortfolioVisualizer:
         steps = [t['step'] for t in traces]
         pnls = [t['pnl'] for t in traces]
         returns = [t['return'] for t in traces]
-        cum_returns = [t['cum_returns'] for t in traces]
+        cum_return = [t['cum_return'] for t in traces]
         positions = [t['position'] for t in traces]
         drawdowns = [t['max_drawdown'] for t in traces]
         
@@ -46,7 +46,7 @@ class PortfolioVisualizer:
         sharpe = self._calculate_sharpe(returns)
         sortino = self._calculate_sortino(returns)
         total_pnl = sum(pnls)
-        final_return = cum_returns[-1] * 100
+        final_return = cum_return[-1] * 100
         max_dd = max(drawdowns)
         win_rate = sum(1 for r in returns if r > 0) / len(returns)
         
@@ -63,9 +63,9 @@ class PortfolioVisualizer:
         
         # 1. Cumulative Returns
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(steps, np.array(cum_returns) * 100, linewidth=2, color='darkblue')
+        ax1.plot(steps, np.array(cum_return) * 100, linewidth=2, color='darkblue')
         ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax1.fill_between(steps, 0, np.array(cum_returns) * 100, 
+        ax1.fill_between(steps, 0, np.array(cum_return) * 100, 
                          alpha=0.3, color='blue' if final_return > 0 else 'red')
         
         if was_skipped and skip_info:
@@ -234,10 +234,10 @@ class PortfolioVisualizer:
         
         # 1. Portfolio Cumulative Returns
         ax1 = fig.add_subplot(gs[0, :])
-        portfolio_cum_returns = np.cumsum([t['pnl'] for t in all_traces])
+        portfolio_cum_return = np.cumsum([t['pnl'] for t in all_traces])
         steps = list(range(len(all_traces)))
-        ax1.plot(steps, portfolio_cum_returns, linewidth=2.5, color='darkblue', label='Portfolio')
-        ax1.fill_between(steps, 0, portfolio_cum_returns, alpha=0.3, color='blue')
+        ax1.plot(steps, portfolio_cum_return, linewidth=2.5, color='darkblue', label='Portfolio')
+        ax1.fill_between(steps, 0, portfolio_cum_return, alpha=0.3, color='blue')
         ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
         
         # Mark supervisor interventions
