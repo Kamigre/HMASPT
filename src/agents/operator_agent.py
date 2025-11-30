@@ -241,22 +241,12 @@ class PairTradingEnv(gym.Env):
         # REWARD FUNCTION
         # --------------------------
 
-        # Mean-reversion signal from zscore_short
-        # normalized_features[0] is the normalized z-score short
-        signal = -self.normalized_features[0][self.idx]   # Correct mean-reversion direction
-        mean_rev_bonus = 0.0001 * signal * (target_position / self.position_scale)
-
-        # Final reward
         reward = (
-            daily_return
-            # + mean_rev_bonus
+            10.0 * daily_return              # Main objective
+            - 8.0 * (drawdown ** 2)          # Quadratic drawdown penalty
+            + 0.01 * signal * (target_position / self.position_scale)  # Signal alignment
+            - 0.0005 * abs(trade_size)       # Subtle penalty for excessive trading
         )
-
-        # # Add small penalty for excessive holding
-        # if abs(self.position) > 0 and self.days_in_position > 30:
-        #   reward -= 0.0001
-
-        # --------------------------
 
         # Record trade
         self.trades.append({
