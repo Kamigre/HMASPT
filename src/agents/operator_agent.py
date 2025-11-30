@@ -666,11 +666,14 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
             last_position = pos
 
         n_trades = len(trades)
-        wins = [1 for tr in trades if tr["realized_pnl_this_step"] > 0]
-        losses = [1 for tr in trades if tr["realized_pnl_this_step"] < 0]
+
+        pnls = [tr["realized_pnl"] for tr in trades]
+
+        wins = [1 for pnl in pnls if pnl > 0]
+        losses = [1 for pnl in pnls if pnl < 0]
 
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
-        avg_trade_pnl = np.mean([tr["realized_pnl_this_step"] for tr in trades]) if n_trades > 0 else 0.0
+        avg_trade_pnl = np.mean(pnls) if n_trades > 0 else 0.0
 
         # ---------- POSITION USAGE ----------
         unique_positions, pos_counts = np.unique(positions, return_counts=True)
