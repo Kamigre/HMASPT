@@ -379,9 +379,10 @@ class OperatorAgent:
 
         print("\n🚀 Training with standard approach (no costs)...")
         env = PairTradingEnv(
-            series_x, series_y, lookback, shock_prob, shock_scale,
-            position_scale=100, enable_transaction_costs=True
-        )
+              series_x, series_y, lookback, position_scale=100,
+              transaction_cost_rate = 0.0005, test_mode=False
+          )
+
         model = PPO(
             "MlpPolicy",
             env,
@@ -404,9 +405,8 @@ class OperatorAgent:
         # Evaluate on training data
         print("\n📊 Evaluating on training data...")
         env_eval = PairTradingEnv(
-            series_x, series_y, lookback, 0.0, 0.0,
-            position_scale=100, enable_transaction_costs=True,
-            test_mode=False
+              series_x, series_y, lookback, position_scale=100,
+              transaction_cost_rate = 0.0005, test_mode=False
         )
         
         obs, _ = env_eval.reset()
@@ -417,7 +417,7 @@ class OperatorAgent:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, info = env_eval.step(action)
-            daily_returns.append(info.get('return', 0))
+            daily_returns.append(info.get('daily_return', 0))
             positions.append(info.get('position', 0))
 
         # Calculate metrics
@@ -543,16 +543,10 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
 
         # TEST ENVIRONMENT: With transaction costs
         env = PairTradingEnv(
-            series_x=aligned.iloc[:, 0],
-            series_y=aligned.iloc[:, 1],
-            lookback=CONFIG.get("rl_lookback", 20),
-            shock_prob=0.0,
-            shock_scale=0.0,
-            initial_capital=CONFIG.get("initial_capital", 10000),
-            test_mode=True,
-            position_scale=100,
-            enable_transaction_costs=True
-        )
+              series_x=aligned.iloc[:, 0], series_y=aligned.iloc[:, 1], 
+              lookback=CONFIG.get("rl_lookback", 20), position_scale=100,
+              transaction_cost_rate = 0.0005, test_mode=True
+          )
 
         episode_traces = []
         local_step = 0
@@ -571,12 +565,21 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
                 "local_step": local_step,
                 "reward": float(reward),
                 "portfolio_value": float(info.get("portfolio_value", 0.0)),
-                "pnl": float(info.get("pnl", 0.0)),
-                "return": float(info.get("return", 0.0)),
                 "cum_return": float(info.get("cum_return", 0.0)),
                 "cum_reward": float(info.get("cum_reward", 0.0)),
                 "position": float(info.get("position", 0)),
-                "max_drawdown": float(info.get("drawdown", 0))
+                "max_drawdown": float(info.get("drawdown", 0)),
+                "cash": float(info.get("cash", 0.0)),
+                "realized_pnl": float(info.get("realized_pnl", 0.0)),
+                "unrealized_pnl": float(info.get("unrealized_pnl", 0.0)),
+                "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
+                "transaction_costs": float(info.get("transaction_costs", 0.0)),
+                "entry_spread": float(info.get("entry_spread", 0.0)),
+                "current_spread": float(info.get("current_spread", 0.0)),
+                "days_in_position": int(info.get("days_in_position", 0)),
+                "daily_return": float(info.get("daily_return", 0.0)),
+                "num_trades": int(info.get("num_trades", 0)),
+                "trade_occurred": bool(info.get("trade_occurred", False)),
             }
 
             episode_traces.append(trace)
@@ -649,8 +652,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
             print(f"  ✓ Complete: {len(episode_traces)} steps")
         
         # Extract values for metrics
-        daily_returns = np.array([t["return"] for t in episode_traces])
-        pnls = np.array([t["pnl"] for t in episode_traces])
+        daily_returns = np.array([t["daily_return"] for t in episode_traces])
+        pnls = np.array([t["realized_pnl_this_step"] for t in episode_traces])
         positions = np.array([t["position"] for t in episode_traces])
 
         # ---------- TRADE DETECTION ----------
@@ -659,15 +662,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
         for t in episode_traces:
             pos = t["position"]
             if pos != last_position:
-                trades.append({"position": pos, "pnl": t["pnl"]})
+                trades.append({"position": pos, "realized_pnl": t["realized_pnl_this_step"]})
             last_position = pos
 
         n_trades = len(trades)
-        wins = [1 for tr in trades if tr["pnl"] > 0]
-        losses = [1 for tr in trades if tr["pnl"] < 0]
+        wins = [1 for tr in trades if tr["realized_pnl_this_step"] > 0]
+        losses = [1 for tr in trades if tr["realized_pnl_this_step"] < 0]
 
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
-        avg_trade_pnl = np.mean([tr["pnl"] for tr in trades]) if n_trades > 0 else 0.0
+        avg_trade_pnl = np.mean([tr["realized_pnl_this_step"] for tr in trades]) if n_trades > 0 else 0.0
 
         # ---------- POSITION USAGE ----------
         unique_positions, pos_counts = np.unique(positions, return_counts=True)
@@ -718,14 +721,14 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
 
         if len(episode_traces) > 0:
             print(f"  Final return: {episode_traces[-1]['cum_reward']*100:.2f}%")
-            print(f"  Total P&L: ${sum(t['pnl'] for t in episode_traces):.2f}")
+            print(f"  Total P&L: {episode_traces[-1]['realized_pnl']:.2f}")
 
         if operator.logger:
             operator.logger.log("operator", "episode_complete", {
                 "pair": f"{pair[0]}-{pair[1]}",
                 "total_steps": len(episode_traces),
-                "final_cum_return": episode_traces[-1]['cum_reward'] if episode_traces else 0,
-                "total_pnl": sum(t['pnl'] for t in episode_traces),
+                "final_cum_return": episode_traces[-1]['cum_reward'],
+                "total_pnl":  episode_traces[-1]['realized_pnl'],
                 "sharpe": sharpe,
                 "sortino": sortino,
                 "was_skipped": skip_to_next_pair
@@ -761,7 +764,7 @@ def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
     
-    returns = np.array([t['return'] for t in traces])
+    returns = np.array([t['daily_return'] for t in traces])
     
     if len(returns) < 2:  # Need at least 2 observations
         return 0.0
@@ -782,7 +785,7 @@ def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
     
-    returns = np.array([t['return'] for t in traces])
+    returns = np.array([t['daily_return'] for t in traces])
     
     if len(returns) < 2:  # Need at least 2 observations
         return 0.0
