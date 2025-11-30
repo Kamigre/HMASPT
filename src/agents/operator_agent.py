@@ -22,259 +22,290 @@ from statsmodels.tsa.stattools import coint
 
 class PairTradingEnv(gym.Env):
 
-    def __init__(self, series_x: pd.Series, series_y: pd.Series, lookback: int = None,
-                 shock_prob: float = None, shock_scale: float = None,
-                 initial_capital: float = None, test_mode: bool = False,
-                 position_scale: int = 100, enable_transaction_costs: bool = True):
-
+    def __init__(self, series_x: pd.Series, series_y: pd.Series, 
+                 lookback: int = 30,
+                 initial_capital: float = 10000,
+                 position_scale: int = 100,
+                 transaction_cost_rate: float = 0.0005,
+                 test_mode: bool = False):
+        
         super().__init__()
-
-        # Use CONFIG defaults if not provided
-        if lookback is None:
-            lookback = CONFIG.get("rl_lookback", 30)
-        if shock_prob is None:
-            shock_prob = CONFIG.get("shock_prob", 0.0)
-        if shock_scale is None:
-            shock_scale = CONFIG.get("shock_scale", 0.0)
-        if initial_capital is None:
-            initial_capital = CONFIG.get("initial_capital", 10000)
-
+        
         # Align series
         self.data = pd.concat([series_x, series_y], axis=1).dropna()
-        self.lookback_short = lookback
-        self.lookback_long = max(60, lookback * 2)
+        self.lookback = lookback
         self.test_mode = test_mode
         self.initial_capital = initial_capital
         self.position_scale = position_scale
-        self.enable_transaction_costs = enable_transaction_costs
-
-        # Action: 3 discrete actions
+        self.transaction_cost_rate = transaction_cost_rate
+        
+        # Action: 3 discrete actions (short, flat, long)
         self.action_space = spaces.Discrete(3)
-
-        # Observation: 15 features
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(15,), dtype=np.float32)
-
-        # set shock behavior
-        self.shock_prob = 0.0 if test_mode else shock_prob
-        self.shock_scale = 0.0 if test_mode else shock_scale
-
-        # Precompute features
+        
+        # Observation space (simplified for clarity)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32
+        )
+        
+        # Precompute spread and features
         self._precompute_features()
-
-        # Episode bookkeeping
+        
         self.reset()
 
     def _precompute_features(self):
+        """Compute spread and basic features"""
         x = self.data.iloc[:, 0]
         y = self.data.iloc[:, 1]
-
-        # Spread
+        
+        # Raw spread
         self.spread = x - y
-
-        # Add optional random shocks to spread for training
-        n = len(self.spread)
-        shock_mask = (np.random.rand(n) < self.shock_prob).astype(float)
-        shocks = np.random.randn(n) * self.shock_scale * (self.spread.std() if self.spread.std() > 0 else 1.0) * shock_mask
-        self.spread = self.spread + shocks
-
-        # Timescale z-scores
-        self.zscore_short = ((self.spread - self.spread.rolling(self.lookback_short).mean()) /
-                             (self.spread.rolling(self.lookback_short).std() + 1e-8))
-        self.zscore_long = ((self.spread - self.spread.rolling(self.lookback_long).mean()) /
-                            (self.spread.rolling(self.lookback_long).std() + 1e-8))
-
+        
+        # Z-scores at different timescales
+        self.zscore_short = (
+            (self.spread - self.spread.rolling(self.lookback).mean()) /
+            (self.spread.rolling(self.lookback).std() + 1e-8)
+        )
+        
+        self.zscore_long = (
+            (self.spread - self.spread.rolling(self.lookback * 2).mean()) /
+            (self.spread.rolling(self.lookback * 2).std() + 1e-8)
+        )
+        
         # Volatility
-        self.vol_short = self.spread.rolling(self.lookback_short).std()
-        self.vol_long = self.spread.rolling(self.lookback_long).std()
-        self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
-
-        # Momentum
-        self.momentum_5d = self.spread.pct_change(5)
-        self.momentum_15d = self.spread.pct_change(15)
-
-        # Correlations
-        rx = x.pct_change()
-        ry = y.pct_change()
-        self.corr_short = rx.rolling(self.lookback_short).corr(ry)
-        self.corr_long = rx.rolling(self.lookback_long).corr(ry)
-
-        # Autocorr (half-life proxy)
-        self.autocorr = self.spread.rolling(self.lookback_short).apply(
-            lambda s: s.autocorr() if len(s) > 1 else 0
-        )
-
-        # Spread percentile in recent history
-        self.spread_percentile = self.spread.rolling(15).apply(
-            lambda s: pd.Series(s).rank(pct=True).iloc[-1] if len(s) > 0 else 0.5
-        )
-
-        # Rolling cointegration p-values
-        self.coint_pvalue = self._rolling_cointegration(x, y, window=90)
-
-        # Normalize features
-        self._normalize_features()
-
+        self.vol = self.spread.rolling(self.lookback).std()
+        
         # Convert to numpy
-        self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0, posinf=5.0, neginf=-5.0)
-        self.vol_short_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0, posinf=1.0, neginf=0.0)
+        self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0)
+        self.zscore_short_np = np.nan_to_num(self.zscore_short.to_numpy(), nan=0.0)
+        self.zscore_long_np = np.nan_to_num(self.zscore_long.to_numpy(), nan=0.0)
+        self.vol_np = np.nan_to_num(self.vol.to_numpy(), nan=1.0)
 
-    def _rolling_cointegration(self, x, y, window=60):
-        pvalues = []
-        for i in range(len(x)):
-            if i < window:
-                pvalues.append(0.5)
-            else:
-                try:
-                    _, pval, _ = coint(x.iloc[i-window:i], y.iloc[i-window:i])
-                    pvalues.append(pval)
-                except Exception:
-                    pvalues.append(0.5)
-        return pd.Series(pvalues, index=x.index)
-
-    def _normalize_features(self):
-      features = [
-          self.zscore_short, self.zscore_long,
-          self.vol_ratio, self.momentum_5d, self.momentum_15d,
-          self.corr_short, self.corr_long, self.autocorr,
-          self.spread_percentile, self.coint_pvalue
-      ]
-
-      self.normalized_features = []
-
-      for feat in features:
-          fmin = feat.min()
-          fmax = feat.max()
-          rng = fmax - fmin
-
-          if rng < 1e-8:
-              normalized = feat - fmin
-          else:
-              normalized = (feat - fmin) / rng      # scale to [0, 1]
-              normalized = 2 * normalized - 1       # scale to [-1, 1]
-
-          self.normalized_features.append(normalized.fillna(0).to_numpy())
-
-    def _get_observation(self, idx: int):
+    def _get_observation(self, idx: int) -> np.ndarray:
+        """Build observation vector"""
         if idx < 0 or idx >= len(self.spread_np):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
-
+        
         obs = np.array([
-            float(self.normalized_features[0][idx]),  # zscore_short
-            float(self.normalized_features[1][idx]),  # zscore_long
-            float(self.normalized_features[2][idx]),  # vol_ratio
-            float(self.normalized_features[3][idx]),  # momentum_5d
-            float(self.normalized_features[4][idx]),  # momentum_15d
-            float(self.normalized_features[5][idx]),  # corr_short
-            float(self.normalized_features[6][idx]),  # corr_long
-            float(self.normalized_features[7][idx]),  # autocorr
-            float(self.normalized_features[8][idx]),  # spread_percentile
-            float(self.normalized_features[9][idx]),  # coint_pvalue
+            self.zscore_short_np[idx],
+            self.zscore_long_np[idx],
+            self.vol_np[idx],
+            self.spread_np[idx],
             float(self.position / self.position_scale),  # normalized position
-            float(self.portfolio_value / self.initial_capital - 1),  # return
-            float(self.days_in_position),              # holding period
-            float(self.spread_np[idx]),                # raw spread
-            float(self.vol_short_np[idx])              # current volatility
+            float(self.entry_spread) if self.position != 0 else 0.0,
+            float(self.unrealized_pnl),
+            float(self.realized_pnl),
+            float(self.cash / self.initial_capital - 1),  # cash return
+            float(self.portfolio_value / self.initial_capital - 1),  # total return
+            float(self.days_in_position),
+            float(self.num_trades),
         ], dtype=np.float32)
-
+        
         return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        """Reset environment to initial state"""
         super().reset(seed=seed)
-        self.idx = self.lookback_long if not self.test_mode else 0
+        
+        self.idx = self.lookback if not self.test_mode else 0
         self.position = 0
+        self.entry_spread = 0.0  # Spread level when position was entered
         self.days_in_position = 0
+        
+        # Financial tracking
+        self.cash = self.initial_capital
+        self.realized_pnl = 0.0  # P&L from closed trades
+        self.unrealized_pnl = 0.0  # Mark-to-market of open position
         self.portfolio_value = self.initial_capital
+        
+        # Performance tracking
         self.peak_value = self.initial_capital
-        self.trades = []
-        self.cum_reward = 0.0
-
+        self.num_trades = 0
+        self.trade_history = []
+        
         return self._get_observation(self.idx), {}
 
     def step(self, action: int):
-
-        # Action 0 → Position -1 * scale (short)
-        # Action 1 → Position  0 (flat)
-        # Action 2 → Position +1 * scale (long)
-
-        base_position = int(action) - 1
+        """
+        Execute one trading step with proper P&L calculation.
+        
+        Action mapping:
+        0 → Short position (-1 * scale)
+        1 → Flat (0)
+        2 → Long position (+1 * scale)
+        """
+        
+        # Map action to target position
+        base_position = int(action) - 1  # Maps to -1, 0, +1
         target_position = base_position * self.position_scale
-
+        
         current_idx = self.idx
         next_idx = current_idx + 1
+        
+        # Check if episode is done
         terminated = next_idx >= len(self.spread_np)
-
         if terminated:
-            return self._get_observation(max(0, current_idx)), 0.0, True, False, {}
-
+            return self._get_observation(current_idx), 0.0, True, False, {}
+        
+        # Get current and next spread
         current_spread = float(self.spread_np[current_idx])
         next_spread = float(self.spread_np[next_idx])
-        spread_change = next_spread - current_spread
-
-        # --------------------------
-        # P&L calculation
-        # --------------------------
-        pnl = self.position * spread_change
-
-        # Transaction costs
-        trade_size = abs(target_position - self.position)
-        if trade_size > 0 and self.enable_transaction_costs:
+        
+        # ============================================================
+        # POSITION CHANGE LOGIC
+        # ============================================================
+        
+        position_change = target_position - self.position
+        trade_occurred = (position_change != 0)
+        
+        realized_pnl_this_step = 0.0
+        transaction_costs = 0.0
+        
+        if trade_occurred:
+            # --------------------------------------------------------
+            # CASE 1: Closing or reducing a position → Realize P&L
+            # --------------------------------------------------------
+            if self.position != 0:
+                # Calculate P&L on the portion being closed
+                spread_change = current_spread - self.entry_spread
+                
+                if target_position == 0:
+                    # Fully closing position
+                    closed_size = abs(self.position)
+                    pnl_on_closed = self.position * spread_change
+                    
+                elif np.sign(target_position) == np.sign(self.position):
+                    # Reducing position (same direction)
+                    closed_size = abs(position_change)
+                    pnl_on_closed = position_change * spread_change
+                    
+                else:
+                    # Flipping position (e.g., from long to short)
+                    # Close entire old position, then open new one
+                    closed_size = abs(self.position)
+                    pnl_on_closed = self.position * spread_change
+                
+                realized_pnl_this_step += pnl_on_closed
+                
+                # Record trade
+                self.trade_history.append({
+                    'entry_spread': self.entry_spread,
+                    'exit_spread': current_spread,
+                    'position': self.position,
+                    'pnl': pnl_on_closed,
+                    'holding_days': self.days_in_position
+                })
+            
+            # --------------------------------------------------------
+            # CASE 2: Opening or increasing position → Set entry price
+            # --------------------------------------------------------
+            if target_position != 0:
+                if np.sign(target_position) != np.sign(self.position):
+                    # New position or flip → reset entry price
+                    self.entry_spread = current_spread
+                    self.days_in_position = 0
+                # If increasing same direction, keep original entry price
+            else:
+                # Flat position
+                self.entry_spread = 0.0
+                self.days_in_position = 0
+            
+            # --------------------------------------------------------
+            # Transaction costs
+            # --------------------------------------------------------
+            trade_size = abs(position_change)
             notional = trade_size * abs(current_spread)
-            cost_rate = CONFIG.get("transaction_cost", 0.0005)
-            transaction_cost = notional * cost_rate
-            pnl -= transaction_cost
-            self.days_in_position = 0
+            transaction_costs = notional * self.transaction_cost_rate
+            
+            self.num_trades += 1
+            
         else:
+            # No trade occurred
             self.days_in_position += 1
-
-        previous_value = self.portfolio_value
-        self.portfolio_value += pnl
+        
+        # ============================================================
+        # UPDATE FINANCIAL STATE
+        # ============================================================
+        
+        # Update position
         self.position = target_position
+        
+        # Update realized P&L (subtract transaction costs)
+        self.realized_pnl += realized_pnl_this_step - transaction_costs
+        
+        # Update cash
+        self.cash = self.initial_capital + self.realized_pnl
+        
+        # Calculate unrealized P&L on current position
+        if self.position != 0:
+            self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
+        else:
+            self.unrealized_pnl = 0.0
+        
+        # Total portfolio value
+        self.portfolio_value = self.cash + self.unrealized_pnl
+        
+        # Update index
         self.idx = next_idx
-
-        # Daily return
-        daily_return = pnl / max(previous_value, 1e-8)
-
-        # Track drawdown
+        
+        # ============================================================
+        # PERFORMANCE METRICS
+        # ============================================================
+        
+        # Daily return (on total portfolio value)
+        previous_value = self.cash - realized_pnl_this_step + transaction_costs + \
+                        (self.position * (current_spread - self.entry_spread))
+        daily_return = (self.portfolio_value - previous_value) / max(previous_value, 1e-8)
+        
+        # Drawdown
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
-
-        # --------------------------
+        
+        # ============================================================
         # REWARD FUNCTION
-        # --------------------------
-
-        signal = -self.normalized_features[0][self.idx] 
-
-        reward = (
-            10.0 * daily_return              # Main objective
-            - 8.0 * (drawdown ** 2)          # Quadratic drawdown penalty
-            + 0.01 * signal * (target_position / self.position_scale)  # Signal alignment
-            - 0.0005 * abs(trade_size)       # Subtle penalty for excessive trading
-        )
-
-        self.cum_reward += reward
-
-        # Record trade
-        self.trades.append({
-            "portfolio_value": float(self.portfolio_value),
-            "pnl": float(pnl),
-            "return": float(daily_return),
-            "position": int(self.position)
-        })
-
-        obs = self._get_observation(self.idx)
+        # ============================================================
+        
+        # Main objective: portfolio return
+        reward = 10.0 * daily_return
+        
+        # Penalize drawdown
+        reward -= 5.0 * (drawdown ** 2)
+        
+        # Small penalty for holding time (encourage mean reversion trading)
+        if self.position != 0:
+            reward -= 0.0001 * self.days_in_position
+        
+        # Bonus for realized profits
+        if realized_pnl_this_step > 0:
+            reward += 0.1 * (realized_pnl_this_step / self.initial_capital)
+        
+        # Penalty for transaction costs
+        reward -= 0.5 * (transaction_costs / self.initial_capital)
+        
+        # ============================================================
+        # INFO DICT
+        # ============================================================
+        
         info = {
-            "portfolio_value": float(self.portfolio_value),
-            "pnl": float(pnl),
-            "return": float(daily_return),
-            "position": int(self.position),
-            "drawdown": float(drawdown),
-            "reward": float(reward),
-            "cum_reward": float(self.cum_reward),
-            "cum_return": float(self.portfolio_value / self.initial_capital - 1)
+            'portfolio_value': float(self.portfolio_value),
+            'cash': float(self.cash),
+            'realized_pnl': float(self.realized_pnl),
+            'unrealized_pnl': float(self.unrealized_pnl),
+            'realized_pnl_this_step': float(realized_pnl_this_step),
+            'transaction_costs': float(transaction_costs),
+            'position': int(self.position),
+            'entry_spread': float(self.entry_spread),
+            'current_spread': float(next_spread),
+            'days_in_position': int(self.days_in_position),
+            'daily_return': float(daily_return),
+            'drawdown': float(drawdown),
+            'num_trades': int(self.num_trades),
+            'trade_occurred': bool(trade_occurred),
+            'cum_return': float(self.portfolio_value / self.initial_capital - 1)
         }
-
+        
+        obs = self._get_observation(self.idx)
+        
         return obs, float(reward), terminated, False, info
-
 
 @dataclass
 class OperatorAgent:
