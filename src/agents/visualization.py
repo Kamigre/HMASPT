@@ -38,7 +38,7 @@ class PortfolioVisualizer:
         steps = [t['step'] for t in traces]
         pnls = [t['pnl'] for t in traces]
         returns = [t['return'] for t in traces]
-        cum_returns = [t['cum_reward'] for t in traces]
+        cum_returns = [t['cum_returns'] for t in traces]
         positions = [t['position'] for t in traces]
         drawdowns = [t['max_drawdown'] for t in traces]
         
@@ -260,7 +260,7 @@ class PortfolioVisualizer:
         ax2 = fig.add_subplot(gs[1, :2])
         pair_summaries = metrics['pair_summaries']
         pair_names = [p['pair'] for p in pair_summaries]
-        pair_returns = [p['final_return'] * 100 for p in pair_summaries]
+        pair_returns = [p['cum_return'] * 100 for p in pair_summaries]
         colors = ['green' if r > 0 else 'red' for r in pair_returns]
         
         # Mark skipped pairs
