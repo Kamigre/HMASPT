@@ -139,12 +139,31 @@ class PairTradingEnv(gym.Env):
         target_position = base_position * self.position_scale
         
         current_idx = self.idx
-        next_idx = current_idx + 1
         
         # Check if episode is done
-        terminated = next_idx >= len(self.spread_np)
+        terminated = current_idx >= len(self.spread_np) - 1
         if terminated:
-            return self._get_observation(current_idx), 0.0, True, False, {}
+            obs = self._get_observation(current_idx)
+            info = {
+                'portfolio_value': float(self.portfolio_value),
+                'cash': float(self.cash),
+                'realized_pnl': float(self.realized_pnl),
+                'unrealized_pnl': float(self.unrealized_pnl),
+                'realized_pnl_this_step': 0.0,
+                'transaction_costs': 0.0,
+                'position': int(self.position),
+                'entry_spread': float(self.entry_spread),
+                'current_spread': float(self.spread_np[current_idx]),
+                'days_in_position': int(self.days_in_position),
+                'daily_return': 0.0,
+                'drawdown': (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8),
+                'num_trades': int(self.num_trades),
+                'trade_occurred': False,
+                'cum_return': float(self.portfolio_value / self.initial_capital - 1)
+            }
+            return obs, 0.0, True, False, info
+
+        next_idx = current_idx + 1
         
         # Get current and next spread
         current_spread = float(self.spread_np[current_idx])
@@ -276,10 +295,7 @@ class PairTradingEnv(gym.Env):
         
         # Bonus for realized profits
         if realized_pnl_this_step > 0:
-            reward += 0.1 * (realized_pnl_this_step / self.initial_capital)
-        
-        # Penalty for transaction costs
-        reward -= 0.5 * (transaction_costs / self.initial_capital)
+            reward += 0.5 * (realized_pnl_this_step / self.initial_capital)
         
         # ============================================================
         # INFO DICT
