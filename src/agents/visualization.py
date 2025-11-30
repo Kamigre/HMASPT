@@ -36,7 +36,7 @@ class PortfolioVisualizer:
         
         # Extract data
         steps = [t['step'] for t in traces]
-        pnls = [t['pnl'] for t in traces]
+        pnls = [t['realized_pnl_this_step'] for t in traces]
         returns = [t['return'] for t in traces]
         cum_return = [t['cum_return'] for t in traces]
         positions = [t['position'] for t in traces]
@@ -234,7 +234,7 @@ class PortfolioVisualizer:
         
         # 1. Portfolio Cumulative Returns
         ax1 = fig.add_subplot(gs[0, :])
-        portfolio_cum_return = np.cumsum([t['pnl'] for t in all_traces])
+        portfolio_cum_return = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
         steps = list(range(len(all_traces)))
         ax1.plot(steps, portfolio_cum_return, linewidth=2.5, color='darkblue', label='Portfolio')
         ax1.fill_between(steps, 0, portfolio_cum_return, alpha=0.3, color='blue')
@@ -247,7 +247,7 @@ class PortfolioVisualizer:
                 skip_step = skip_traces[-1]['step']
                 ax1.axvline(skip_step, color='red', linestyle=':', alpha=0.5)
         
-        ax1.set_title(f"Portfolio P&L: ${metrics['total_pnl']:.2f} | "
+        ax1.set_title(f"Portfolio P&L: ${metrics['realized_pnl']:.2f} | "
                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
                      f"Sortino: {metrics['sortino_ratio']:.2f}",
                      fontsize=13, fontweight='bold')
@@ -408,7 +408,7 @@ class PortfolioVisualizer:
         
         summary_text = f"""
                       PORTFOLIO SUMMARY:
-                      • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
+                      • Total P&L: ${metrics['realized_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
                       • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
                       • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
                       
