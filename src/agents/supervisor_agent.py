@@ -1,504 +1,550 @@
 import os
+import json
+import datetime
+from dataclasses import dataclass
+from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import List, Dict, Any, Tuple
-from datetime import datetime
+import google.generativeai as genai
+from statsmodels.tsa.stattools import adfuller
 
-# Set style
-sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (15, 10)
-plt.rcParams['font.size'] = 10
+from config import CONFIG
+from agents.message_bus import JSONLogger
+from utils import half_life as compute_half_life, compute_spread
 
-
-class PortfolioVisualizer:
-    """Creates visual reports for pairs trading performance."""
+@dataclass
+class SupervisorAgent:
     
-    def __init__(self, output_dir: str = "reports"):
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
+    logger: JSONLogger = None
+    df: pd.DataFrame = None  # Full price data for validation
+    max_drawdown: float = 0.20  # Max allowed drawdown before intervention
+    min_sharpe: float = -0.5  # Min Sharpe before intervention
+    min_win_rate: float = 0.5  # Min win rate before intervention
+    storage_dir: str = "./storage"
+    gemini_api_key: Optional[str] = None
+    model: str = "gemini-2.5-flash"
+    temperature: float = 0.1
+    use_gemini: bool = True
+
+    def __post_init__(self):
+        os.makedirs(self.storage_dir, exist_ok=True)
+        
+        # Initialize Gemini for explanations
+        if self.use_gemini:
+            try:
+                api_key = self.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                if api_key:
+                    genai.configure(api_key=api_key)
+                    generation_config = {
+                        "temperature": self.temperature,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "max_output_tokens": 2048,
+                    }
+                    self.client = genai.GenerativeModel(
+                        model_name=self.model,
+                        generation_config=generation_config
+                    )
+                    print(f"✅ Gemini API initialized")
+                else:
+                    self.use_gemini = False
+                    print("⚠️ No Gemini API key - using fallback explanations")
+            except Exception as e:
+                self.use_gemini = False
+                print(f"⚠️ Gemini init failed: {e}")
+        
+        self._log("init", {
+            "max_drawdown": self.max_drawdown,
+            "min_sharpe": self.min_sharpe,
+            "gemini_enabled": self.use_gemini
+        })
+
+    def _log(self, event: str, details: Dict[str, Any]):
+        """Simple logging wrapper."""
+        if self.logger:
+            self.logger.log("supervisor", event, details)
+
+    def format_skip_info(self, pair: Tuple[str, str], decision: Dict, step: int) -> Dict:
+      """Format skip information for visualization."""
+      return {
+          "pair": f"{pair[0]}-{pair[1]}",
+          "reason": decision['reason'],
+          "step_stopped": step,
+          "metrics": decision['metrics']
+      }
+
+    # ===================================================================
+    # 1. PAIR VALIDATION (used by Selector)
+    # ===================================================================
     
-    def visualize_pair(self, traces: List[Dict], pair_name: str, 
-                       was_skipped: bool = False, skip_info: Dict = None):
-        """
-        Create detailed visualization for a single pair.
+    def validate_pairs(
+        self, 
+        df_pairs: pd.DataFrame, 
+        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
+        half_life_max: float = 60,
+        min_crossings_per_year: int = 12
+    ) -> pd.DataFrame:
         
-        Args:
-            traces: List of trace dicts for this pair
-            pair_name: Name like "AAPL-MSFT"
-            was_skipped: Whether supervisor stopped this pair early
-            skip_info: Dict with skip details if applicable
-        """
-        if len(traces) == 0:
-            return
+        start, end = validation_window
+        validated = []
+
+        # Pivot price data
+        prices = self.df.pivot(
+            index="date",
+            columns="ticker",
+            values="adj_close"
+        ).sort_index()
+
+        print(f"\n🔍 Validating {len(df_pairs)} pairs...")
         
-        # Extract data
-        steps = [t['step'] for t in traces]
-        pnls = [t['realized_pnl_this_step'] for t in traces]
-        returns = [t['daily_return'] for t in traces]
-        cum_return = [t['cum_return'] for t in traces]
-        positions = [t['position'] for t in traces]
-        drawdowns = [t['max_drawdown'] for t in traces]
+        for idx, row in df_pairs.iterrows():
+            x, y = row["x"], row["y"]
+
+            # Check tickers exist
+            if x not in prices.columns or y not in prices.columns:
+                continue
+
+            # Extract validation window
+            series_x = prices[x].loc[start:end].dropna()
+            series_y = prices[y].loc[start:end].dropna()
+
+            if min(len(series_x), len(series_y)) < 60:
+                continue
+
+            # Compute spread
+            spread = compute_spread(series_x, series_y)
+            if spread is None or len(spread) == 0:
+                continue
+
+            # --- Crossing frequency ---
+            centered = spread - spread.mean()
+            crossings = (centered.shift(1) * centered < 0).sum()
+            days = (series_x.index[-1] - series_x.index[0]).days
+            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
+
+            if crossings_per_year < min_crossings_per_year:
+                continue
+
+            # --- ADF test (stationarity) ---
+            try:
+                adf_res = adfuller(spread.dropna())
+                adf_p = adf_res[1]
+            except:
+                adf_p = 1.0
+
+            # --- Half-life (mean reversion speed) ---
+            hl = compute_half_life(spread.values)
+            try:
+                hl_val = float(hl)
+            except:
+                hl_val = float("inf")
+
+            # --- Pass criteria ---
+            pass_criteria = (adf_p < 0.05) and (hl_val < half_life_max)
+
+            validated.append({
+                "x": x,
+                "y": y,
+                "score": float(row.get("score", np.nan)),
+                "adf_p": float(adf_p),
+                "half_life": hl_val,
+                "crossings_per_year": float(crossings_per_year),
+                "pass": bool(pass_criteria)
+            })
+
+        result_df = pd.DataFrame(validated)
+        n_passed = result_df["pass"].sum() if len(result_df) > 0 else 0
         
-        # Calculate metrics
+        self._log("pairs_validated", {
+            "n_total": len(df_pairs),
+            "n_validated": len(result_df),
+            "n_passed": int(n_passed)
+        })
+        
+        print(f"✅ Validation complete: {n_passed}/{len(result_df)} pairs passed")
+        
+        return result_df
+
+    # ===================================================================
+    # 2. OPERATOR MONITORING
+    # ===================================================================
+    
+    def check_operator_performance(
+        self, 
+        operator_traces: List[Dict[str, Any]],
+        pair: Tuple[str, str]
+    ) -> Dict[str, Any]:
+
+        if len(operator_traces) < 10:
+            return {"action": "continue", "reason": "insufficient_data"}
+        
+        # Calculate current metrics
+        returns = [t.get("daily_return", 0) for t in operator_traces]
+        pnls = [t.get("realized_pnl_this_step", 0) for t in operator_traces]
+        portfolio_value = operator_traces[-1].get("portfolio_value", 0)
+        max_portfolio_value = max([t.get("portfolio_value", 0) for t in operator_traces])
+
+        max_dd = (max_portfolio_value - portfolio_value) / max(max_portfolio_value, 1e-8)
+        
+        # Current Sharpe
         sharpe = self._calculate_sharpe(returns)
-        sortino = self._calculate_sortino(returns)
+        
+        # Win rate
+        positive_pnls = sum(1 for r in pnls if r > 0)
+        win_rate = positive_pnls / len(pnls)
+        
+        # Total P&L
         total_pnl = sum(pnls)
-        final_return = cum_return[-1] * 100
-        max_dd = max(drawdowns)
-        win_rate = sum(1 for r in returns if r > 0) / len(returns)
         
-        # Create figure with subplots
-        fig = plt.figure(figsize=(16, 12))
-        gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
+        # --- Decision Logic ---
         
-        # Title with skip indicator
-        title = f"Pair Trading Analysis: {pair_name}"
-        if was_skipped:
-            title += f" ⛔ STOPPED BY SUPERVISOR"
-        fig.suptitle(title, fontsize=16, fontweight='bold', 
-                     color='red' if was_skipped else 'black')
+        # # STOP: Excessive drawdown
+        # if max_dd > self.max_drawdown:
+        #     self._log("intervention_triggered", {
+        #         "pair": f"{pair[0]}-{pair[1]}",
+        #         "action": "stop",
+        #         "reason": "max_drawdown_exceeded",
+        #         "drawdown": max_dd,
+        #         "threshold": self.max_drawdown
+        #     })
+        #     return {
+        #         "action": "stop",
+        #         "reason": f"Drawdown {max_dd:.2%} exceeds limit {self.max_drawdown:.2%}",
+        #         "metrics": {"drawdown": max_dd, "sharpe": sharpe, "win_rate": win_rate}
+        #     }
         
-        # 1. Cumulative Returns
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(steps, np.array(cum_return) * 100, linewidth=2, color='darkblue')
-        ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax1.fill_between(steps, 0, np.array(cum_return) * 100, 
-                         alpha=0.3, color='blue' if final_return > 0 else 'red')
+        # # STOP: Terrible Sharpe
+        # if sharpe < self.min_sharpe:
+        #     self._log("intervention_triggered", {
+        #         "pair": f"{pair[0]}-{pair[1]}",
+        #         "action": "stop",
+        #         "reason": "sharpe_too_low",
+        #         "sharpe": sharpe,
+        #         "threshold": self.min_sharpe
+        #     })
+        #     return {
+        #         "action": "stop",
+        #         "reason": f"Sharpe {sharpe:.2f} below minimum {self.min_sharpe:.2f}",
+        #         "metrics": {"drawdown": max_dd, "sharpe": sharpe, "win_rate": win_rate}
+        #     }
         
-        if was_skipped and skip_info:
-            skip_step = skip_info.get('step_stopped', steps[-1])
-            ax1.axvline(skip_step, color='red', linestyle='--', linewidth=2, 
-                       label=f'Supervisor Stop: {skip_info.get("reason", "")}')
-            ax1.legend(loc='upper left')
+        # # ADJUST: Poor win rate
+        # if win_rate < self.min_win_rate:
+        #     self._log("intervention_triggered", {
+        #         "pair": f"{pair[0]}-{pair[1]}",
+        #         "action": "adjust",
+        #         "reason": "low_win_rate",
+        #         "win_rate": win_rate,
+        #         "threshold": self.min_win_rate
+        #     })
+        #     return {
+        #         "action": "adjust",
+        #         "reason": f"Win rate {win_rate:.2%} below target {self.min_win_rate:.2%}",
+        #         "suggestion": "Consider reducing position sizes or tightening entry thresholds",
+        #         "metrics": {"drawdown": max_dd, "sharpe": sharpe, "win_rate": win_rate}
+        #     }
         
-        ax1.set_title(f'Cumulative Return: {final_return:.2f}%', fontsize=12, fontweight='bold')
-        ax1.set_xlabel('Step')
-        ax1.set_ylabel('Cumulative Return (%)')
-        ax1.grid(True, alpha=0.3)
+        # Continue trading
+        return {
+            "action": "continue",
+            "reason": "performance_acceptable",
+            "metrics": {"drawdown": max_dd, "sharpe": sharpe, "win_rate": win_rate}
+        }
+
+    # ===================================================================
+    # 3. FINAL EVALUATION (after all trading complete)
+    # ===================================================================
         
-        # 2. Drawdown
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.fill_between(steps, 0, np.array(drawdowns) * 100, 
-                         alpha=0.5, color='red')
-        ax2.plot(steps, np.array(drawdowns) * 100, linewidth=2, color='darkred')
-        ax2.set_title(f'Drawdown (Max: {max_dd*100:.2f}%)', fontsize=11, fontweight='bold')
-        ax2.set_xlabel('Step')
-        ax2.set_ylabel('Drawdown (%)')
-        ax2.grid(True, alpha=0.3)
-        ax2.invert_yaxis()
-        
-        # 3. Daily P&L
-        ax3 = fig.add_subplot(gs[1, 1])
-        colors = ['green' if p > 0 else 'red' for p in pnls]
-        ax3.bar(steps, pnls, color=colors, alpha=0.6)
-        ax3.axhline(0, color='black', linestyle='-', linewidth=0.5)
-        ax3.set_title(f'Daily P&L (Total: ${total_pnl:.2f})', fontsize=11, fontweight='bold')
-        ax3.set_xlabel('Step')
-        ax3.set_ylabel('P&L ($)')
-        ax3.grid(True, alpha=0.3)
-        
-        # 4. Position Over Time
-        ax4 = fig.add_subplot(gs[1, 2])
-        ax4.plot(steps, positions, linewidth=2, color='purple', alpha=0.7)
-        ax4.fill_between(steps, 0, positions, alpha=0.3, color='purple')
-        ax4.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax4.set_title('Position Over Time', fontsize=11, fontweight='bold')
-        ax4.set_xlabel('Step')
-        ax4.set_ylabel('Position Size')
-        ax4.grid(True, alpha=0.3)
-        
-        # 5. Returns Distribution
-        ax5 = fig.add_subplot(gs[2, 0])
-        ax5.hist(returns, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
-        ax5.axvline(np.mean(returns), color='red', linestyle='--', 
-                   linewidth=2, label=f'Mean: {np.mean(returns):.4f}')
-        ax5.axvline(np.median(returns), color='orange', linestyle='--', 
-                   linewidth=2, label=f'Median: {np.median(returns):.4f}')
-        ax5.set_title('Returns Distribution', fontsize=11, fontweight='bold')
-        ax5.set_xlabel('Return')
-        ax5.set_ylabel('Frequency')
-        ax5.legend()
-        ax5.grid(True, alpha=0.3)
-        
-        # 6. Rolling Sharpe (30-step window)
-        ax6 = fig.add_subplot(gs[2, 1])
-        if len(returns) > 30:
-            rolling_sharpe = pd.Series(returns).rolling(30).apply(
-                lambda x: self._calculate_sharpe(x.tolist())
-            )
-            ax6.plot(steps, rolling_sharpe, linewidth=2, color='darkgreen')
-            ax6.axhline(0, color='black', linestyle='--', alpha=0.3)
-            ax6.axhline(1, color='green', linestyle=':', alpha=0.5, label='Good (>1)')
-            ax6.axhline(-1, color='red', linestyle=':', alpha=0.5, label='Poor (<-1)')
-            ax6.set_title(f'Rolling Sharpe (30-step)', fontsize=11, fontweight='bold')
-            ax6.set_xlabel('Step')
-            ax6.set_ylabel('Sharpe Ratio')
-            ax6.legend()
-            ax6.grid(True, alpha=0.3)
-        
-        # 7. Win Rate Over Time
-        ax7 = fig.add_subplot(gs[2, 2])
-        window = 20
-        rolling_wr = pd.Series([1 if r > 0 else 0 for r in returns]).rolling(window).mean()
-        ax7.plot(steps, rolling_wr * 100, linewidth=2, color='teal')
-        ax7.axhline(50, color='black', linestyle='--', alpha=0.3, label='50%')
-        ax7.fill_between(steps, 50, rolling_wr * 100, 
-                         alpha=0.3, color='green', where=(rolling_wr * 100 > 50))
-        ax7.fill_between(steps, 50, rolling_wr * 100, 
-                         alpha=0.3, color='red', where=(rolling_wr * 100 <= 50))
-        ax7.set_title(f'Rolling Win Rate ({window}-step)', fontsize=11, fontweight='bold')
-        ax7.set_xlabel('Step')
-        ax7.set_ylabel('Win Rate (%)')
-        ax7.legend()
-        ax7.grid(True, alpha=0.3)
-        ax7.set_ylim([0, 100])
-        
-        # 8. Metrics Summary Table
-        ax8 = fig.add_subplot(gs[3, :])
-        ax8.axis('off')
-        
-        metrics_data = [
-            ['Metric', 'Value', 'Status'],
-            ['Total P&L', f'${total_pnl:.2f}', '✓' if total_pnl > 0 else '✗'],
-            ['Final Return', f'{final_return:.2f}%', '✓' if final_return > 0 else '✗'],
-            ['Sharpe Ratio', f'{sharpe:.3f}', '✓' if sharpe > 0.5 else '✗'],
-            ['Sortino Ratio', f'{sortino:.3f}', '✓' if sortino > 0.5 else '✗'],
-            ['Max Drawdown', f'{max_dd*100:.2f}%', '✓' if max_dd < 0.15 else '✗'],
-            ['Win Rate', f'{win_rate*100:.1f}%', '✓' if win_rate > 0.5 else '✗'],
-            ['Total Steps', f'{len(traces)}', '—'],
-            ['Avg Return/Step', f'{np.mean(returns):.5f}', '—'],
-        ]
-        
-        if was_skipped and skip_info:
-            metrics_data.append(['Supervisor Action', 'STOPPED EARLY', '⛔'])
-            metrics_data.append(['Stop Reason', skip_info.get('reason', 'N/A'), '—'])
-        
-        table = ax8.table(cellText=metrics_data, cellLoc='left', 
-                         colWidths=[0.3, 0.3, 0.1],
-                         loc='center', bbox=[0.1, 0.0, 0.8, 1.0])
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1, 2)
-        
-        # Style header row
-        for i in range(3):
-            table[(0, i)].set_facecolor('#4CAF50')
-            table[(0, i)].set_text_props(weight='bold', color='white')
-        
-        # Color code status
-        for i in range(1, len(metrics_data)):
-            if metrics_data[i][2] == '✓':
-                table[(i, 2)].set_facecolor('#90EE90')
-            elif metrics_data[i][2] == '✗':
-                table[(i, 2)].set_facecolor('#FFB6C6')
-            elif metrics_data[i][2] == '⛔':
-                table[(i, 2)].set_facecolor('#FF6B6B')
-        
-        # Save figure
-        filename = f"{pair_name.replace('-', '_')}_analysis.png"
-        filepath = os.path.join(self.output_dir, "pairs", filename)
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  📊 Saved pair analysis: {filepath}")
-    
-    def visualize_portfolio(self, all_traces: List[Dict], 
-                           skipped_pairs: List[Dict],
-                           final_summary: Dict):
-        """
-        Create portfolio-level aggregate visualization.
-        
-        Args:
-            all_traces: All traces from all pairs
-            skipped_pairs: List of pairs stopped by supervisor
-            final_summary: Dict from supervisor.evaluate_portfolio()
-        """
-        # Group traces by pair
-        traces_by_pair = {}
-        for t in all_traces:
-            pair = t['pair']
-            if pair not in traces_by_pair:
-                traces_by_pair[pair] = []
-            traces_by_pair[pair].append(t)
-        
-        metrics = final_summary['metrics']
-        
-        # Create figure
-        fig = plt.figure(figsize=(18, 14))
-        gs = fig.add_gridspec(5, 3, hspace=0.35, wspace=0.3)
-        
-        fig.suptitle('Portfolio Aggregate Analysis', fontsize=18, fontweight='bold')
-        
-        # 1. Portfolio Cumulative Returns
-        ax1 = fig.add_subplot(gs[0, :])
-        portfolio_cum_return = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
-        steps = list(range(len(all_traces)))
-        ax1.plot(steps, portfolio_cum_return, linewidth=2.5, color='darkblue', label='Portfolio')
-        ax1.fill_between(steps, 0, portfolio_cum_return, alpha=0.3, color='blue')
-        ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
-        
-        # Mark supervisor interventions
-        for skip in skipped_pairs:
-            skip_traces = traces_by_pair.get(skip['pair'], [])
-            if skip_traces:
-                skip_step = skip_traces[-1]['step']
-                ax1.axvline(skip_step, color='red', linestyle=':', alpha=0.5)
-        
-        ax1.set_title(f"Portfolio P&L: ${metrics['realized_pnl']:.2f} | "
-                     f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
-                     f"Sortino: {metrics['sortino_ratio']:.2f}",
-                     fontsize=13, fontweight='bold')
-        ax1.set_xlabel('Step')
-        ax1.set_ylabel('Cumulative P&L ($)')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-        
-        # 2. Per-Pair Performance Comparison
-        ax2 = fig.add_subplot(gs[1, :2])
-        pair_summaries = metrics['pair_summaries']
-        pair_names = [p['pair'] for p in pair_summaries]
-        pair_returns = [p['cum_return'] * 100 for p in pair_summaries]
-        colors = ['green' if r > 0 else 'red' for r in pair_returns]
-        
-        # Mark skipped pairs
-        for i, name in enumerate(pair_names):
-            if any(skip['pair'] == name for skip in skipped_pairs):
-                colors[i] = 'orange'
-        
-        bars = ax2.barh(pair_names, pair_returns, color=colors, alpha=0.7)
-        ax2.axvline(0, color='black', linestyle='-', linewidth=1)
-        ax2.set_title('Per-Pair Returns (%)', fontsize=12, fontweight='bold')
-        ax2.set_xlabel('Return (%)')
-        ax2.grid(True, alpha=0.3, axis='x')
-        
-        # Add value labels
-        for i, (bar, val) in enumerate(zip(bars, pair_returns)):
-            label = f'{val:.1f}%'
-            if any(skip['pair'] == pair_names[i] for skip in skipped_pairs):
-                label += ' ⛔'
-            ax2.text(val, bar.get_y() + bar.get_height()/2, label,
-                    ha='left' if val > 0 else 'right', va='center', fontsize=9)
-        
-        # 3. Risk Metrics Summary
-        ax3 = fig.add_subplot(gs[1, 2])
-        ax3.axis('off')
-        
-        risk_data = [
-            ['Risk Metric', 'Value'],
-            ['Max Drawdown', f"{metrics['max_drawdown']*100:.2f}%"],
-            ['VaR (95%)', f"{metrics['var_95']:.4f}"],
-            ['CVaR (95%)', f"{metrics['cvar_95']:.4f}"],
-            ['Volatility', f"{metrics['std_return']:.4f}"],
-            ['', ''],
-            ['Performance', ''],
-            ['Win Rate', f"{metrics['win_rate']*100:.1f}%"],
-            ['Avg Return', f"{metrics['avg_return']:.5f}"],
-            ['Pairs Traded', f"{metrics['n_pairs']}"],
-            ['Pairs Stopped', f"{len(skipped_pairs)}"],
-        ]
-        
-        table = ax3.table(cellText=risk_data, cellLoc='left',
-                         colWidths=[0.6, 0.4],
-                         loc='center', bbox=[0.0, 0.0, 1.0, 1.0])
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1, 2.2)
-        
-        # Style
-        for i in range(2):
-            table[(0, i)].set_facecolor('#FF6B6B')
-            table[(0, i)].set_text_props(weight='bold', color='white')
-        table[(6, 0)].set_facecolor('#4CAF50')
-        table[(6, 0)].set_text_props(weight='bold', color='white')
-        
-        # 4. Sharpe Ratio by Pair
-        ax4 = fig.add_subplot(gs[2, 0])
-        pair_sharpes = [p['sharpe'] for p in pair_summaries]
-        colors_sharpe = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' 
-                        for s in pair_sharpes]
-        ax4.barh(pair_names, pair_sharpes, color=colors_sharpe, alpha=0.7)
-        ax4.axvline(0, color='black', linestyle='-', linewidth=1)
-        ax4.axvline(0.5, color='green', linestyle='--', alpha=0.3, label='Good (>0.5)')
-        ax4.set_title('Sharpe Ratio by Pair', fontsize=11, fontweight='bold')
-        ax4.set_xlabel('Sharpe Ratio')
-        ax4.legend(fontsize=8)
-        ax4.grid(True, alpha=0.3, axis='x')
-        
-        # 5. Sortino Ratio by Pair
-        ax5 = fig.add_subplot(gs[2, 1])
-        pair_sortinos = [p['sortino'] for p in pair_summaries]
-        colors_sortino = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' 
-                         for s in pair_sortinos]
-        ax5.barh(pair_names, pair_sortinos, color=colors_sortino, alpha=0.7)
-        ax5.axvline(0, color='black', linestyle='-', linewidth=1)
-        ax5.axvline(0.5, color='green', linestyle='--', alpha=0.3, label='Good (>0.5)')
-        ax5.set_title('Sortino Ratio by Pair', fontsize=11, fontweight='bold')
-        ax5.set_xlabel('Sortino Ratio')
-        ax5.legend(fontsize=8)
-        ax5.grid(True, alpha=0.3, axis='x')
-        
-        # 6. Max Drawdown by Pair
-        ax6 = fig.add_subplot(gs[2, 2])
-        pair_dds = [p['max_drawdown'] * 100 for p in pair_summaries]
-        colors_dd = ['red' if dd > 15 else 'orange' if dd > 10 else 'green' 
-                    for dd in pair_dds]
-        ax6.barh(pair_names, pair_dds, color=colors_dd, alpha=0.7)
-        ax6.axvline(15, color='red', linestyle='--', alpha=0.3, label='Risk Limit')
-        ax6.set_title('Max Drawdown by Pair (%)', fontsize=11, fontweight='bold')
-        ax6.set_xlabel('Drawdown (%)')
-        ax6.legend(fontsize=8)
-        ax6.grid(True, alpha=0.3, axis='x')
-        
-        # 7. Portfolio Returns Distribution
-        ax7 = fig.add_subplot(gs[3, 0])
-        all_returns = [t['return'] for t in all_traces]
-        ax7.hist(all_returns, bins=60, alpha=0.7, color='steelblue', edgecolor='black')
-        ax7.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
-        ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', 
-                   linewidth=2, label=f'Mean: {np.mean(all_returns):.5f}')
-        ax7.set_title('Portfolio Returns Distribution', fontsize=11, fontweight='bold')
-        ax7.set_xlabel('Return')
-        ax7.set_ylabel('Frequency')
-        ax7.legend()
-        ax7.grid(True, alpha=0.3)
-        
-        # 8. Win Rate Scatter
-        ax8 = fig.add_subplot(gs[3, 1])
-        for pair_summary in pair_summaries:
-            pair_traces = traces_by_pair[pair_summary['pair']]
-            pair_rets = [t['return'] for t in pair_traces]
-            win_rate = sum(1 for r in pair_rets if r > 0) / len(pair_rets)
-            final_ret = pair_summary['final_return'] * 100
+    def evaluate_portfolio(
+            self, 
+            operator_traces: List[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+
+            # Group by pair
+            traces_by_pair = {}
+            for t in operator_traces:
+                pair = t.get("pair", "unknown")
+                if pair not in traces_by_pair:
+                    traces_by_pair[pair] = []
+                traces_by_pair[pair].append(t)
+
+            # ============================================================
+            # Recalculate true daily returns using pnl / prev_value
+            # ============================================================
+            all_returns = []
+            all_pnls = []
+
+            for i in range(1, len(operator_traces)):
+                pnl = operator_traces[i].get("realized_pnl_this_step", 0)
+                pv_prev = operator_traces[i-1].get("portfolio_value", None)
+
+                if pv_prev is None or pv_prev == 0:
+                    continue
+                
+                true_return = pnl / pv_prev
+                all_returns.append(true_return)
+                all_pnls.append(pnl)
+
+            # If only one step, fallback safely
+            if not all_returns:
+                all_returns = [0.0]
+                all_pnls = [0.0]
+
+            total_pnl = sum(all_pnls)
             
-            color = 'orange' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'blue'
-            ax8.scatter(win_rate * 100, final_ret, s=100, alpha=0.6, color=color)
+            # Calculate portfolio cumulative return
+            portfolio_cum_return = self._calculate_cumulative_return(all_returns)
+
+            sharpe = self._calculate_sharpe(all_returns)
+            sortino = self._calculate_sortino(all_returns)
+
+            # Risk metrics
+            max_dd = max([t.get("max_drawdown", 0) for t in operator_traces] + [0])
+            var_95 = float(np.percentile(all_returns, 5)) if all_returns else 0
+            cvar_95 = float(np.mean([r for r in all_returns if r <= var_95])) if any(r <= var_95 for r in all_returns) else var_95
+
+            # Win rate
+            positive = sum(1 for r in all_returns if r > 0)
+            win_rate = positive / len(all_returns) if all_returns else 0
+
+            # ============================================================
+            # Per-pair summaries with cumulative returns
+            # ============================================================
+            pair_summaries = []
+            for pair, traces in traces_by_pair.items():
+                
+                pair_pnls = []
+                pair_returns = []
+
+                for i in range(1, len(traces)):
+                    pnl = traces[i].get("realized_pnl_this_step", 0)
+                    pv_prev = traces[i-1].get("portfolio_value", None)
+
+                    if pv_prev is None or pv_prev == 0:
+                        continue
+
+                    true_return = pnl / pv_prev
+                    pair_pnls.append(pnl)
+                    pair_returns.append(true_return)
+
+                if not pair_returns:
+                    pair_returns = [0.0]
+                    pair_pnls = [0.0]
+
+                # Calculate cumulative return for this pair
+                pair_cum_return = self._calculate_cumulative_return(pair_returns)
+                
+                pair_sharpe = self._calculate_sharpe(pair_returns)
+                pair_sortino = self._calculate_sortino(pair_returns)
+                pair_max_dd = max([t.get("max_drawdown", 0) for t in traces] + [0])
+
+                pair_summaries.append({
+                    "pair": pair,
+                    "total_pnl": float(sum(pair_pnls)),
+                    "cum_return": float(pair_cum_return),
+                    "sharpe": float(pair_sharpe),
+                    "sortino": float(pair_sortino),
+                    "max_drawdown": float(pair_max_dd),
+                    "steps": len(traces)
+                })
+
+            metrics = {
+                "total_pnl": float(total_pnl),
+                "cum_return": float(portfolio_cum_return),
+                "sharpe_ratio": float(sharpe),
+                "sortino_ratio": float(sortino),
+                "max_drawdown": float(max_dd),
+                "var_95": float(var_95),
+                "cvar_95": float(cvar_95),
+                "win_rate": float(win_rate),
+                "avg_return": float(np.mean(all_returns)) if all_returns else 0,
+                "std_return": float(np.std(all_returns)) if all_returns else 0,
+                "n_pairs": len(traces_by_pair),
+                "total_steps": len(operator_traces),
+                "pair_summaries": pair_summaries
+            }
+
+            # Additional metrics
+            metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
+            metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
+            metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
+            metrics["avg_steps_per_pair"] = (
+                metrics["total_steps"] / max(metrics["n_pairs"], 1)
+            )
+
+            # Safety defaults
+            metrics.setdefault("pair_summaries", [])
+            metrics.setdefault("max_drawdown", 0.0)
+            metrics.setdefault("var_95", 0.0)
+            metrics.setdefault("cvar_95", 0.0)
+            metrics.setdefault("sharpe_ratio", 0.0)
+            metrics.setdefault("sortino_ratio", 0.0)
+            metrics.setdefault("win_rate", 0.0)
+            metrics.setdefault("avg_return", 0.0)
+            metrics.setdefault("std_return", 0.0)
+            metrics.setdefault("cum_return", 0.0)
+
+            # Generate actions based on final performance
+            actions = []
+            
+            if max_dd > self.max_drawdown:
+                actions.append({
+                    "action": "reduce_risk",
+                    "reason": "Portfolio drawdown exceeded limit",
+                    "severity": "high"
+                })
+            
+            if sharpe < 0:
+                actions.append({
+                    "action": "review_strategy",
+                    "reason": "Negative Sharpe ratio indicates consistent losses",
+                    "severity": "high"
+                })
+            
+            if win_rate < self.min_win_rate:
+                actions.append({
+                    "action": "improve_entry_exit",
+                    "reason": f"Win rate {win_rate:.2%} below target {self.min_win_rate:.2%}",
+                    "severity": "medium"
+                })
+            
+            if cvar_95 < -0.05:
+                actions.append({
+                    "action": "reduce_tail_risk",
+                    "reason": "Excessive tail losses detected",
+                    "severity": "high"
+                })
+            
+            # Generate explanation
+            explanation = self._generate_explanation(metrics, actions)
+            
+            summary = {
+                "metrics": metrics,
+                "actions": actions,
+                "explanation": explanation
+            }
+            
+            self._log("portfolio_evaluated", summary)
+            
+            # Save report
+            report_path = os.path.join(self.storage_dir, "supervisor_final_report.json")
+            with open(report_path, "w") as f:
+                json.dump(summary, f, indent=2, default=str)
+            
+            return summary
+
+    def _calculate_cumulative_return(self, returns: List[float]) -> float:
+        """
+        Calculate cumulative return from a series of period returns.
+        Uses compounding: (1 + r1) * (1 + r2) * ... - 1
+        """
+        if not returns:
+            return 0.0
         
-        ax8.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax8.axvline(50, color='black', linestyle='--', alpha=0.3)
-        ax8.set_title('Win Rate vs Final Return', fontsize=11, fontweight='bold')
-        ax8.set_xlabel('Win Rate (%)')
-        ax8.set_ylabel('Final Return (%)')
-        ax8.grid(True, alpha=0.3)
+        cum_return = 1.0
+        for r in returns:
+            cum_return *= (1 + r)
         
-        # 9. Supervisor Interventions Timeline
-        ax9 = fig.add_subplot(gs[3, 2])
-        if skipped_pairs:
-            skip_steps = [skip['step_stopped'] for skip in skipped_pairs]
-            skip_names = [skip['pair'].split('-')[0][:4] for skip in skipped_pairs]
-            ax9.scatter(skip_steps, range(len(skip_steps)), s=200, 
-                       color='red', marker='X', alpha=0.7)
-            for i, (step, name) in enumerate(zip(skip_steps, skip_names)):
-                ax9.text(step, i, f' {name}', va='center', fontsize=9)
-            ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
-            ax9.set_xlabel('Step')
-            ax9.set_yticks([])
-            ax9.grid(True, alpha=0.3, axis='x')
-        else:
-            ax9.text(0.5, 0.5, 'No Interventions', ha='center', va='center',
-                    fontsize=14, transform=ax9.transAxes)
-            ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
-            ax9.axis('off')
-        
-        # 10. Summary Text
-        ax10 = fig.add_subplot(gs[4, :])
-        ax10.axis('off')
-        
-        summary_text = f"""
-                      PORTFOLIO SUMMARY:
-                      • Total P&L: ${metrics['realized_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
-                      • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
-                      • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
-                      
-                      SUPERVISOR ACTIONS:
-                      """
-        if final_summary['actions']:
-            for action in final_summary['actions']:
-                summary_text += f"• {action['action']}: {action['reason']}\n"
-        else:
-            summary_text += "• No risk interventions required\n"
-        
-        ax10.text(0.05, 0.5, summary_text, fontsize=11, verticalalignment='center',
-                 fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-        
-        # Save figure
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(self.output_dir, f"portfolio_analysis_{timestamp}.png")
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"\n📊 Saved portfolio analysis: {filepath}")
+        return cum_return - 1.0
+
+    # ===================================================================
+    # HELPER METHODS
+    # ===================================================================
     
     def _calculate_sharpe(self, returns: List[float]) -> float:
-        """Calculate Sharpe ratio."""
+        """Calculate annualized Sharpe ratio."""
         if len(returns) < 2:
             return 0.0
-        rf_daily = 0.04 / 252
+        
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess = np.array(returns) - rf_daily
+        
         mean_excess = np.mean(excess)
         std_excess = np.std(excess, ddof=1)
+        
         if std_excess < 1e-8:
             return 0.0
+        
         return (mean_excess / std_excess) * np.sqrt(252)
-    
+
     def _calculate_sortino(self, returns: List[float]) -> float:
-        """Calculate Sortino ratio."""
+        """Calculate annualized Sortino ratio."""
         if len(returns) < 2:
             return 0.0
-        rf_daily = 0.04 / 252
+        
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess = np.array(returns) - rf_daily
+        
         mean_excess = np.mean(excess)
         downside = excess[excess < 0]
+        
         if len(downside) == 0:
             return 100.0 if mean_excess > 0 else 0.0
+        
         downside_std = np.sqrt(np.mean(downside**2))
+        
         if downside_std < 1e-8:
             return 100.0 if mean_excess > 0 else 0.0
+        
         return (mean_excess / downside_std) * np.sqrt(252)
 
-
-def generate_all_visualizations(all_traces: List[Dict], 
-                                skipped_pairs: List[Dict],
-                                final_summary: Dict,
-                                output_dir: str = "reports"):
-    """
-    Generate complete visual report for portfolio and all pairs.
-    
-    Args:
-        all_traces: All traces from operator
-        skipped_pairs: List of skipped pair info from supervisor
-        final_summary: Dict from supervisor.evaluate_portfolio()
-        output_dir: Where to save reports
-    """
-    print("\n" + "="*70)
-    print("GENERATING VISUAL REPORTS")
-    print("="*70)
-    
-    visualizer = PortfolioVisualizer(output_dir)
-    
-    # Group traces by pair
-    traces_by_pair = {}
-    for t in all_traces:
-        pair = t['pair']
-        if pair not in traces_by_pair:
-            traces_by_pair[pair] = []
-        traces_by_pair[pair].append(t)
-    
-    # Generate individual pair reports
-    print("\n📊 Generating pair-level reports...")
-    for pair_name, traces in traces_by_pair.items():
-        # Check if this pair was skipped
-        skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
-        was_skipped = skip_info is not None
+    def _generate_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
+        """Generate natural language explanation using Gemini or fallback."""
+        if not self.use_gemini:
+            return self._fallback_explanation(metrics, actions)
         
-        visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
-    
-    # Generate portfolio aggregate
-    print("\n📊 Generating portfolio aggregate report...")
-    visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
-    
-    print(f"\n✅ All reports saved to: {output_dir}/")
-    print(f"   • Portfolio aggregate: {output_dir}/portfolio_analysis_*.png")
-    print(f"   • Individual pairs: {output_dir}/pairs/*.png")
+        system_instruction = """You are an expert quantitative supervisor analyzing pairs trading performance. 
+        Provide clear, actionable insights about risk and performance."""
+        
+        prompt = f"""Analyze this pairs trading portfolio and explain the results:
+                    
+                METRICS:
+                {json.dumps(metrics, indent=2)}
+                
+                RECOMMENDED ACTIONS:
+                {json.dumps(actions, indent=2)}
+                
+                Provide a concise 3-4 paragraph executive summary covering:
+                1. Overall performance (Sharpe, Sortino, win rate, drawdown)
+                2. Key risks or concerns
+                3. Rationale for recommended actions
+                4. Brief outlook
+                
+                Keep it professional and actionable. This is a simulated backtest for research purposes."""
+        
+        try:
+            model = genai.GenerativeModel(
+                model_name=self.model,
+                generation_config={"temperature": self.temperature},
+                system_instruction=system_instruction
+            )
+            response = model.generate_content(prompt)
+            
+            if response.candidates and response.candidates[0].content.parts:
+                return "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, "text"))
+            
+        except Exception as e:
+            print(f"⚠️ Gemini explanation failed: {e}")
+        
+        return self._fallback_explanation(metrics, actions)
+
+    def _fallback_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
+        """Fallback explanation when Gemini unavailable."""
+        text = "Portfolio Performance Summary:\n\n"
+        
+        text += f"The portfolio achieved a Sharpe ratio of {metrics['sharpe_ratio']:.2f} "
+        text += f"and Sortino ratio of {metrics['sortino_ratio']:.2f} with a "
+        text += f"win rate of {metrics['win_rate']:.1%}. "
+        text += f"Maximum drawdown was {metrics['max_drawdown']:.2%}.\n\n"
+        
+        if actions:
+            text += f"Risk Management: {len(actions)} intervention(s) recommended - "
+            text += ", ".join([a['action'] for a in actions]) + ".\n\n"
+        else:
+            text += "No critical risk interventions required.\n\n"
+        
+        text += f"The portfolio traded {metrics['n_pairs']} pairs over "
+        text += f"{metrics['total_steps']} steps with an average return of "
+        text += f"{metrics['avg_return']:.4f} per step."
+        
+        return text
