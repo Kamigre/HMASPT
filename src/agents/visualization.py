@@ -37,7 +37,7 @@ class PortfolioVisualizer:
         # Extract data
         steps = [t['step'] for t in traces]
         pnls = [t['realized_pnl_this_step'] for t in traces]
-        returns = [t['return'] for t in traces]
+        returns = [t['daily_return'] for t in traces]
         cum_return = [t['cum_return'] for t in traces]
         positions = [t['position'] for t in traces]
         drawdowns = [t['max_drawdown'] for t in traces]
