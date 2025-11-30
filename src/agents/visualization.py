@@ -74,7 +74,7 @@ class PortfolioVisualizer:
                        label=f'Supervisor Stop: {skip_info.get("reason", "")}')
             ax1.legend(loc='upper left')
         
-        ax1.set_title(f'Cumulative Return: {final_return:.2f}%', fontsize=12, fontweight='bold')
+        ax1.set_title(f'Cumulative Return: {cum_return[-1]*100:.2f}%', fontsize=12, fontweight='bold')
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Cumulative Return (%)')
         ax1.grid(True, alpha=0.3)
@@ -234,10 +234,10 @@ class PortfolioVisualizer:
         
         # 1. Portfolio Cumulative Returns
         ax1 = fig.add_subplot(gs[0, :])
-        portfolio_cum_return = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
+        portfolio_cum_pnl = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
         steps = list(range(len(all_traces)))
-        ax1.plot(steps, portfolio_cum_return, linewidth=2.5, color='darkblue', label='Portfolio')
-        ax1.fill_between(steps, 0, portfolio_cum_return, alpha=0.3, color='blue')
+        ax1.plot(steps, portfolio_cum_pnl, linewidth=2.5, color='darkblue', label='Portfolio')
+        ax1.fill_between(steps, 0, portfolio_cum_pnl, alpha=0.3, color='blue')
         ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
         
         # Mark supervisor interventions
@@ -247,7 +247,7 @@ class PortfolioVisualizer:
                 skip_step = skip_traces[-1]['step']
                 ax1.axvline(skip_step, color='red', linestyle=':', alpha=0.5)
         
-        ax1.set_title(f"Portfolio P&L: ${metrics['realized_pnl']:.2f} | "
+        ax1.set_title(f"Portfolio P&L: ${metrics['total_pnl']:.2f} | "
                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
                      f"Sortino: {metrics['sortino_ratio']:.2f}",
                      fontsize=13, fontweight='bold')
@@ -354,7 +354,7 @@ class PortfolioVisualizer:
         
         # 7. Portfolio Returns Distribution
         ax7 = fig.add_subplot(gs[3, 0])
-        all_returns = [t['return'] for t in all_traces]
+        all_returns = [t['daily_return'] for t in all_traces]
         ax7.hist(all_returns, bins=60, alpha=0.7, color='steelblue', edgecolor='black')
         ax7.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
         ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', 
@@ -369,9 +369,9 @@ class PortfolioVisualizer:
         ax8 = fig.add_subplot(gs[3, 1])
         for pair_summary in pair_summaries:
             pair_traces = traces_by_pair[pair_summary['pair']]
-            pair_rets = [t['return'] for t in pair_traces]
+            pair_rets = [t['cum_return'] for t in pair_traces]
             win_rate = sum(1 for r in pair_rets if r > 0) / len(pair_rets)
-            final_ret = pair_summary['final_return'] * 100
+            final_ret = pair_summary['cum_return'] * 100
             
             color = 'orange' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'blue'
             ax8.scatter(win_rate * 100, final_ret, s=100, alpha=0.6, color=color)
@@ -408,7 +408,7 @@ class PortfolioVisualizer:
         
         summary_text = f"""
                       PORTFOLIO SUMMARY:
-                      • Total P&L: ${metrics['realized_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
+                      • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
                       • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
                       • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
                       
