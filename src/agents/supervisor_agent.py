@@ -179,8 +179,8 @@ class SupervisorAgent:
             return {"action": "continue", "reason": "insufficient_data"}
         
         # Calculate current metrics
-        returns = [t.get("return", 0) for t in operator_traces]
-        pnls = [t.get("pnl", 0) for t in operator_traces]
+        returns = [t.get("daily_return", 0) for t in operator_traces]
+        pnls = [t.get("realized_pnl_this_step", 0) for t in operator_traces]
         
         # Current drawdown
         cum_returns = np.cumsum(returns)
@@ -277,7 +277,7 @@ class SupervisorAgent:
             all_pnls = []
 
             for i in range(1, len(operator_traces)):
-                pnl = operator_traces[i].get("pnl", 0)
+                pnl = operator_traces[i].get("realized_pnl_this_step", 0)
                 pv_prev = operator_traces[i-1].get("portfolio_value", None)
 
                 if pv_prev is None or pv_prev == 0:
@@ -319,7 +319,7 @@ class SupervisorAgent:
                 pair_returns = []
 
                 for i in range(1, len(traces)):
-                    pnl = traces[i].get("pnl", 0)
+                    pnl = traces[i].get("realized_pnl_this_step", 0)
                     pv_prev = traces[i-1].get("portfolio_value", None)
 
                     if pv_prev is None or pv_prev == 0:
