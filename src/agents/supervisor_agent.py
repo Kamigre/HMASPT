@@ -291,9 +291,11 @@ class SupervisorAgent:
                 all_pnls = [0.0]
 
             total_pnl = sum(all_pnls)
-            
-            # Calculate portfolio cumulative return
-            portfolio_cum_return = self._calculate_cumulative_return(all_returns)
+
+            initial_pv = operator_traces[0].get("portfolio_value", 0.0)
+            final_pv = operator_traces[-1].get("portfolio_value", 0.0)
+
+            portfolio_cum_return = (final_pv - initial_pv) / initial_pv
 
             sharpe = self._calculate_sharpe(all_returns)
             sortino = self._calculate_sortino(all_returns)
@@ -331,8 +333,10 @@ class SupervisorAgent:
                     pair_returns = [0.0]
                     pair_pnls = [0.0]
 
-                # Calculate cumulative return for this pair
-                pair_cum_return = self._calculate_cumulative_return(pair_returns)
+                initial_pv = traces[0].get("portfolio_value", 0.0)
+                final_pv = traces[-1].get("portfolio_value", 0.0)
+
+                pair_return = (final_pv - initial_pv) / initial_pv
                 
                 pair_sharpe = self._calculate_sharpe(pair_returns)
                 pair_sortino = self._calculate_sortino(pair_returns)
@@ -341,7 +345,7 @@ class SupervisorAgent:
                 pair_summaries.append({
                     "pair": pair,
                     "total_pnl": float(sum(pair_pnls)),
-                    "cum_return": float(pair_cum_return),
+                    "cum_return": float(pair_return),
                     "sharpe": float(pair_sharpe),
                     "sortino": float(pair_sortino),
                     "max_drawdown": float(pair_max_dd),
@@ -433,19 +437,19 @@ class SupervisorAgent:
             
             return summary
 
-    def _calculate_cumulative_return(self, returns: List[float]) -> float:
-        """
-        Calculate cumulative return from a series of period returns.
-        Uses compounding: (1 + r1) * (1 + r2) * ... - 1
-        """
-        if not returns:
-            return 0.0
+    # def _calculate_cumulative_return(self, returns: List[float]) -> float:
+    #     """
+    #     Calculate cumulative return from a series of period returns.
+    #     Uses compounding: (1 + r1) * (1 + r2) * ... - 1
+    #     """
+    #     if not returns:
+    #         return 0.0
         
-        cum_return = 1.0
-        for r in returns:
-            cum_return *= (1 + r)
+    #     cum_return = 1.0
+    #     for r in returns:
+    #         cum_return *= (1 + r)
         
-        return cum_return - 1.0
+    #     return cum_return - 1.0
 
     # ===================================================================
     # HELPER METHODS
