@@ -297,7 +297,7 @@ class PairTradingEnv(gym.Env):
         if realized_pnl_this_step > 0:
             reward += 0.5 * (realized_pnl_this_step / self.initial_capital)
         
-        reward -= 0.005 * abs(position_change)
+        reward -= 0.0005 * abs(position_change)
         
         # ============================================================
         # INFO DICT
@@ -710,17 +710,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         last_position = 0
         for t in episode_traces:
             pos = t["position"]
-            if pos != last_position:
-                trades.append({"position": pos, "realized_pnl": t["realized_pnl_this_step"]})
+            pnl = t.get("realized_pnl_this_step", 0)
+            if pos != last_position and pnl != 0:  # only count trades with non-zero PnL
+                trades.append({"position": pos, "realized_pnl": pnl})
             last_position = pos
-
-        n_trades = len(trades)
 
         pnls_list = [tr["realized_pnl"] for tr in trades]
 
+        n_trades = len(pnls_list)
         wins = [1 for pnl in pnls_list if pnl > 0]
-        losses = [1 for pnl in pnls_list if pnl < 0]
-
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
         avg_trade_pnl = np.mean(pnls_list) if n_trades > 0 else 0.0
 
@@ -732,12 +730,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         }
 
         # ---------- RETURN METRICS ----------
-        ret_mean = np.mean(daily_returns) if len(daily_returns) > 0 else 0.0
-        ret_std = np.std(daily_returns) if len(daily_returns) > 0 else 0.0
-        ret_median = np.median(daily_returns) if len(daily_returns) > 0 else 0.0
+        # Filter daily returns to remove zeros
+        filtered_returns = [t.get("daily_return", 0) for t in episode_traces if t.get("daily_return", 0) != 0]
+
+        ret_mean = np.mean(filtered_returns) if filtered_returns else 0.0
+        ret_std = np.std(filtered_returns) if filtered_returns else 0.0
+        ret_median = np.median(filtered_returns) if filtered_returns else 0.0
 
         # ---------- DRAWDOWN ----------
-        max_dd = max(t["max_drawdown"] for t in episode_traces) if episode_traces else 0
+        max_dd = max(t.get("max_drawdown", 0) for t in episode_traces) if episode_traces else 0
 
         # Sharpe and Sortino
         sharpe = calculate_sharpe(episode_traces)
@@ -825,9 +826,9 @@ def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
     
-    returns = np.array([t['daily_return'] for t in traces])
+    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
     
-    if len(returns) < 2:  # Need at least 2 observations
+    if len(returns) < 2:
         return 0.0
     
     rf_daily = risk_free_rate / 252
@@ -836,7 +837,7 @@ def calculate_sharpe(traces, risk_free_rate=None):
     mean_excess = np.mean(excess_returns)
     std_excess = np.std(excess_returns, ddof=1)
     
-    if std_excess < 1e-8:  # Essentially zero volatility
+    if std_excess < 1e-8:
         return 0.0
     
     return (mean_excess / std_excess) * np.sqrt(252)
@@ -846,29 +847,22 @@ def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
     
-    returns = np.array([t['daily_return'] for t in traces])
+    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
     
-    if len(returns) < 2:  # Need at least 2 observations
+    if len(returns) < 2:
         return 0.0
     
     rf_daily = risk_free_rate / 252
     excess_returns = returns - rf_daily
     
     mean_excess = np.mean(excess_returns)
-    
-    # CORRECT: Downside deviation (semi-deviation)
-    # Only penalize returns below the target (risk-free rate)
     downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
     
-    if downside_deviation < 1e-8:  # No downside risk
-        # All returns above risk-free rate
-        if mean_excess > 0:
-            return 100.0  # Or some large positive number
-        else:
-            return 0.0
+    if downside_deviation < 1e-8:
+        return 100.0 if mean_excess > 0 else 0.0
     
     return (mean_excess / downside_deviation) * np.sqrt(252)
-
+    
 def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
     """Save detailed trace for visualization."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
