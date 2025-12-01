@@ -291,11 +291,13 @@ class PairTradingEnv(gym.Env):
         
         # Small penalty for holding time (encourage mean reversion trading)
         if self.position != 0:
-            reward -= 0.0001 * self.days_in_position
+            reward -= 0.01 * self.days_in_position
         
         # Bonus for realized profits
         if realized_pnl_this_step > 0:
             reward += 0.5 * (realized_pnl_this_step / self.initial_capital)
+        
+        reward -= 0.005 * abs(position_change)
         
         # ============================================================
         # INFO DICT
@@ -402,8 +404,8 @@ class OperatorAgent:
         model = PPO(
             "MlpPolicy",
             env,
-            learning_rate=0.001,
-            n_steps=2048,
+            learning_rate=0.0001,
+            n_steps=512,
             batch_size=64,
             n_epochs=20,
             gamma=0.99,
@@ -411,6 +413,7 @@ class OperatorAgent:
             verbose=1,  # Show progress
             device="cpu"
         )
+
         model.learn(total_timesteps=timesteps)
 
         # Save model
