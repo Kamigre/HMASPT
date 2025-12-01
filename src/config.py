@@ -32,7 +32,7 @@ CONFIG = {
             # --- INFORMATION CHECKPOINTS ---
             # Provide feedback without intervention
             "info_checkpoints": {
-                "check_interval": 50,  # Check every N timesteps
+                "check_interval": 40,  # Check every N timesteps
                 "metrics_to_track": [
                     "avg_reward",
                     "position_distribution",
@@ -63,8 +63,8 @@ CONFIG = {
         "holdout": {
             
             # Minimum data before intervention
-            "min_observations": 10,
-            "check_interval": 20,  # Check every 20 steps
+            "min_observations": 20,
+            "check_interval": 30,  # Check every 20 steps
             
             # --- TIER 1: INFORMATIVE WARNINGS ---
             # No intervention, just log and inform
