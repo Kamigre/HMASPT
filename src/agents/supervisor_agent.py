@@ -245,17 +245,19 @@ class SupervisorAgent:
         if phase == "holdout" and "stop_tier" in rules:
             stop_tier = rules["stop_tier"]
             
+            ### ALL ACTIONS WERE STOP
+
             if max_dd > stop_tier["catastrophic_drawdown"]:
                 self._log("intervention_triggered", {
                     "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "stop",
+                    "action": "wan",
                     "severity": "critical",
                     "reason": "catastrophic_drawdown",
                     "drawdown": max_dd,
                     "threshold": stop_tier["catastrophic_drawdown"]
                 })
                 return {
-                    'action': 'stop',
+                    'action': 'wan',
                     'severity': 'critical',
                     'reason': f'Drawdown {max_dd:.1%} exceeds critical limit {stop_tier["catastrophic_drawdown"]:.1%}',
                     'metrics': metrics
@@ -264,14 +266,14 @@ class SupervisorAgent:
             if sharpe < stop_tier["disastrous_sharpe"]:
                 self._log("intervention_triggered", {
                     "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "stop",
+                    "action": "wan",
                     "severity": "critical",
                     "reason": "disastrous_sharpe",
                     "sharpe": sharpe,
                     "threshold": stop_tier["disastrous_sharpe"]
                 })
                 return {
-                    'action': 'stop',
+                    'action': 'warn',
                     'severity': 'critical',
                     'reason': f'Sharpe {sharpe:.2f} below disastrous threshold {stop_tier["disastrous_sharpe"]:.2f}',
                     'metrics': metrics
@@ -280,14 +282,14 @@ class SupervisorAgent:
             if win_rate < stop_tier["consistent_failure"]:
                 self._log("intervention_triggered", {
                     "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "stop",
+                    "action": "warn",
                     "severity": "critical",
                     "reason": "consistent_failure",
                     "win_rate": win_rate,
                     "threshold": stop_tier["consistent_failure"]
                 })
                 return {
-                    'action': 'stop',
+                    'action': 'warn',
                     'severity': 'critical',
                     'reason': f'Win rate {win_rate:.1%} indicates consistent failure (threshold: {stop_tier["consistent_failure"]:.1%})',
                     'metrics': metrics
@@ -296,14 +298,14 @@ class SupervisorAgent:
             if total_pnl < stop_tier["runaway_losses"]:
                 self._log("intervention_triggered", {
                     "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "stop",
+                    "action": "warn",
                     "severity": "critical",
                     "reason": "runaway_losses",
                     "total_pnl": total_pnl,
                     "threshold": stop_tier["runaway_losses"]
                 })
                 return {
-                    'action': 'stop',
+                    'action': 'warn',
                     'severity': 'critical',
                     'reason': f'Total P&L ${total_pnl:.0f} indicates runaway losses (threshold: ${stop_tier["runaway_losses"]:.0f})',
                     'metrics': metrics
