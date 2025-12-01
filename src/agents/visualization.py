@@ -6,6 +6,11 @@ import seaborn as sns
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
 
+# Import CONFIG for risk-free rate
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import CONFIG
+
 # Set style
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (15, 10)
@@ -35,7 +40,7 @@ class PortfolioVisualizer:
             return
         
         # Extract data
-        steps = [t['step'] for t in traces]
+        steps = [t['local_step'] for t in traces]  # CHANGED: use local_step for per-pair view
         pnls = [t['realized_pnl_this_step'] for t in traces]
         returns = [t['daily_return'] for t in traces]
         cum_return = [t['cum_return'] for t in traces]
@@ -46,9 +51,12 @@ class PortfolioVisualizer:
         sharpe = self._calculate_sharpe(returns)
         sortino = self._calculate_sortino(returns)
         total_pnl = sum(pnls)
-        final_return = cum_return[-1] * 100
-        max_dd = max(drawdowns)
-        win_rate = sum(1 for r in returns if r > 0) / len(returns)
+        final_return = cum_return[-1] * 100 if cum_return else 0
+        max_dd = max(drawdowns) if drawdowns else 0
+        
+        # Win rate calculation (fixed)
+        positive_returns = sum(1 for r in returns if r > 0)
+        win_rate = positive_returns / len(returns) if returns else 0
         
         # Create figure with subplots
         fig = plt.figure(figsize=(16, 12))
@@ -69,12 +77,12 @@ class PortfolioVisualizer:
                          alpha=0.3, color='blue' if final_return > 0 else 'red')
         
         if was_skipped and skip_info:
-            skip_step = skip_info.get('step_stopped', steps[-1])
-            ax1.axvline(skip_step, color='red', linestyle='--', linewidth=2, 
+            skip_local_step = skip_info.get('local_step_stopped', steps[-1])
+            ax1.axvline(skip_local_step, color='red', linestyle='--', linewidth=2, 
                        label=f'Supervisor Stop: {skip_info.get("reason", "")}')
             ax1.legend(loc='upper left')
         
-        ax1.set_title(f'Cumulative Return: {cum_return[-1]*100:.2f}%', fontsize=12, fontweight='bold')
+        ax1.set_title(f'Cumulative Return: {final_return:.2f}%', fontsize=12, fontweight='bold')
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Cumulative Return (%)')
         ax1.grid(True, alpha=0.3)
@@ -174,7 +182,9 @@ class PortfolioVisualizer:
         
         if was_skipped and skip_info:
             metrics_data.append(['Supervisor Action', 'STOPPED EARLY', '⛔'])
-            metrics_data.append(['Stop Reason', skip_info.get('reason', 'N/A'), '—'])
+            metrics_data.append(['Stop Reason', skip_info.get('reason', 'N/A')[:40], '—'])
+            severity = skip_info.get('severity', 'unknown').upper()
+            metrics_data.append(['Severity', severity, '🔴' if severity == 'CRITICAL' else '🟡'])
         
         table = ax8.table(cellText=metrics_data, cellLoc='left', 
                          colWidths=[0.3, 0.3, 0.1],
@@ -232,11 +242,11 @@ class PortfolioVisualizer:
         
         fig.suptitle('Portfolio Aggregate Analysis', fontsize=18, fontweight='bold')
         
-        # 1. Portfolio Cumulative Returns
+        # 1. Portfolio Cumulative P&L
         ax1 = fig.add_subplot(gs[0, :])
         portfolio_cum_pnl = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
         steps = list(range(len(all_traces)))
-        ax1.plot(steps, portfolio_cum_pnl, linewidth=2.5, color='darkblue', label='Portfolio')
+        ax1.plot(steps, portfolio_cum_pnl, linewidth=2.5, color='darkblue', label='Portfolio P&L')
         ax1.fill_between(steps, 0, portfolio_cum_pnl, alpha=0.3, color='blue')
         ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
         
@@ -251,7 +261,7 @@ class PortfolioVisualizer:
                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
                      f"Sortino: {metrics['sortino_ratio']:.2f}",
                      fontsize=13, fontweight='bold')
-        ax1.set_xlabel('Step')
+        ax1.set_xlabel('Global Step')
         ax1.set_ylabel('Cumulative P&L ($)')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
@@ -365,21 +375,20 @@ class PortfolioVisualizer:
         ax7.legend()
         ax7.grid(True, alpha=0.3)
         
-        # 8. Win Rate Scatter
+        # 8. Sharpe vs Return Scatter
         ax8 = fig.add_subplot(gs[3, 1])
         for pair_summary in pair_summaries:
-            pair_traces = traces_by_pair[pair_summary['pair']]
-            pair_rets = [t['cum_return'] for t in pair_traces]
-            win_rate = sum(1 for r in pair_rets if r > 0) / len(pair_rets)
+            sharpe = pair_summary['sharpe']
             final_ret = pair_summary['cum_return'] * 100
             
             color = 'orange' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'blue'
-            ax8.scatter(win_rate * 100, final_ret, s=100, alpha=0.6, color=color)
+            marker = 'X' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'o'
+            ax8.scatter(sharpe, final_ret, s=100, alpha=0.6, color=color, marker=marker)
         
         ax8.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax8.axvline(50, color='black', linestyle='--', alpha=0.3)
-        ax8.set_title('Win Rate vs Final Return', fontsize=11, fontweight='bold')
-        ax8.set_xlabel('Win Rate (%)')
+        ax8.axvline(0, color='black', linestyle='--', alpha=0.3)
+        ax8.set_title('Sharpe vs Return', fontsize=11, fontweight='bold')
+        ax8.set_xlabel('Sharpe Ratio')
         ax8.set_ylabel('Final Return (%)')
         ax8.grid(True, alpha=0.3)
         
@@ -388,12 +397,16 @@ class PortfolioVisualizer:
         if skipped_pairs:
             skip_steps = [skip['step_stopped'] for skip in skipped_pairs]
             skip_names = [skip['pair'].split('-')[0][:4] for skip in skipped_pairs]
+            skip_severities = [skip.get('severity', 'unknown') for skip in skipped_pairs]
+            
+            colors_severity = ['red' if s == 'critical' else 'orange' for s in skip_severities]
+            
             ax9.scatter(skip_steps, range(len(skip_steps)), s=200, 
-                       color='red', marker='X', alpha=0.7)
+                       c=colors_severity, marker='X', alpha=0.7)
             for i, (step, name) in enumerate(zip(skip_steps, skip_names)):
                 ax9.text(step, i, f' {name}', va='center', fontsize=9)
             ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
-            ax9.set_xlabel('Step')
+            ax9.set_xlabel('Global Step')
             ax9.set_yticks([])
             ax9.grid(True, alpha=0.3, axis='x')
         else:
@@ -406,19 +419,20 @@ class PortfolioVisualizer:
         ax10 = fig.add_subplot(gs[4, :])
         ax10.axis('off')
         
-        summary_text = f"""
-                      PORTFOLIO SUMMARY:
-                      • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
-                      • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
-                      • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
-                      
-                      SUPERVISOR ACTIONS:
-                      """
+        summary_text = f"""PORTFOLIO SUMMARY:
+            • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
+            • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
+            • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
+
+            SUPERVISOR ACTIONS:
+            """
+        
         if final_summary['actions']:
             for action in final_summary['actions']:
-                summary_text += f"• {action['action']}: {action['reason']}\n"
+                severity_symbol = "🔴" if action.get('severity') == 'high' else "🟡"
+                summary_text += f"{severity_symbol} {action['action']}: {action['reason']}\n"
         else:
-            summary_text += "• No risk interventions required\n"
+            summary_text += "✅ No risk interventions required\n"
         
         ax10.text(0.05, 0.5, summary_text, fontsize=11, verticalalignment='center',
                  fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
@@ -432,10 +446,10 @@ class PortfolioVisualizer:
         print(f"\n📊 Saved portfolio analysis: {filepath}")
     
     def _calculate_sharpe(self, returns: List[float]) -> float:
-        """Calculate Sharpe ratio."""
+        """Calculate Sharpe ratio using CONFIG risk-free rate."""
         if len(returns) < 2:
             return 0.0
-        rf_daily = 0.04 / 252
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess = np.array(returns) - rf_daily
         mean_excess = np.mean(excess)
         std_excess = np.std(excess, ddof=1)
@@ -444,10 +458,10 @@ class PortfolioVisualizer:
         return (mean_excess / std_excess) * np.sqrt(252)
     
     def _calculate_sortino(self, returns: List[float]) -> float:
-        """Calculate Sortino ratio."""
+        """Calculate Sortino ratio using CONFIG risk-free rate."""
         if len(returns) < 2:
             return 0.0
-        rf_daily = 0.04 / 252
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess = np.array(returns) - rf_daily
         mean_excess = np.mean(excess)
         downside = excess[excess < 0]
