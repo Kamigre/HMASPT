@@ -520,7 +520,26 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     return all_traces
 
 
-def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_interval=20):
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
+    """
+    Run holdout testing with supervisor monitoring.
+    
+    Args:
+        operator: OperatorAgent instance
+        holdout_prices: DataFrame with holdout price data
+        pairs: List of (x, y) tuples to test
+        supervisor: SupervisorAgent instance
+    
+    Returns:
+        all_traces: List of all trading step traces
+        skipped_pairs: List of pairs that were stopped early by supervisor
+    """
+    
+    # Get check_interval from CONFIG
+    if "supervisor_rules" in CONFIG and "holdout" in CONFIG["supervisor_rules"]:
+        check_interval = CONFIG["supervisor_rules"]["holdout"].get("check_interval", 20)
+    else:
+        check_interval = 20  # Fallback default
     
     operator.traces_buffer = []
     operator.current_step = 0
@@ -613,13 +632,16 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
             # SUPERVISOR MONITORING (every N steps)
             # ============================================================
             if local_step > 0 and local_step % check_interval == 0:
+                # Call supervisor with phase parameter
                 decision = supervisor.check_operator_performance(
                     episode_traces, 
-                    pair
+                    pair,
+                    phase="holdout"  # <-- ADDED THIS
                 )
                 
                 if decision["action"] == "stop":
-                    print(f"\n⛔ SUPERVISOR INTERVENTION: Skipping to next pair")
+                    severity = decision.get("severity", "critical")
+                    print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Skipping to next pair")
                     print(f"   Reason: {decision['reason']}")
                     print(f"   Metrics: {decision['metrics']}")
                     print(f"   Steps completed: {local_step}/{len(aligned)}")
@@ -628,6 +650,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
                     skip_info = {
                         "pair": f"{pair[0]}-{pair[1]}",
                         "reason": decision['reason'],
+                        "severity": severity,
                         "step_stopped": global_step,
                         "local_step_stopped": local_step,
                         "metrics": decision['metrics']
@@ -643,16 +666,23 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
                     continue
                 
                 elif decision["action"] == "adjust":
-                    print(f"\n⚠️  SUPERVISOR WARNING:")
+                    print(f"\n⚠️  SUPERVISOR WARNING [{decision.get('severity', 'warning').upper()}]:")
                     print(f"   {decision['reason']}")
                     if 'suggestion' in decision:
-                        print(f"   Suggestion: {decision['suggestion']}")
+                        print(f"   💡 Suggestion: {decision['suggestion']}")
+                
+                elif decision["action"] == "warn":
+                    # Only show warnings occasionally (every 4 checks)
+                    if local_step % (check_interval * 4) == 0:
+                        print(f"\nℹ️  SUPERVISOR INFO:")
+                        print(f"   {decision['reason']}")
                 
                 # Show periodic performance updates
                 if local_step % (check_interval * 2) == 0:
                     metrics = decision["metrics"]
-                    print(f"\n📊 Step {local_step}: DD={metrics['drawdown']:.2%}, "
-                          f"Sharpe={metrics['sharpe']:.2f}, WinRate={metrics['win_rate']:.2%}")
+                    print(f"\n📊 Step {local_step}: DD={metrics.get('drawdown', 0):.2%}, "
+                          f"Sharpe={metrics.get('sharpe', 0):.2f}, "
+                          f"WinRate={metrics.get('win_rate', 0):.2%}")
 
             local_step += 1
             global_step += 1
@@ -683,13 +713,13 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
 
         n_trades = len(trades)
 
-        pnls = [tr["realized_pnl"] for tr in trades]
+        pnls_list = [tr["realized_pnl"] for tr in trades]
 
-        wins = [1 for pnl in pnls if pnl > 0]
-        losses = [1 for pnl in pnls if pnl < 0]
+        wins = [1 for pnl in pnls_list if pnl > 0]
+        losses = [1 for pnl in pnls_list if pnl < 0]
 
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
-        avg_trade_pnl = np.mean(pnls) if n_trades > 0 else 0.0
+        avg_trade_pnl = np.mean(pnls_list) if n_trades > 0 else 0.0
 
         # ---------- POSITION USAGE ----------
         unique_positions, pos_counts = np.unique(positions, return_counts=True)
@@ -699,9 +729,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
         }
 
         # ---------- RETURN METRICS ----------
-        ret_mean = np.mean(daily_returns)
-        ret_std = np.std(daily_returns)
-        ret_median = np.median(daily_returns)
+        ret_mean = np.mean(daily_returns) if len(daily_returns) > 0 else 0.0
+        ret_std = np.std(daily_returns) if len(daily_returns) > 0 else 0.0
+        ret_median = np.median(daily_returns) if len(daily_returns) > 0 else 0.0
 
         # ---------- DRAWDOWN ----------
         max_dd = max(t["max_drawdown"] for t in episode_traces) if episode_traces else 0
@@ -739,43 +769,52 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, check_inte
             })
 
         if len(episode_traces) > 0:
-            print(f"  Final return: {episode_traces[-1]['cum_reward']*100:.2f}%")
-            print(f"  Total P&L: {episode_traces[-1]['realized_pnl']:.2f}")
+            final_cum_return = episode_traces[-1].get('cum_return', 0)
+            final_pnl = episode_traces[-1].get('realized_pnl', 0)
+            print(f"  Final return: {final_cum_return*100:.2f}%")
+            print(f"  Total P&L: {final_pnl:.2f}")
 
-        if operator.logger:
-            operator.logger.log("operator", "episode_complete", {
-                "pair": f"{pair[0]}-{pair[1]}",
-                "total_steps": len(episode_traces),
-                "final_cum_return": episode_traces[-1]['cum_reward'],
-                "total_pnl":  episode_traces[-1]['realized_pnl'],
-                "sharpe": sharpe,
-                "sortino": sortino,
-                "was_skipped": skip_to_next_pair
-            })
+            if operator.logger:
+                operator.logger.log("operator", "episode_complete", {
+                    "pair": f"{pair[0]}-{pair[1]}",
+                    "total_steps": len(episode_traces),
+                    "final_cum_return": final_cum_return,
+                    "total_pnl": final_pnl,
+                    "sharpe": sharpe,
+                    "sortino": sortino,
+                    "was_skipped": skip_to_next_pair
+                })
 
     # ============================================================
     # FINAL SUMMARY
     # ============================================================
     
     print("\n" + "="*70)
-    print("Holdout testing complete")
+    print("HOLDOUT TESTING COMPLETE")
+    print("="*70)
     print(f"Total steps: {global_step}")
     print(f"Total pairs tested: {len(pairs)}")
+    print(f"Pairs completed: {len(pairs) - len(skipped_pairs)}")
     print(f"Pairs skipped by supervisor: {len(skipped_pairs)}")
     print("="*70)
     
     # Print skipped pairs summary
     if skipped_pairs:
         print(f"\n{'='*70}")
-        print(f"SUPERVISOR SUMMARY: {len(skipped_pairs)} pairs skipped early")
+        print(f"SUPERVISOR INTERVENTION SUMMARY")
         print(f"{'='*70}")
+        print(f"{len(skipped_pairs)} pairs stopped early:\n")
+        
         for skip in skipped_pairs:
-            print(f"\n  {skip['pair']}:")
+            print(f"  {skip['pair']}:")
+            print(f"    Severity: {skip.get('severity', 'unknown').upper()}")
             print(f"    Reason: {skip['reason']}")
-            print(f"    Stopped at step: {skip['local_step_stopped']}")
-            print(f"    Final metrics: DD={skip['metrics']['drawdown']:.2%}, "
-                  f"Sharpe={skip['metrics']['sharpe']:.2f}, "
-                  f"WinRate={skip['metrics']['win_rate']:.2%}")
+            print(f"    Stopped at local step: {skip['local_step_stopped']}")
+            metrics = skip.get('metrics', {})
+            print(f"    Final metrics: DD={metrics.get('drawdown', 0):.2%}, "
+                  f"Sharpe={metrics.get('sharpe', 0):.2f}, "
+                  f"WinRate={metrics.get('win_rate', 0):.2%}\n")
+        print("="*70)
 
     return all_traces, skipped_pairs
 
