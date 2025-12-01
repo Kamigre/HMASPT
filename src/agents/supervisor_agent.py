@@ -204,33 +204,35 @@ class SupervisorAgent:
                 "metrics": {}
             }
         
-        # Calculate current metrics
-        returns = [t.get("daily_return", 0) for t in operator_traces]
-        pnls = [t.get("realized_pnl_this_step", 0) for t in operator_traces]
-        portfolio_values = [t.get("portfolio_value", 0) for t in operator_traces]
-        
+        # Filter out zero returns/pnls
+        filtered_traces = [t for t in operator_traces if t.get("daily_return", 0) != 0 and t.get("realized_pnl_this_step", 0) != 0]
+
+        returns = [t["daily_return"] for t in filtered_traces]
+        pnls = [t["realized_pnl_this_step"] for t in filtered_traces]
+        portfolio_values = [t.get("portfolio_value", 0) for t in operator_traces]  # keep full portfolio history for drawdown
+
         # Current state
         portfolio_value = portfolio_values[-1] if portfolio_values else 0
         max_portfolio_value = max(portfolio_values) if portfolio_values else 1
         max_dd = (max_portfolio_value - portfolio_value) / max(max_portfolio_value, 1e-8)
-        
+
         # Sharpe ratio
         rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-        excess_returns = np.array(returns) - rf_daily
         sharpe = 0.0
-        if len(excess_returns) > 1 and np.std(excess_returns, ddof=1) > 1e-8:
-            sharpe = (np.mean(excess_returns) / np.std(excess_returns, ddof=1)) * np.sqrt(252)
-        
+        if returns:
+            excess_returns = np.array(returns) - rf_daily
+            if len(excess_returns) > 1 and np.std(excess_returns, ddof=1) > 1e-8:
+                sharpe = (np.mean(excess_returns) / np.std(excess_returns, ddof=1)) * np.sqrt(252)
+
         # Win rate
-        positive_pnls = sum(1 for r in pnls if r > 0)
-        win_rate = positive_pnls / len(pnls) if pnls else 0
-        
+        win_rate = sum(1 for r in returns if r > 0) / len(returns) if returns else 0
+
         # Total P&L
         total_pnl = sum(pnls)
-        
+
         # Package metrics
         metrics = {
-            'n_observations': len(operator_traces),
+            'n_observations': len(filtered_traces),
             'drawdown': max_dd,
             'sharpe': sharpe,
             'win_rate': win_rate,
@@ -238,7 +240,7 @@ class SupervisorAgent:
             'portfolio_value': portfolio_value,
             'avg_return': np.mean(returns) if returns else 0
         }
-        
+
         # ============================================================
         # TIER 3: CRITICAL INTERVENTION - STOP
         # ============================================================
@@ -466,17 +468,20 @@ class SupervisorAgent:
             pnl = operator_traces[i].get("realized_pnl_this_step", 0)
             pv_prev = operator_traces[i-1].get("portfolio_value", None)
 
-            if pv_prev is None or pv_prev == 0:
+            if pv_prev is None or pv_prev == 0 or pnl == 0:
                 continue
             
             true_return = pnl / pv_prev
+            if true_return == 0:
+                continue  # skip zero returns entirely
+            
             all_returns.append(true_return)
             all_pnls.append(pnl)
 
-        # If only one step, fallback safely
+        # If no valid step, fallback safely
         if not all_returns:
-            all_returns = [0.0]
-            all_pnls = [0.0]
+            all_returns = []
+            all_pnls = []
 
         total_pnl = sum(all_pnls)
 
@@ -485,13 +490,13 @@ class SupervisorAgent:
 
         portfolio_cum_return = (final_pv - initial_pv) / initial_pv if initial_pv > 0 else 0.0
 
-        sharpe = self._calculate_sharpe(all_returns)
-        sortino = self._calculate_sortino(all_returns)
+        sharpe = self._calculate_sharpe(all_returns) if all_returns else 0.0
+        sortino = self._calculate_sortino(all_returns) if all_returns else 0.0
 
         # Risk metrics
         max_dd = max([t.get("max_drawdown", 0) for t in operator_traces] + [0])
         var_95 = float(np.percentile(all_returns, 5)) if all_returns else 0
-        cvar_95 = float(np.mean([r for r in all_returns if r <= var_95])) if any(r <= var_95 for r in all_returns) else var_95
+        cvar_95 = float(np.mean([r for r in all_returns if r <= var_95])) if all_returns and any(r <= var_95 for r in all_returns) else var_95
 
         # Win rate
         positive = sum(1 for r in all_returns if r > 0)
@@ -641,23 +646,25 @@ class SupervisorAgent:
     # ===================================================================
     
     def _calculate_sharpe(self, returns: List[float]) -> float:
-        """Calculate annualized Sharpe ratio."""
-        if len(returns) < 2:
-            return 0.0
-        
-        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-        excess = np.array(returns) - rf_daily
-        
-        mean_excess = np.mean(excess)
-        std_excess = np.std(excess, ddof=1)
-        
-        if std_excess < 1e-8:
-            return 0.0
-        
-        return (mean_excess / std_excess) * np.sqrt(252)
+
+      returns = [r for r in returns if r != 0]
+      if len(returns) < 2:
+          return 0.0
+      
+      rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
+      excess = np.array(returns) - rf_daily
+      
+      mean_excess = np.mean(excess)
+      std_excess = np.std(excess, ddof=1)
+      
+      if std_excess < 1e-8:
+          return 0.0
+      
+      return (mean_excess / std_excess) * np.sqrt(252)
 
     def _calculate_sortino(self, returns: List[float]) -> float:
-        """Calculate annualized Sortino ratio."""
+      
+        returns = [r for r in returns if r != 0]
         if len(returns) < 2:
             return 0.0
         
