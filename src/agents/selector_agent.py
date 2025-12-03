@@ -73,7 +73,7 @@ class OptimizedSelectorAgent:
     trace_path: str = "traces/selector.jsonl"
     corr_threshold: float = 0.7
     lookback_weeks: int = 4  # Rolling window for correlation (4 weeks)
-    holdout_years: int = 1
+    holdout_months: int = 18
     hidden_dim: int = 32
     num_heads: int = 2
     model: Any = None
@@ -189,9 +189,9 @@ class OptimizedSelectorAgent:
     def prepare_data(self, train_end_date: str = None):
 
         if train_end_date is None:
-            # Auto-split based on holdout_years
+            # Auto-split based on holdout_months
             last_date = self.df["date"].max()
-            train_end_date = last_date - pd.DateOffset(years=self.holdout_years)
+            train_end_date = last_date - pd.DateOffset(months=self.holdout_months)
         
         train_end = pd.to_datetime(train_end_date)
         
