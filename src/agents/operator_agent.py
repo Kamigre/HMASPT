@@ -287,7 +287,7 @@ class PairTradingEnv(gym.Env):
         reward = 10.0 * daily_return
         
         # Penalize drawdown
-        reward -= 5.0 * (drawdown ** 2)
+        reward -= 7.0 * (drawdown ** 2)
         
         # Small penalty for holding time (encourage mean reversion trading)
         if self.position != 0:
