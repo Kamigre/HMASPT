@@ -25,8 +25,8 @@ class PortfolioVisualizer:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
     
-    def visualize_pair(self, traces: List[Dict], pair_name: str, 
-                       was_skipped: bool = False, skip_info: Dict = None):
+   def visualize_pair(self, traces: List[Dict], pair_name: str, 
+                   was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair.
         
@@ -40,23 +40,27 @@ class PortfolioVisualizer:
             return
         
         # Extract data
-        steps = [t['local_step'] for t in traces]  # CHANGED: use local_step for per-pair view
+        steps = [t['local_step'] for t in traces]
         pnls = [t['realized_pnl_this_step'] for t in traces]
         returns = [t['daily_return'] for t in traces]
         cum_return = [t['cum_return'] for t in traces]
         positions = [t['position'] for t in traces]
         drawdowns = [t['max_drawdown'] for t in traces]
         
-        # Calculate metrics
-        sharpe = self._calculate_sharpe(returns)
-        sortino = self._calculate_sortino(returns)
+        # Filter only trades (non-zero returns) for statistics
+        trade_returns = [r for r in returns if r != 0]
+        trade_pnls = [p for p in pnls if p != 0]
+        
+        # Calculate metrics using only trades
+        sharpe = self._calculate_sharpe(trade_returns) if trade_returns else 0.0
+        sortino = self._calculate_sortino(trade_returns) if trade_returns else 0.0
         total_pnl = sum(pnls)
         final_return = cum_return[-1] * 100 if cum_return else 0
         max_dd = max(drawdowns) if drawdowns else 0
         
-        # Win rate calculation (fixed)
-        positive_returns = sum(1 for r in returns if r > 0)
-        win_rate = positive_returns / len(returns) if returns else 0
+        # Win rate calculation using only trades
+        positive_returns = sum(1 for r in trade_returns if r > 0)
+        win_rate = positive_returns / len(trade_returns) if trade_returns else 0
         
         # Create figure with subplots
         fig = plt.figure(figsize=(16, 12))
@@ -69,22 +73,24 @@ class PortfolioVisualizer:
         fig.suptitle(title, fontsize=16, fontweight='bold', 
                      color='red' if was_skipped else 'black')
         
-        # 1. Cumulative Returns
+        # 1. Price Performance (was Cumulative Returns)
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(steps, np.array(cum_return) * 100, linewidth=2, color='darkblue')
-        ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
-        ax1.fill_between(steps, 0, np.array(cum_return) * 100, 
+        # Convert cumulative return to price performance starting at 100
+        price_performance = 100 * (1 + np.array(cum_return))
+        ax1.plot(steps, price_performance, linewidth=2, color='darkblue')
+        ax1.axhline(100, color='black', linestyle='--', alpha=0.3, label='Starting Value')
+        ax1.fill_between(steps, 100, price_performance, 
                          alpha=0.3, color='blue' if final_return > 0 else 'red')
         
         if was_skipped and skip_info:
             skip_local_step = skip_info.get('local_step_stopped', steps[-1])
             ax1.axvline(skip_local_step, color='red', linestyle='--', linewidth=2, 
                        label=f'Supervisor Stop: {skip_info.get("reason", "")}')
-            ax1.legend(loc='upper left')
         
-        ax1.set_title(f'Cumulative Return: {final_return:.2f}%', fontsize=12, fontweight='bold')
+        ax1.legend(loc='upper left')
+        ax1.set_title(f'Final Price Performance: {final_return:.2f}%', fontsize=12, fontweight='bold')
         ax1.set_xlabel('Step')
-        ax1.set_ylabel('Cumulative Return (%)')
+        ax1.set_ylabel('Portfolio Value (Base 100)')
         ax1.grid(True, alpha=0.3)
         
         # 2. Drawdown
@@ -98,10 +104,11 @@ class PortfolioVisualizer:
         ax2.grid(True, alpha=0.3)
         ax2.invert_yaxis()
         
-        # 3. Daily P&L
+        # 3. Daily P&L (thicker bars)
         ax3 = fig.add_subplot(gs[1, 1])
         colors = ['green' if p > 0 else 'red' for p in pnls]
-        ax3.bar(steps, pnls, color=colors, alpha=0.6)
+        bar_width = max(1.0, len(steps) / 100)  # Adaptive width
+        ax3.bar(steps, pnls, color=colors, alpha=0.6, width=bar_width)
         ax3.axhline(0, color='black', linestyle='-', linewidth=0.5)
         ax3.set_title(f'Daily P&L (Total: ${total_pnl:.2f})', fontsize=11, fontweight='bold')
         ax3.set_xlabel('Step')
@@ -118,55 +125,75 @@ class PortfolioVisualizer:
         ax4.set_ylabel('Position Size')
         ax4.grid(True, alpha=0.3)
         
-        # 5. Returns Distribution
+        # 5. Returns Distribution (only trades)
         ax5 = fig.add_subplot(gs[2, 0])
-        ax5.hist(returns, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
-        ax5.axvline(np.mean(returns), color='red', linestyle='--', 
-                   linewidth=2, label=f'Mean: {np.mean(returns):.4f}')
-        ax5.axvline(np.median(returns), color='orange', linestyle='--', 
-                   linewidth=2, label=f'Median: {np.median(returns):.4f}')
-        ax5.set_title('Returns Distribution', fontsize=11, fontweight='bold')
+        if trade_returns:
+            ax5.hist(trade_returns, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+            ax5.axvline(np.mean(trade_returns), color='red', linestyle='--', 
+                       linewidth=2, label=f'Mean: {np.mean(trade_returns):.4f}')
+            ax5.axvline(np.median(trade_returns), color='orange', linestyle='--', 
+                       linewidth=2, label=f'Median: {np.median(trade_returns):.4f}')
+            ax5.legend()
+        ax5.set_title('Trade Returns Distribution (Non-Zero Only)', fontsize=11, fontweight='bold')
         ax5.set_xlabel('Return')
         ax5.set_ylabel('Frequency')
-        ax5.legend()
         ax5.grid(True, alpha=0.3)
         
-        # 6. Rolling Sharpe (30-step window)
+        # 6. Point-wise Sharpe (per trade, not rolling window)
         ax6 = fig.add_subplot(gs[2, 1])
-        if len(returns) > 30:
-            rolling_sharpe = pd.Series(returns).rolling(30).apply(
-                lambda x: self._calculate_sharpe(x.tolist())
-            )
-            ax6.plot(steps, rolling_sharpe, linewidth=2, color='darkgreen')
+        if len(trade_returns) > 1:
+            # Calculate cumulative Sharpe at each trade
+            rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
+            cumulative_sharpe = []
+            for i in range(2, len(trade_returns) + 1):
+                subset = trade_returns[:i]
+                sharpe_i = self._calculate_sharpe(subset)
+                cumulative_sharpe.append(sharpe_i)
+            
+            trade_steps = [i for i, r in enumerate(returns) if r != 0][1:]  # Skip first trade
+            
+            ax6.plot(trade_steps, cumulative_sharpe, linewidth=2, color='darkgreen', 
+                    marker='o', markersize=3)
             ax6.axhline(0, color='black', linestyle='--', alpha=0.3)
             ax6.axhline(1, color='green', linestyle=':', alpha=0.5, label='Good (>1)')
             ax6.axhline(-1, color='red', linestyle=':', alpha=0.5, label='Poor (<-1)')
-            ax6.set_title(f'Rolling Sharpe (30-step)', fontsize=11, fontweight='bold')
+            ax6.set_title(f'Cumulative Sharpe (Per Trade)', fontsize=11, fontweight='bold')
             ax6.set_xlabel('Step')
             ax6.set_ylabel('Sharpe Ratio')
             ax6.legend()
             ax6.grid(True, alpha=0.3)
         
-        # 7. Win Rate Over Time
+        # 7. Point-wise Win Rate (per trade)
         ax7 = fig.add_subplot(gs[2, 2])
-        window = 20
-        rolling_wr = pd.Series([1 if r > 0 else 0 for r in returns]).rolling(window).mean()
-        ax7.plot(steps, rolling_wr * 100, linewidth=2, color='teal')
-        ax7.axhline(50, color='black', linestyle='--', alpha=0.3, label='50%')
-        ax7.fill_between(steps, 50, rolling_wr * 100, 
-                         alpha=0.3, color='green', where=(rolling_wr * 100 > 50))
-        ax7.fill_between(steps, 50, rolling_wr * 100, 
-                         alpha=0.3, color='red', where=(rolling_wr * 100 <= 50))
-        ax7.set_title(f'Rolling Win Rate ({window}-step)', fontsize=11, fontweight='bold')
-        ax7.set_xlabel('Step')
-        ax7.set_ylabel('Win Rate (%)')
-        ax7.legend()
-        ax7.grid(True, alpha=0.3)
-        ax7.set_ylim([0, 100])
+        if trade_returns:
+            # Calculate cumulative win rate at each trade
+            cumulative_wr = []
+            for i in range(1, len(trade_returns) + 1):
+                subset = trade_returns[:i]
+                wr_i = sum(1 for r in subset if r > 0) / len(subset)
+                cumulative_wr.append(wr_i * 100)
+            
+            trade_steps = [i for i, r in enumerate(returns) if r != 0]
+            
+            ax7.plot(trade_steps, cumulative_wr, linewidth=2, color='teal', 
+                    marker='o', markersize=3)
+            ax7.axhline(50, color='black', linestyle='--', alpha=0.3, label='50%')
+            ax7.fill_between(trade_steps, 50, cumulative_wr, 
+                             alpha=0.3, color='green', where=(np.array(cumulative_wr) > 50))
+            ax7.fill_between(trade_steps, 50, cumulative_wr, 
+                             alpha=0.3, color='red', where=(np.array(cumulative_wr) <= 50))
+            ax7.set_title(f'Cumulative Win Rate (Per Trade)', fontsize=11, fontweight='bold')
+            ax7.set_xlabel('Step')
+            ax7.set_ylabel('Win Rate (%)')
+            ax7.legend()
+            ax7.grid(True, alpha=0.3)
+            ax7.set_ylim([0, 100])
         
         # 8. Metrics Summary Table
         ax8 = fig.add_subplot(gs[3, :])
         ax8.axis('off')
+        
+        avg_trade_return = np.mean(trade_returns) if trade_returns else 0
         
         metrics_data = [
             ['Metric', 'Value', 'Status'],
@@ -177,7 +204,8 @@ class PortfolioVisualizer:
             ['Max Drawdown', f'{max_dd*100:.2f}%', '✓' if max_dd < 0.15 else '✗'],
             ['Win Rate', f'{win_rate*100:.1f}%', '✓' if win_rate > 0.5 else '✗'],
             ['Total Steps', f'{len(traces)}', '—'],
-            ['Avg Return/Step', f'{np.mean(returns):.5f}', '—'],
+            ['Total Trades', f'{len(trade_returns)}', '—'],
+            ['Avg Return/Trade', f'{avg_trade_return:.5f}', '—'],
         ]
         
         if was_skipped and skip_info:
@@ -242,26 +270,48 @@ class PortfolioVisualizer:
         
         fig.suptitle('Portfolio Aggregate Analysis', fontsize=18, fontweight='bold')
         
-        # 1. Portfolio Cumulative P&L
+        # 1. Portfolio Cumulative P&L - USE LOCAL STEPS PER PAIR
         ax1 = fig.add_subplot(gs[0, :])
-        portfolio_cum_pnl = np.cumsum([t['realized_pnl_this_step'] for t in all_traces])
-        steps = list(range(len(all_traces)))
-        ax1.plot(steps, portfolio_cum_pnl, linewidth=2.5, color='darkblue', label='Portfolio P&L')
-        ax1.fill_between(steps, 0, portfolio_cum_pnl, alpha=0.3, color='blue')
+        
+        # Reconstruct portfolio timeline using local steps
+        # Concatenate all pairs in sequence
+        cumulative_pnl_series = []
+        step_labels = []
+        current_global_step = 0
+        
+        for pair_name in sorted(traces_by_pair.keys()):
+            pair_traces = traces_by_pair[pair_name]
+            pair_pnls = [t['realized_pnl_this_step'] for t in pair_traces]
+            pair_cum_pnl = np.cumsum(pair_pnls)
+            
+            # Offset by previous cumulative value
+            if cumulative_pnl_series:
+                offset = cumulative_pnl_series[-1]
+                pair_cum_pnl = pair_cum_pnl + offset
+            
+            cumulative_pnl_series.extend(pair_cum_pnl.tolist())
+            step_labels.extend(range(current_global_step, current_global_step + len(pair_traces)))
+            current_global_step += len(pair_traces)
+        
+        ax1.plot(step_labels, cumulative_pnl_series, linewidth=2.5, color='darkblue', 
+                 label='Portfolio P&L')
+        ax1.fill_between(step_labels, 0, cumulative_pnl_series, alpha=0.3, color='blue')
         ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
         
         # Mark supervisor interventions
-        for skip in skipped_pairs:
-            skip_traces = traces_by_pair.get(skip['pair'], [])
-            if skip_traces:
-                skip_step = skip_traces[-1]['step']
+        current_step = 0
+        for pair_name in sorted(traces_by_pair.keys()):
+            pair_traces = traces_by_pair[pair_name]
+            if any(skip['pair'] == pair_name for skip in skipped_pairs):
+                skip_step = current_step + len(pair_traces)
                 ax1.axvline(skip_step, color='red', linestyle=':', alpha=0.5)
+            current_step += len(pair_traces)
         
         ax1.set_title(f"Portfolio P&L: ${metrics['total_pnl']:.2f} | "
                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
                      f"Sortino: {metrics['sortino_ratio']:.2f}",
                      fontsize=13, fontweight='bold')
-        ax1.set_xlabel('Global Step')
+        ax1.set_xlabel('Concatenated Step (All Pairs)')
         ax1.set_ylabel('Cumulative P&L ($)')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
@@ -305,7 +355,7 @@ class PortfolioVisualizer:
             ['', ''],
             ['Performance', ''],
             ['Win Rate', f"{metrics['win_rate']*100:.1f}%"],
-            ['Avg Return', f"{metrics['avg_return']:.5f}"],
+            ['Avg Return/Trade', f"{metrics['avg_return']:.5f}"],
             ['Pairs Traded', f"{metrics['n_pairs']}"],
             ['Pairs Stopped', f"{len(skipped_pairs)}"],
         ]
@@ -362,17 +412,21 @@ class PortfolioVisualizer:
         ax6.legend(fontsize=8)
         ax6.grid(True, alpha=0.3, axis='x')
         
-        # 7. Portfolio Returns Distribution
+        # 7. Portfolio Returns Distribution (ONLY TRADES - NON-ZERO)
         ax7 = fig.add_subplot(gs[3, 0])
-        all_returns = [t['daily_return'] for t in all_traces]
-        ax7.hist(all_returns, bins=60, alpha=0.7, color='steelblue', edgecolor='black')
-        ax7.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
-        ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', 
-                   linewidth=2, label=f'Mean: {np.mean(all_returns):.5f}')
-        ax7.set_title('Portfolio Returns Distribution', fontsize=11, fontweight='bold')
+        all_returns = [t['daily_return'] for t in all_traces if t['daily_return'] != 0]
+        
+        if all_returns:
+            ax7.hist(all_returns, bins=60, alpha=0.7, color='steelblue', edgecolor='black')
+            ax7.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
+            ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', 
+                       linewidth=2, label=f'Mean: {np.mean(all_returns):.5f}')
+            ax7.legend()
+        
+        ax7.set_title('Portfolio Trade Returns Distribution (Non-Zero Only)', 
+                      fontsize=11, fontweight='bold')
         ax7.set_xlabel('Return')
         ax7.set_ylabel('Frequency')
-        ax7.legend()
         ax7.grid(True, alpha=0.3)
         
         # 8. Sharpe vs Return Scatter
@@ -395,7 +449,15 @@ class PortfolioVisualizer:
         # 9. Supervisor Interventions Timeline
         ax9 = fig.add_subplot(gs[3, 2])
         if skipped_pairs:
-            skip_steps = [skip['step_stopped'] for skip in skipped_pairs]
+            # Use concatenated step positions
+            skip_steps = []
+            current_step = 0
+            for pair_name in sorted(traces_by_pair.keys()):
+                pair_traces = traces_by_pair[pair_name]
+                if any(skip['pair'] == pair_name for skip in skipped_pairs):
+                    skip_steps.append(current_step + len(pair_traces))
+                current_step += len(pair_traces)
+            
             skip_names = [skip['pair'].split('-')[0][:4] for skip in skipped_pairs]
             skip_severities = [skip.get('severity', 'unknown') for skip in skipped_pairs]
             
@@ -406,7 +468,7 @@ class PortfolioVisualizer:
             for i, (step, name) in enumerate(zip(skip_steps, skip_names)):
                 ax9.text(step, i, f' {name}', va='center', fontsize=9)
             ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
-            ax9.set_xlabel('Global Step')
+            ax9.set_xlabel('Concatenated Step')
             ax9.set_yticks([])
             ax9.grid(True, alpha=0.3, axis='x')
         else:
@@ -423,7 +485,7 @@ class PortfolioVisualizer:
             • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
             • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
             • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
-
+    
             SUPERVISOR ACTIONS:
             """
         
