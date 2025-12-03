@@ -187,7 +187,7 @@ class OptimizedSelectorAgent:
         return df
     
     def prepare_data(self, train_end_date: str = None):
-    
+
         if train_end_date is None:
             # Auto-split based on holdout_months
             last_date = self.df["date"].max()
@@ -205,19 +205,15 @@ class OptimizedSelectorAgent:
         self.tickers = sorted(df["ticker"].unique())
         self.ticker_to_idx = {t: i for i, t in enumerate(self.tickers)}
         
-        # -----------------------------------------------------
-        # FIXED SPLIT LOGIC: TEST = last 12 months, 
-        #                    VALIDATION = 6 months before test
-        # -----------------------------------------------------
+        # Calculate split dates
         last_date = df["date"].max()
+        holdout_start = train_end
+        mid_point = holdout_start + (last_date - holdout_start) / 2
         
-        # Test: last 12 months
+        val_start = holdout_start
+        val_end = mid_point
+        test_start = mid_point
         test_end = last_date
-        test_start = last_date - pd.DateOffset(months=12)
-        
-        # Validation: previous 6 months
-        val_end = test_start
-        val_start = test_start - pd.DateOffset(months=6)
         
         self.val_period = (val_start, val_end)
         self.test_period = (test_start, test_end)
@@ -227,7 +223,6 @@ class OptimizedSelectorAgent:
         self.val_df = df[(df["date"] >= val_start) & (df["date"] < val_end)].copy()
         self.test_df = df[df["date"] >= test_start].copy()
         
-        # Logging
         self._log_event("data_prepared", {
             "n_tickers": len(self.tickers),
             "train_samples": len(self.train_df),
