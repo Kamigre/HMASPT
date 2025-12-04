@@ -25,7 +25,7 @@ class PortfolioVisualizer:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
     
-   def visualize_pair(self, traces: List[Dict], pair_name: str, 
+    def visualize_pair(self, traces: List[Dict], pair_name: str, 
                    was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair.
