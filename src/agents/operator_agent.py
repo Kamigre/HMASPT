@@ -287,11 +287,11 @@ class PairTradingEnv(gym.Env):
         reward = 10.0 * daily_return
         
         # Penalize drawdown
-        reward -= 7.0 * (drawdown ** 2)
+        reward -= 5.0 * (drawdown ** 2)
         
         # Small penalty for holding time (encourage mean reversion trading)
         if self.position != 0:
-            reward -= 0.01 * self.days_in_position
+            reward -= 0.00 * self.days_in_position
         
         # Bonus for realized profits
         if realized_pnl_this_step > 0:
@@ -639,7 +639,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 decision = supervisor.check_operator_performance(
                     episode_traces, 
                     pair,
-                    phase="holdout"  # <-- ADDED THIS
+                    phase="holdout"
                 )
                 
                 if decision["action"] == "stop":
