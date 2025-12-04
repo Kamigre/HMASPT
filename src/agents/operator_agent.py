@@ -392,7 +392,7 @@ class OperatorAgent:
         print(f"Training pair: {x} - {y}")
         print(f"  Data length: {len(series_x)} days")
         print(f"  Timesteps: {timesteps:,}")
-        print(f"  Position scale: 10x")
+        print(f"  Position scale: 100x")
         print(f"{'='*70}")
 
         print("\n🚀 Training with standard approach (no costs)...")
