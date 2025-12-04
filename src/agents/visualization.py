@@ -16,7 +16,6 @@ sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (15, 10)
 plt.rcParams['font.size'] = 10
 
-
 class PortfolioVisualizer:
     """Creates visual reports for pairs trading performance."""
     
@@ -25,8 +24,7 @@ class PortfolioVisualizer:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
     
-    def visualize_pair(self, traces: List[Dict], pair_name: str, 
-                   was_skipped: bool = False, skip_info: Dict = None):
+    def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair.
         
@@ -46,6 +44,9 @@ class PortfolioVisualizer:
         cum_return = [t['cum_return'] for t in traces]
         positions = [t['position'] for t in traces]
         drawdowns = [t['max_drawdown'] for t in traces]
+        
+        # Get num_trades from last trace
+        num_trades = traces[-1].get('num_trades', len([r for r in returns if r != 0]))
         
         # Filter only trades (non-zero returns) for statistics
         trade_returns = [r for r in returns if r != 0]
@@ -71,7 +72,7 @@ class PortfolioVisualizer:
         if was_skipped:
             title += f" ⛔ STOPPED BY SUPERVISOR"
         fig.suptitle(title, fontsize=16, fontweight='bold', 
-                     color='red' if was_skipped else 'black')
+                    color='red' if was_skipped else 'black')
         
         # 1. Price Performance (was Cumulative Returns)
         ax1 = fig.add_subplot(gs[0, :])
@@ -79,24 +80,24 @@ class PortfolioVisualizer:
         price_performance = 100 * (1 + np.array(cum_return))
         ax1.plot(steps, price_performance, linewidth=2, color='darkblue')
         ax1.axhline(100, color='black', linestyle='--', alpha=0.3, label='Starting Value')
-        ax1.fill_between(steps, 100, price_performance, 
-                         alpha=0.3, color='blue' if final_return > 0 else 'red')
+        ax1.fill_between(steps, 100, price_performance, alpha=0.3, 
+                         color='blue' if final_return > 0 else 'red')
         
         if was_skipped and skip_info:
             skip_local_step = skip_info.get('local_step_stopped', steps[-1])
-            ax1.axvline(skip_local_step, color='red', linestyle='--', linewidth=2, 
+            ax1.axvline(skip_local_step, color='red', linestyle='--', linewidth=2,
                        label=f'Supervisor Stop: {skip_info.get("reason", "")}')
+            ax1.legend(loc='upper left')
         
-        ax1.legend(loc='upper left')
-        ax1.set_title(f'Final Price Performance: {final_return:.2f}%', fontsize=12, fontweight='bold')
+        ax1.set_title(f'Final Price Performance: {final_return:.2f}%', 
+                     fontsize=12, fontweight='bold')
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Portfolio Value (Base 100)')
         ax1.grid(True, alpha=0.3)
         
         # 2. Drawdown
         ax2 = fig.add_subplot(gs[1, 0])
-        ax2.fill_between(steps, 0, np.array(drawdowns) * 100, 
-                         alpha=0.5, color='red')
+        ax2.fill_between(steps, 0, np.array(drawdowns) * 100, alpha=0.5, color='red')
         ax2.plot(steps, np.array(drawdowns) * 100, linewidth=2, color='darkred')
         ax2.set_title(f'Drawdown (Max: {max_dd*100:.2f}%)', fontsize=11, fontweight='bold')
         ax2.set_xlabel('Step')
@@ -129,10 +130,10 @@ class PortfolioVisualizer:
         ax5 = fig.add_subplot(gs[2, 0])
         if trade_returns:
             ax5.hist(trade_returns, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
-            ax5.axvline(np.mean(trade_returns), color='red', linestyle='--', 
-                       linewidth=2, label=f'Mean: {np.mean(trade_returns):.4f}')
-            ax5.axvline(np.median(trade_returns), color='orange', linestyle='--', 
-                       linewidth=2, label=f'Median: {np.median(trade_returns):.4f}')
+            ax5.axvline(np.mean(trade_returns), color='red', linestyle='--', linewidth=2,
+                       label=f'Mean: {np.mean(trade_returns):.2f}%')
+            ax5.axvline(np.median(trade_returns), color='orange', linestyle='--', linewidth=2,
+                       label=f'Median: {np.median(trade_returns):.2f}%')
             ax5.legend()
         ax5.set_title('Trade Returns Distribution (Non-Zero Only)', fontsize=11, fontweight='bold')
         ax5.set_xlabel('Return')
@@ -151,7 +152,6 @@ class PortfolioVisualizer:
                 cumulative_sharpe.append(sharpe_i)
             
             trade_steps = [i for i, r in enumerate(returns) if r != 0][1:]  # Skip first trade
-            
             ax6.plot(trade_steps, cumulative_sharpe, linewidth=2, color='darkgreen', 
                     marker='o', markersize=3)
             ax6.axhline(0, color='black', linestyle='--', alpha=0.3)
@@ -174,14 +174,12 @@ class PortfolioVisualizer:
                 cumulative_wr.append(wr_i * 100)
             
             trade_steps = [i for i, r in enumerate(returns) if r != 0]
-            
-            ax7.plot(trade_steps, cumulative_wr, linewidth=2, color='teal', 
-                    marker='o', markersize=3)
+            ax7.plot(trade_steps, cumulative_wr, linewidth=2, color='teal', marker='o', markersize=3)
             ax7.axhline(50, color='black', linestyle='--', alpha=0.3, label='50%')
-            ax7.fill_between(trade_steps, 50, cumulative_wr, 
-                             alpha=0.3, color='green', where=(np.array(cumulative_wr) > 50))
-            ax7.fill_between(trade_steps, 50, cumulative_wr, 
-                             alpha=0.3, color='red', where=(np.array(cumulative_wr) <= 50))
+            ax7.fill_between(trade_steps, 50, cumulative_wr, alpha=0.3, color='green',
+                           where=(np.array(cumulative_wr) > 50))
+            ax7.fill_between(trade_steps, 50, cumulative_wr, alpha=0.3, color='red',
+                           where=(np.array(cumulative_wr) <= 50))
             ax7.set_title(f'Cumulative Win Rate (Per Trade)', fontsize=11, fontweight='bold')
             ax7.set_xlabel('Step')
             ax7.set_ylabel('Win Rate (%)')
@@ -204,8 +202,8 @@ class PortfolioVisualizer:
             ['Max Drawdown', f'{max_dd*100:.2f}%', '✓' if max_dd < 0.15 else '✗'],
             ['Win Rate', f'{win_rate*100:.1f}%', '✓' if win_rate > 0.5 else '✗'],
             ['Total Steps', f'{len(traces)}', '—'],
-            ['Total Trades', f'{len(trade_returns)}', '—'],
-            ['Avg Return/Trade', f'{avg_trade_return:.5f}', '—'],
+            ['Total Trades', f'{num_trades}', '—'],  # Use num_trades from trace
+            ['Avg Return/Trade', f'{avg_trade_return:.2f}%', '—'],
         ]
         
         if was_skipped and skip_info:
@@ -214,7 +212,7 @@ class PortfolioVisualizer:
             severity = skip_info.get('severity', 'unknown').upper()
             metrics_data.append(['Severity', severity, '🔴' if severity == 'CRITICAL' else '🟡'])
         
-        table = ax8.table(cellText=metrics_data, cellLoc='left', 
+        table = ax8.table(cellText=metrics_data, cellLoc='left',
                          colWidths=[0.3, 0.3, 0.1],
                          loc='center', bbox=[0.1, 0.0, 0.8, 1.0])
         table.auto_set_font_size(False)
@@ -243,9 +241,8 @@ class PortfolioVisualizer:
         
         print(f"  📊 Saved pair analysis: {filepath}")
     
-    def visualize_portfolio(self, all_traces: List[Dict], 
-                           skipped_pairs: List[Dict],
-                           final_summary: Dict):
+    def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], 
+                          final_summary: Dict):
         """
         Create portfolio-level aggregate visualization.
         
@@ -267,7 +264,6 @@ class PortfolioVisualizer:
         # Create figure
         fig = plt.figure(figsize=(18, 14))
         gs = fig.add_gridspec(5, 3, hspace=0.35, wspace=0.3)
-        
         fig.suptitle('Portfolio Aggregate Analysis', fontsize=18, fontweight='bold')
         
         # 1. Portfolio Price Performance (Base 100) - AGGREGATE BY STEP
@@ -290,23 +286,25 @@ class PortfolioVisualizer:
         # Convert to price performance (base 100)
         cum_returns = np.cumprod([1 + r for r in avg_returns])
         price_performance = 100 * cum_returns
-        
         final_performance = ((price_performance[-1] / 100) - 1) * 100 if len(price_performance) > 0 else 0
         
-        ax1.plot(sorted_steps, price_performance, linewidth=2.5, color='darkblue', label='Portfolio Value')
-        ax1.axhline(100, color='black', linestyle='--', alpha=0.3, label='Starting Value (100)')
-        ax1.fill_between(sorted_steps, 100, price_performance, 
-                        alpha=0.3, color='blue' if final_performance > 0 else 'red')
+        # Count total portfolio steps (matches the graph)
+        total_portfolio_steps = len(sorted_steps)
         
+        ax1.plot(sorted_steps, price_performance, linewidth=2.5, color='darkblue', 
+                label='Portfolio Value')
+        ax1.axhline(100, color='black', linestyle='--', alpha=0.3, label='Starting Value (100)')
+        ax1.fill_between(sorted_steps, 100, price_performance, alpha=0.3,
+                        color='blue' if final_performance > 0 else 'red')
         ax1.set_title(f"Portfolio Price Performance: {final_performance:.2f}% | "
-                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
-                      f"Sortino: {metrics['sortino_ratio']:.2f}",
-                      fontsize=13, fontweight='bold')
+                     f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
+                     f"Sortino: {metrics['sortino_ratio']:.2f}",
+                     fontsize=13, fontweight='bold')
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Portfolio Value (Base 100)')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
-                
+        
         # 2. Per-Pair Performance Comparison
         ax2 = fig.add_subplot(gs[1, :2])
         pair_summaries = metrics['pair_summaries']
@@ -368,8 +366,7 @@ class PortfolioVisualizer:
         # 4. Sharpe Ratio by Pair
         ax4 = fig.add_subplot(gs[2, 0])
         pair_sharpes = [p['sharpe'] for p in pair_summaries]
-        colors_sharpe = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' 
-                        for s in pair_sharpes]
+        colors_sharpe = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' for s in pair_sharpes]
         ax4.barh(pair_names, pair_sharpes, color=colors_sharpe, alpha=0.7)
         ax4.axvline(0, color='black', linestyle='-', linewidth=1)
         ax4.axvline(0.5, color='green', linestyle='--', alpha=0.3, label='Good (>0.5)')
@@ -381,8 +378,7 @@ class PortfolioVisualizer:
         # 5. Sortino Ratio by Pair
         ax5 = fig.add_subplot(gs[2, 1])
         pair_sortinos = [p['sortino'] for p in pair_summaries]
-        colors_sortino = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' 
-                         for s in pair_sortinos]
+        colors_sortino = ['green' if s > 0.5 else 'red' if s < 0 else 'orange' for s in pair_sortinos]
         ax5.barh(pair_names, pair_sortinos, color=colors_sortino, alpha=0.7)
         ax5.axvline(0, color='black', linestyle='-', linewidth=1)
         ax5.axvline(0.5, color='green', linestyle='--', alpha=0.3, label='Good (>0.5)')
@@ -394,8 +390,7 @@ class PortfolioVisualizer:
         # 6. Max Drawdown by Pair
         ax6 = fig.add_subplot(gs[2, 2])
         pair_dds = [p['max_drawdown'] * 100 for p in pair_summaries]
-        colors_dd = ['red' if dd > 15 else 'orange' if dd > 10 else 'green' 
-                    for dd in pair_dds]
+        colors_dd = ['red' if dd > 15 else 'orange' if dd > 10 else 'green' for dd in pair_dds]
         ax6.barh(pair_names, pair_dds, color=colors_dd, alpha=0.7)
         ax6.axvline(15, color='red', linestyle='--', alpha=0.3, label='Risk Limit')
         ax6.set_title('Max Drawdown by Pair (%)', fontsize=11, fontweight='bold')
@@ -406,16 +401,14 @@ class PortfolioVisualizer:
         # 7. Portfolio Returns Distribution (ONLY TRADES - NON-ZERO)
         ax7 = fig.add_subplot(gs[3, 0])
         all_returns = [t['daily_return'] for t in all_traces if t['daily_return'] != 0]
-        
         if all_returns:
             ax7.hist(all_returns, bins=60, alpha=0.7, color='steelblue', edgecolor='black')
             ax7.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
-            ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', 
-                       linewidth=2, label=f'Mean: {np.mean(all_returns):.5f}')
+            ax7.axvline(np.mean(all_returns), color='orange', linestyle='--', linewidth=2,
+                       label=f'Mean: {np.mean(all_returns):.5f}')
             ax7.legend()
-        
         ax7.set_title('Portfolio Trade Returns Distribution (Non-Zero Only)', 
-                      fontsize=11, fontweight='bold')
+                     fontsize=11, fontweight='bold')
         ax7.set_xlabel('Return')
         ax7.set_ylabel('Frequency')
         ax7.grid(True, alpha=0.3)
@@ -425,7 +418,6 @@ class PortfolioVisualizer:
         for pair_summary in pair_summaries:
             sharpe = pair_summary['sharpe']
             final_ret = pair_summary['cum_return'] * 100
-            
             color = 'orange' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'blue'
             marker = 'X' if any(s['pair'] == pair_summary['pair'] for s in skipped_pairs) else 'o'
             ax8.scatter(sharpe, final_ret, s=100, alpha=0.6, color=color, marker=marker)
@@ -451,19 +443,19 @@ class PortfolioVisualizer:
             
             skip_names = [skip['pair'].split('-')[0][:4] for skip in skipped_pairs]
             skip_severities = [skip.get('severity', 'unknown') for skip in skipped_pairs]
-            
             colors_severity = ['red' if s == 'critical' else 'orange' for s in skip_severities]
             
-            ax9.scatter(skip_steps, range(len(skip_steps)), s=200, 
-                       c=colors_severity, marker='X', alpha=0.7)
+            ax9.scatter(skip_steps, range(len(skip_steps)), s=200, c=colors_severity, 
+                       marker='X', alpha=0.7)
             for i, (step, name) in enumerate(zip(skip_steps, skip_names)):
                 ax9.text(step, i, f' {name}', va='center', fontsize=9)
+            
             ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
             ax9.set_xlabel('Concatenated Step')
             ax9.set_yticks([])
             ax9.grid(True, alpha=0.3, axis='x')
         else:
-            ax9.text(0.5, 0.5, 'No Interventions', ha='center', va='center',
+            ax9.text(0.5, 0.5, 'No Interventions', ha='center', va='center', 
                     fontsize=14, transform=ax9.transAxes)
             ax9.set_title('Supervisor Interventions', fontsize=11, fontweight='bold')
             ax9.axis('off')
@@ -473,13 +465,12 @@ class PortfolioVisualizer:
         ax10.axis('off')
         
         summary_text = f"""PORTFOLIO SUMMARY:
-            • Total P&L: ${metrics['total_pnl']:.2f}  |  Sharpe: {metrics['sharpe_ratio']:.2f}  |  Sortino: {metrics['sortino_ratio']:.2f}
-            • Win Rate: {metrics['win_rate']*100:.1f}%  |  Max Drawdown: {metrics['max_drawdown']*100:.2f}%  |  Total Steps: {metrics['total_steps']}
-            • Pairs Traded: {metrics['n_pairs']}  |  Pairs Stopped by Supervisor: {len(skipped_pairs)}
-    
-            SUPERVISOR ACTIONS:
-            """
-        
+                        • Total P&L: ${metrics['total_pnl']:.2f} | Sharpe: {metrics['sharpe_ratio']:.2f} | Sortino: {metrics['sortino_ratio']:.2f}
+                        • Win Rate: {metrics['win_rate']*100:.1f}% | Max Drawdown: {metrics['max_drawdown']*100:.2f}% | Total Steps: {total_portfolio_steps}
+                        • Pairs Traded: {metrics['n_pairs']} | Pairs Stopped by Supervisor: {len(skipped_pairs)}
+                        
+                        SUPERVISOR ACTIONS:
+                        """
         if final_summary['actions']:
             for action in final_summary['actions']:
                 severity_symbol = "🔴" if action.get('severity') == 'high' else "🟡"
@@ -502,12 +493,15 @@ class PortfolioVisualizer:
         """Calculate Sharpe ratio using CONFIG risk-free rate."""
         if len(returns) < 2:
             return 0.0
+        
         rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess = np.array(returns) - rf_daily
         mean_excess = np.mean(excess)
         std_excess = np.std(excess, ddof=1)
+        
         if std_excess < 1e-8:
             return 0.0
+        
         return (mean_excess / std_excess) * np.sqrt(252)
     
     def _calculate_sortino(self, returns: List[float]) -> float:
