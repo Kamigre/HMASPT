@@ -270,52 +270,43 @@ class PortfolioVisualizer:
         
         fig.suptitle('Portfolio Aggregate Analysis', fontsize=18, fontweight='bold')
         
-        # 1. Portfolio Cumulative P&L - USE LOCAL STEPS PER PAIR
+        # 1. Portfolio Price Performance (Base 100) - AGGREGATE BY STEP
         ax1 = fig.add_subplot(gs[0, :])
         
-        # Reconstruct portfolio timeline using local steps
-        # Concatenate all pairs in sequence
-        cumulative_pnl_series = []
-        step_labels = []
-        current_global_step = 0
+        # Aggregate returns by step across all pairs
+        step_returns = {}  # step -> list of returns
+        for pair_name, pair_traces in traces_by_pair.items():
+            for trace in pair_traces:
+                step = trace['local_step']
+                ret = trace['daily_return']
+                if step not in step_returns:
+                    step_returns[step] = []
+                step_returns[step].append(ret)
         
-        for pair_name in sorted(traces_by_pair.keys()):
-            pair_traces = traces_by_pair[pair_name]
-            pair_pnls = [t['realized_pnl_this_step'] for t in pair_traces]
-            pair_cum_pnl = np.cumsum(pair_pnls)
-            
-            # Offset by previous cumulative value
-            if cumulative_pnl_series:
-                offset = cumulative_pnl_series[-1]
-                pair_cum_pnl = pair_cum_pnl + offset
-            
-            cumulative_pnl_series.extend(pair_cum_pnl.tolist())
-            step_labels.extend(range(current_global_step, current_global_step + len(pair_traces)))
-            current_global_step += len(pair_traces)
+        # Average returns per step
+        sorted_steps = sorted(step_returns.keys())
+        avg_returns = [np.mean(step_returns[s]) for s in sorted_steps]
         
-        ax1.plot(step_labels, cumulative_pnl_series, linewidth=2.5, color='darkblue', 
-                 label='Portfolio P&L')
-        ax1.fill_between(step_labels, 0, cumulative_pnl_series, alpha=0.3, color='blue')
-        ax1.axhline(0, color='black', linestyle='--', alpha=0.3)
+        # Convert to price performance (base 100)
+        cum_returns = np.cumprod([1 + r for r in avg_returns])
+        price_performance = 100 * cum_returns
         
-        # Mark supervisor interventions
-        current_step = 0
-        for pair_name in sorted(traces_by_pair.keys()):
-            pair_traces = traces_by_pair[pair_name]
-            if any(skip['pair'] == pair_name for skip in skipped_pairs):
-                skip_step = current_step + len(pair_traces)
-                ax1.axvline(skip_step, color='red', linestyle=':', alpha=0.5)
-            current_step += len(pair_traces)
+        final_performance = ((price_performance[-1] / 100) - 1) * 100 if len(price_performance) > 0 else 0
         
-        ax1.set_title(f"Portfolio P&L: ${metrics['total_pnl']:.2f} | "
-                     f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
-                     f"Sortino: {metrics['sortino_ratio']:.2f}",
-                     fontsize=13, fontweight='bold')
-        ax1.set_xlabel('Concatenated Step (All Pairs)')
-        ax1.set_ylabel('Cumulative P&L ($)')
+        ax1.plot(sorted_steps, price_performance, linewidth=2.5, color='darkblue', label='Portfolio Value')
+        ax1.axhline(100, color='black', linestyle='--', alpha=0.3, label='Starting Value (100)')
+        ax1.fill_between(sorted_steps, 100, price_performance, 
+                        alpha=0.3, color='blue' if final_performance > 0 else 'red')
+        
+        ax1.set_title(f"Portfolio Price Performance: {final_performance:.2f}% | "
+                      f"Sharpe: {metrics['sharpe_ratio']:.2f} | "
+                      f"Sortino: {metrics['sortino_ratio']:.2f}",
+                      fontsize=13, fontweight='bold')
+        ax1.set_xlabel('Step')
+        ax1.set_ylabel('Portfolio Value (Base 100)')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
-        
+                
         # 2. Per-Pair Performance Comparison
         ax2 = fig.add_subplot(gs[1, :2])
         pair_summaries = metrics['pair_summaries']
