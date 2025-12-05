@@ -372,9 +372,12 @@ class OperatorAgent:
                       shock_prob: float = None, shock_scale: float = None,
                       use_curriculum: bool = False):
 
+        # Get seed from CONFIG
+        seed = CONFIG.get("random_seed", 42)
+                          
         if not self.active:
             return None
-
+    
         # Defaults
         if lookback is None:
             lookback = CONFIG.get("rl_lookback", 20)
@@ -397,9 +400,12 @@ class OperatorAgent:
 
         print("\n🚀 Training with standard approach (no costs)...")
         env = PairTradingEnv(
-              series_x, series_y, lookback, position_scale=100,
-              transaction_cost_rate = 0.0005, test_mode=False
-          )
+            series_x, series_y, lookback, position_scale=100,
+            transaction_cost_rate=0.0005, test_mode=False
+        )
+        
+        # Seed the environment
+        env.reset(seed=seed)
 
         model = PPO(
             "MlpPolicy",
@@ -411,7 +417,8 @@ class OperatorAgent:
             gamma=0.99,
             ent_coef=0.01,
             verbose=1,  # Show progress
-            device="cpu"
+            device="cpu",
+            seed=seed
         )
 
         model.learn(total_timesteps=timesteps)
