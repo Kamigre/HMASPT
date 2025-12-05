@@ -312,6 +312,14 @@ class OptimizedSelectorAgent:
     def train(self, epochs: int = 5, lr: float = 0.001, batch_size: int = 512, 
               snapshot_stride: int = 1):
 
+        # Get seed from CONFIG
+        seed = CONFIG.get("random_seed", 42)
+        
+        # Seed PyTorch specifically for this training
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+                  
         if self.train_df is None:
             raise ValueError("Call prepare_data() first")
         
@@ -328,7 +336,7 @@ class OptimizedSelectorAgent:
             hidden_dim=self.hidden_dim,
             num_heads=self.num_heads
         ).to(self.device)
-        
+                  
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         criterion = nn.BCEWithLogitsLoss()
         
