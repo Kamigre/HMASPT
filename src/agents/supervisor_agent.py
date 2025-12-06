@@ -192,9 +192,6 @@ class SupervisorAgent:
         # A. IMMEDIATE KILL (Structural Breaks) - No Mercy
         # ============================================================
         # If the Z-score is > 4.5, the model is statistically broken.
-        # 
-
-[Image of Z-Score Circuit Breaker Diagram]
 
         spread_history = [t['current_spread'] for t in operator_traces]
         if len(spread_history) > 30:
