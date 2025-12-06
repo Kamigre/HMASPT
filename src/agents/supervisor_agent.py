@@ -1,22 +1,8 @@
-import os
-import json
-import datetime
-from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
-import numpy as np
-import pandas as pd
-import google.generativeai as genai
-from statsmodels.tsa.stattools import adfuller
-
-from config import CONFIG
-from agents.message_bus import JSONLogger
-from utils import half_life as compute_half_life, compute_spread
-
 @dataclass
 class SupervisorAgent:
     
     logger: JSONLogger = None
-    df: pd.DataFrame = None  # Full price data for validation
+    df: pd.DataFrame = None
     storage_dir: str = "./storage"
     gemini_api_key: Optional[str] = None
     model: str = "gemini-2.5-flash"
@@ -50,6 +36,10 @@ class SupervisorAgent:
                 self.use_gemini = False
                 print(f"⚠️ Gemini init failed: {e}")
         
+        # NEW: State tracking for sequential warnings (The "Memory")
+        # Format: { 'TickerA-TickerB': {'strikes': 0, 'grace_period': True} }
+        self.monitoring_state = {} 
+        
         self._log("init", {
             "gemini_enabled": self.use_gemini,
             "supervisor_rules_loaded": "supervisor_rules" in CONFIG
@@ -60,17 +50,8 @@ class SupervisorAgent:
         if self.logger:
             self.logger.log("supervisor", event, details)
 
-    def format_skip_info(self, pair: Tuple[str, str], decision: Dict, step: int) -> Dict:
-        """Format skip information for visualization."""
-        return {
-            "pair": f"{pair[0]}-{pair[1]}",
-            "reason": decision['reason'],
-            "step_stopped": step,
-            "metrics": decision['metrics']
-        }
-
     # ===================================================================
-    # 1. PAIR VALIDATION (used by Selector)
+    # 1. PAIR VALIDATION
     # ===================================================================
     
     def validate_pairs(
@@ -96,55 +77,43 @@ class SupervisorAgent:
         for idx, row in df_pairs.iterrows():
             x, y = row["x"], row["y"]
 
-            # Check tickers exist
             if x not in prices.columns or y not in prices.columns:
                 continue
 
-            # Extract validation window
             series_x = prices[x].loc[start:end].dropna()
             series_y = prices[y].loc[start:end].dropna()
 
             if min(len(series_x), len(series_y)) < 60:
                 continue
 
-            # Compute spread
             spread = compute_spread(series_x, series_y)
             if spread is None or len(spread) == 0:
                 continue
 
-            # --- Crossing frequency ---
-            centered = spread - spread.mean()
-            crossings = (centered.shift(1) * centered < 0).sum()
-            days = (series_x.index[-1] - series_x.index[0]).days
-            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
-
-            if crossings_per_year < min_crossings_per_year:
-                continue
-
-            # --- ADF test (stationarity) ---
+            # Check stationarity
             try:
                 adf_res = adfuller(spread.dropna())
                 adf_p = adf_res[1]
             except:
                 adf_p = 1.0
 
-            # --- Half-life (mean reversion speed) ---
+            # Check mean reversion speed
             hl = compute_half_life(spread.values)
-            try:
-                hl_val = float(hl)
-            except:
-                hl_val = float("inf")
+            
+            # Crossing frequency check
+            centered = spread - spread.mean()
+            crossings = (centered.shift(1) * centered < 0).sum()
+            days = (series_x.index[-1] - series_x.index[0]).days
+            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
 
-            # --- Pass criteria ---
-            pass_criteria = (adf_p < 0.05) and (hl_val < half_life_max)
+            pass_criteria = (adf_p < 0.05) and (float(hl) < half_life_max) and (crossings_per_year >= min_crossings_per_year)
 
             validated.append({
-                "x": x,
-                "y": y,
+                "x": x, "y": y,
                 "score": float(row.get("score", np.nan)),
                 "adf_p": float(adf_p),
-                "half_life": hl_val,
-                "crossings_per_year": float(crossings_per_year),
+                "half_life": float(hl),
+                "crossings_per_year": crossings_per_year,
                 "pass": bool(pass_criteria)
             })
 
@@ -158,11 +127,10 @@ class SupervisorAgent:
         })
         
         print(f"✅ Validation complete: {n_passed}/{len(result_df)} pairs passed")
-        
         return result_df
 
     # ===================================================================
-    # 2. OPERATOR MONITORING (Enhanced with Tiered Rules)
+    # 2. OPERATOR MONITORING (IMPROVED with PATIENCE)
     # ===================================================================
     
     def check_operator_performance(
@@ -171,575 +139,282 @@ class SupervisorAgent:
         pair: Tuple[str, str],
         phase: str = "holdout"
     ) -> Dict[str, Any]:
-        """
-        Enhanced supervisor monitoring with tiered intervention.
         
-        Args:
-            operator_traces: List of trading step traces
-            pair: Tuple of (ticker_x, ticker_y)
-            phase: "training" or "holdout"
-        
-        Returns:
-            Decision dict with:
-                - action: "continue" | "warn" | "adjust" | "stop"
-                - severity: "info" | "warning" | "critical"
-                - reason: Human-readable explanation
-                - suggestion: Optional improvement suggestion
-                - metrics: Current performance metrics
-        """
-        
-        # Get rules from CONFIG
+        # 1. Base Setup
         if "supervisor_rules" not in CONFIG:
-            # Fallback to basic checks if rules not configured
             return self._basic_check(operator_traces, pair)
         
         rules = CONFIG["supervisor_rules"][phase]
         
-        # Check minimum observations
-        if len(operator_traces) < rules["min_observations"]:
-            return {
-                "action": "continue",
-                "severity": "info",
-                "reason": "insufficient_data",
-                "metrics": {}
-            }
+        if len(operator_traces) < rules.get("min_observations", 20):
+            return {"action": "continue", "severity": "info", "reason": "insufficient_data", "metrics": {}}
+
+        pair_key = f"{pair[0]}-{pair[1]}"
+        latest_trace = operator_traces[-1]
         
-        # Filter out zero returns/pnls
-        filtered_traces = [t for t in operator_traces if t.get("daily_return", 0) != 0 and t.get("realized_pnl_this_step", 0) != 0]
+        # 2. Initialize/Reset State (Grace Period Logic)
+        if pair_key not in self.monitoring_state:
+            self.monitoring_state[pair_key] = {'strikes': 0, 'grace_period': True}
 
-        returns = [t["daily_return"] for t in filtered_traces]
-        pnls = [t["realized_pnl_this_step"] for t in filtered_traces]
-        portfolio_values = [t.get("portfolio_value", 0) for t in operator_traces]  # keep full portfolio history for drawdown
+        # If days_in_position is small (<= 5), we treat it as a new trade attempt
+        # and reset strikes to give the agent a chance.
+        days_in_pos = latest_trace.get('days_in_position', 0)
+        
+        if days_in_pos <= 5:
+            self.monitoring_state[pair_key]['strikes'] = 0
+            self.monitoring_state[pair_key]['grace_period'] = True
+        else:
+            self.monitoring_state[pair_key]['grace_period'] = False
 
-        # Current state
-        portfolio_value = portfolio_values[-1] if portfolio_values else 0
-        max_portfolio_value = max(portfolio_values) if portfolio_values else 1
-        max_dd = (max_portfolio_value - portfolio_value) / max(max_portfolio_value, 1e-8)
-
-        # Sharpe ratio
-        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-        sharpe = 0.0
-        if returns:
-            excess_returns = np.array(returns) - rf_daily
-            if len(excess_returns) > 1 and np.std(excess_returns, ddof=1) > 1e-8:
-                sharpe = (np.mean(excess_returns) / np.std(excess_returns, ddof=1)) * np.sqrt(252)
-
-        # Win rate
-        win_rate = sum(1 for r in returns if r > 0) / len(returns) if returns else 0
-
-        # Total P&L
-        total_pnl = sum(pnls)
-
-        # Package metrics
-        metrics = {
-            'n_observations': len(filtered_traces),
-            'drawdown': max_dd,
-            'sharpe': sharpe,
-            'win_rate': win_rate,
-            'total_pnl': total_pnl,
-            'portfolio_value': portfolio_value,
-            'avg_return': np.mean(returns) if returns else 0
-        }
-
+        # 3. Compute Metrics
+        metrics = self._compute_live_metrics(operator_traces)
+        
         # ============================================================
-        # TIER 3: CRITICAL INTERVENTION - STOP
+        # A. IMMEDIATE KILL (Structural Breaks) - No Mercy
         # ============================================================
-        if phase == "holdout" and "stop_tier" in rules:
-            stop_tier = rules["stop_tier"]
+        # If the Z-score is > 4.5, the model is statistically broken.
+        spread_history = [t['current_spread'] for t in operator_traces]
+        if len(spread_history) > 30:
+            spread_series = pd.Series(spread_history)
+            rolling_mean = spread_series.rolling(window=30).mean().iloc[-1]
+            rolling_std = spread_series.rolling(window=30).std().iloc[-1]
             
+            if rolling_std > 1e-8:
+                current_z = abs(latest_trace['current_spread'] - rolling_mean) / rolling_std
+                if current_z > 4.5:
+                    self._log("intervention_triggered", {"pair": pair, "reason": "structural_break_zscore", "z": current_z})
+                    return {
+                        'action': 'stop',
+                        'severity': 'critical',
+                        'reason': f'Structural Break: Z-Score {current_z:.1f} > 4.5 (Instant Kill)',
+                        'metrics': metrics
+                    }
 
-            if max_dd > stop_tier["catastrophic_drawdown"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "critical",
-                    "reason": "catastrophic_drawdown",
-                    "drawdown": max_dd,
-                    "threshold": stop_tier["catastrophic_drawdown"]
-                })
+        # ============================================================
+        # B. SEQUENTIAL WARNINGS (P&L Checks) - With Patience
+        # ============================================================
+        
+        # Define Thresholds
+        stop_tier = rules.get("stop_tier", {})
+        max_dd_limit = stop_tier.get("catastrophic_drawdown", 0.30)
+        
+        # Check for Violation
+        violation = False
+        violation_reason = ""
+        
+        if metrics['drawdown'] > max_dd_limit:
+            violation = True
+            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > {max_dd_limit:.1%}"
+        
+        # Only check Sharpe after 20 days to avoid noise
+        elif metrics['sharpe'] < -2.0 and days_in_pos > 20: 
+            violation = True
+            violation_reason = f"Sharpe {metrics['sharpe']:.2f} is disastrous"
+
+        # Apply Three-Strike Logic
+        if violation:
+            if self.monitoring_state[pair_key]['grace_period']:
+                # IGNORING violation because we are in Grace Period
+                return {
+                    'action': 'continue',
+                    'severity': 'info',
+                    'reason': f'Grace Period: Ignoring {violation_reason}',
+                    'metrics': metrics
+                }
+            
+            # Increment Strikes
+            self.monitoring_state[pair_key]['strikes'] += 1
+            strikes = self.monitoring_state[pair_key]['strikes']
+            
+            if strikes == 1:
+                return {
+                    'action': 'warn',
+                    'severity': 'warning',
+                    'reason': f'Strike 1/3: {violation_reason}. Monitoring closely.',
+                    'metrics': metrics
+                }
+            elif strikes == 2:
+                return {
+                    'action': 'adjust',
+                    'severity': 'warning',
+                    'reason': f'Strike 2/3: {violation_reason}. Persisting. Suggest size reduction.',
+                    'suggestion': 'reduce_size_50_percent',
+                    'metrics': metrics
+                }
+            elif strikes >= 3:
                 return {
                     'action': 'stop',
                     'severity': 'critical',
-                    'reason': f'Drawdown {max_dd:.1%} exceeds critical limit {stop_tier["catastrophic_drawdown"]:.1%}',
+                    'reason': f'Strike 3/3: {violation_reason}. Patience exhausted. Stopping.',
                     'metrics': metrics
                 }
-            
-            if sharpe < stop_tier["disastrous_sharpe"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "critical",
-                    "reason": "disastrous_sharpe",
-                    "sharpe": sharpe,
-                    "threshold": stop_tier["disastrous_sharpe"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'critical',
-                    'reason': f'Sharpe {sharpe:.2f} below disastrous threshold {stop_tier["disastrous_sharpe"]:.2f}',
-                    'metrics': metrics
-                }
-            
-            if win_rate < stop_tier["consistent_failure"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "critical",
-                    "reason": "consistent_failure",
-                    "win_rate": win_rate,
-                    "threshold": stop_tier["consistent_failure"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'critical',
-                    'reason': f'Win rate {win_rate:.1%} indicates consistent failure (threshold: {stop_tier["consistent_failure"]:.1%})',
-                    'metrics': metrics
-                }
-            
-            if total_pnl < stop_tier["runaway_losses"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "critical",
-                    "reason": "runaway_losses",
-                    "total_pnl": total_pnl,
-                    "threshold": stop_tier["runaway_losses"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'critical',
-                    'reason': f'Total P&L ${total_pnl:.0f} indicates runaway losses (threshold: ${stop_tier["runaway_losses"]:.0f})',
-                    'metrics': metrics
-                }
-        
-        # ============================================================
-        # TIER 2: ADJUSTMENT SUGGESTIONS - ADJUST
-        # ============================================================
-        if phase == "holdout" and "adjustment_tier" in rules:
-            adjust_tier = rules["adjustment_tier"]
-            
-            if max_dd > adjust_tier["significant_drawdown"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "warning",
-                    "reason": "significant_drawdown",
-                    "drawdown": max_dd,
-                    "threshold": adjust_tier["significant_drawdown"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'warning',
-                    'reason': f'Drawdown {max_dd:.1%} significant',
-                    'suggestion': adjust_tier["suggestions"]["drawdown"],
-                    'metrics': metrics
-                }
-            
-            if sharpe < adjust_tier["very_low_sharpe"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "warning",
-                    "reason": "very_low_sharpe",
-                    "sharpe": sharpe,
-                    "threshold": adjust_tier["very_low_sharpe"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'warning',
-                    'reason': f'Sharpe {sharpe:.2f} very low',
-                    'suggestion': adjust_tier["suggestions"]["sharpe"],
-                    'metrics': metrics
-                }
-            
-            if win_rate < adjust_tier["terrible_win_rate"]:
-                self._log("intervention_triggered", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "adjust",
-                    "severity": "warning",
-                    "reason": "terrible_win_rate",
-                    "win_rate": win_rate,
-                    "threshold": adjust_tier["terrible_win_rate"]
-                })
-                return {
-                    'action': 'adjust',
-                    'severity': 'warning',
-                    'reason': f'Win rate {win_rate:.1%} terrible',
-                    'suggestion': adjust_tier["suggestions"]["win_rate"],
-                    'metrics': metrics
-                }
-        
-        # ============================================================
-        # TIER 1: INFORMATIVE WARNINGS - WARN
-        # ============================================================
-        if phase == "holdout" and "info_tier" in rules:
-            info_tier = rules["info_tier"]
-            warnings = []
-            
-            if max_dd > info_tier["moderate_drawdown"]:
-                warnings.append(f'Drawdown {max_dd:.1%} elevated')
-            
-            if sharpe < info_tier["low_sharpe"]:
-                warnings.append(f'Sharpe {sharpe:.2f} below target')
-            
-            if win_rate < info_tier["poor_win_rate"]:
-                warnings.append(f'Win rate {win_rate:.1%} suboptimal')
-            
-            if warnings:
-                self._log("performance_warning", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "action": "warn",
-                    "warnings": warnings,
-                    "metrics": metrics
-                })
-                return {
-                    'action': 'warn',
-                    'severity': 'info',
-                    'reason': '; '.join(warnings),
-                    'metrics': metrics
-                }
-        
-        # All good - continue trading
+        else:
+            # GOOD BEHAVIOR: Heal strikes slowly
+            # If performance recovers, we forgive past sins
+            if self.monitoring_state[pair_key]['strikes'] > 0:
+                self.monitoring_state[pair_key]['strikes'] -= 1
+                
         return {
             'action': 'continue',
             'severity': 'info',
-            'reason': 'Performance within acceptable ranges',
+            'reason': 'Performance nominal',
             'metrics': metrics
         }
 
-    def _basic_check(self, operator_traces: List[Dict[str, Any]], 
-                     pair: Tuple[str, str]) -> Dict[str, Any]:
-        """
-        Fallback basic checks if supervisor_rules not in CONFIG.
-        More lenient than the tiered system.
-        """
-        if len(operator_traces) < 10:
-            return {"action": "continue", "reason": "insufficient_data"}
+    def _compute_live_metrics(self, traces):
+        """Helper to calculate metrics efficiently."""
+        returns = [t.get("daily_return", 0) for t in traces]
+        portfolio_values = [t.get("portfolio_value", 0) for t in traces]
         
-        returns = [t.get("daily_return", 0) for t in operator_traces]
-        portfolio_values = [t.get("portfolio_value", 0) for t in operator_traces]
-        
-        portfolio_value = portfolio_values[-1] if portfolio_values else 0
-        max_portfolio_value = max(portfolio_values) if portfolio_values else 1
-        max_dd = (max_portfolio_value - portfolio_value) / max(max_portfolio_value, 1e-8)
-        
-        # Very basic threshold (50% drawdown)
-        if max_dd > 0.50:
-            return {
-                "action": "stop",
-                "reason": f"Extreme drawdown {max_dd:.2%} (fallback check)",
-                "metrics": {"drawdown": max_dd}
-            }
+        current_pv = portfolio_values[-1] if portfolio_values else 0
+        peak_pv = max(portfolio_values) if portfolio_values else 1
+        drawdown = (peak_pv - current_pv) / max(peak_pv, 1e-8)
         
         return {
-            "action": "continue",
-            "reason": "performance_acceptable",
-            "metrics": {"drawdown": max_dd}
+            'drawdown': drawdown,
+            'sharpe': self._calculate_sharpe(returns),
+            'win_rate': sum(1 for r in returns if r > 0) / len(returns) if returns else 0,
+            'total_steps': len(traces)
         }
 
     # ===================================================================
-    # 3. FINAL EVALUATION (after all trading complete)
+    # 3. FINAL EVALUATION
     # ===================================================================
+    
+    def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Evaluate complete portfolio performance."""
         
-    def evaluate_portfolio(
-        self, 
-        operator_traces: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Evaluate complete portfolio performance after all trading.
-        """
-
-        # Group by pair
         traces_by_pair = {}
         for t in operator_traces:
-            pair = t.get("pair", "unknown")
-            if pair not in traces_by_pair:
-                traces_by_pair[pair] = []
-            traces_by_pair[pair].append(t)
+            traces_by_pair.setdefault(t['pair'], []).append(t)
 
-        # ============================================================
-        # Recalculate true daily returns using pnl / prev_value
-        # ============================================================
         all_returns = []
         all_pnls = []
-
-        for i in range(1, len(operator_traces)):
-            pnl = operator_traces[i].get("realized_pnl_this_step", 0)
-            pv_prev = operator_traces[i-1].get("portfolio_value", None)
-
-            if pv_prev is None or pv_prev == 0 or pnl == 0:
-                continue
-            
-            true_return = pnl / pv_prev
-            if true_return == 0:
-                continue  # skip zero returns entirely
-            
-            all_returns.append(true_return)
-            all_pnls.append(pnl)
-
-        # If no valid step, fallback safely
-        if not all_returns:
-            all_returns = []
-            all_pnls = []
-
-        total_pnl = sum(all_pnls)
-
-        initial_pv = operator_traces[0].get("portfolio_value", 0.0)
-        final_pv = operator_traces[-1].get("portfolio_value", 0.0)
-
-        portfolio_cum_return = (final_pv - initial_pv) / initial_pv if initial_pv > 0 else 0.0
-
-        sharpe = self._calculate_sharpe(all_returns) if all_returns else 0.0
-        sortino = self._calculate_sortino(all_returns) if all_returns else 0.0
-
-        # Risk metrics
-        max_dd = max([t.get("max_drawdown", 0) for t in operator_traces] + [0])
-        var_95 = float(np.percentile(all_returns, 5)) if all_returns else 0
-        cvar_95 = float(np.mean([r for r in all_returns if r <= var_95])) if all_returns and any(r <= var_95 for r in all_returns) else var_95
-
-        # Win rate
-        positive = sum(1 for r in all_returns if r > 0)
-        win_rate = positive / len(all_returns) if all_returns else 0
-
-        # ============================================================
-        # Per-pair summaries with cumulative returns
-        # ============================================================
         pair_summaries = []
-        for pair, traces in traces_by_pair.items():
-            
-            pair_pnls = []
-            pair_returns = []
 
+        # Process each pair
+        for pair, traces in traces_by_pair.items():
+            pair_returns = []
+            pair_pnls = []
+            
             for i in range(1, len(traces)):
                 pnl = traces[i].get("realized_pnl_this_step", 0)
-                pv_prev = traces[i-1].get("portfolio_value", None)
+                pv_prev = traces[i-1].get("portfolio_value", 0)
+                
+                if pv_prev > 0 and pnl != 0:
+                    ret = pnl / pv_prev
+                    pair_returns.append(ret)
+                    all_returns.append(ret)
+                    pair_pnls.append(pnl)
+                    all_pnls.append(pnl)
 
-                if pv_prev is None or pv_prev == 0:
-                    continue
-
-                true_return = pnl / pv_prev
-                pair_pnls.append(pnl)
-                pair_returns.append(true_return)
-
-            if not pair_returns:
-                pair_returns = [0.0]
-                pair_pnls = [0.0]
-
-            initial_pv = traces[0].get("portfolio_value", 0.0)
-            final_pv = traces[-1].get("portfolio_value", 0.0)
-
-            pair_return = (final_pv - initial_pv) / initial_pv if initial_pv > 0 else 0.0
+            # Pair stats
+            initial = traces[0]['portfolio_value']
+            final = traces[-1]['portfolio_value']
+            cum_ret = (final - initial) / initial if initial > 0 else 0
             
-            pair_sharpe = self._calculate_sharpe(pair_returns)
-            pair_sortino = self._calculate_sortino(pair_returns)
-            pair_max_dd = max([t.get("max_drawdown", 0) for t in traces] + [0])
-
             pair_summaries.append({
                 "pair": pair,
-                "total_pnl": float(sum(pair_pnls)),
-                "cum_return": float(pair_return),
-                "sharpe": float(pair_sharpe),
-                "sortino": float(pair_sortino),
-                "max_drawdown": float(pair_max_dd),
+                "total_pnl": sum(pair_pnls),
+                "cum_return": cum_ret,
+                "sharpe": self._calculate_sharpe(pair_returns),
+                "sortino": self._calculate_sortino(pair_returns),
+                "max_drawdown": max([t.get("max_drawdown", 0) for t in traces] + [0]),
                 "steps": len(traces)
             })
 
+        # Global stats
         metrics = {
-            "total_pnl": float(total_pnl),
-            "cum_return": float(portfolio_cum_return),
-            "sharpe_ratio": float(sharpe),
-            "sortino_ratio": float(sortino),
-            "max_drawdown": float(max_dd),
-            "var_95": float(var_95),
-            "cvar_95": float(cvar_95),
-            "win_rate": float(win_rate),
+            "total_pnl": sum(all_pnls),
+            "sharpe_ratio": self._calculate_sharpe(all_returns),
+            "sortino_ratio": self._calculate_sortino(all_returns),
+            "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
+            "win_rate": sum(1 for r in all_returns if r > 0) / len(all_returns) if all_returns else 0,
             "avg_return": float(np.mean(all_returns)) if all_returns else 0,
-            "std_return": float(np.std(all_returns)) if all_returns else 0,
-            "n_pairs": len(traces_by_pair),
             "total_steps": len(operator_traces),
+            "n_pairs": len(traces_by_pair),
             "pair_summaries": pair_summaries
         }
+        
+        # Calculate Risk Metrics (VaR/CVaR)
+        if all_returns:
+            metrics["var_95"] = float(np.percentile(all_returns, 5))
+            tail_losses = [r for r in all_returns if r <= metrics["var_95"]]
+            metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
+        else:
+            metrics["var_95"] = 0.0
+            metrics["cvar_95"] = 0.0
 
-        # Additional metrics
+        # Additional activity metrics
         metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
         metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
         metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
-        metrics["avg_steps_per_pair"] = (
-            metrics["total_steps"] / max(metrics["n_pairs"], 1)
-        )
-
-        # Generate actions based on final performance
-        actions = self._generate_portfolio_actions(metrics)
+        metrics["std_return"] = float(np.std(all_returns)) if all_returns else 0.0
+        metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
         
-        # Generate explanation
+        # Store cumulative return properly
+        if operator_traces:
+            start_pv = operator_traces[0].get("portfolio_value", 0)
+            end_pv = operator_traces[-1].get("portfolio_value", 0)
+            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0
+        else:
+            metrics["cum_return"] = 0.0
+
+        actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
         
-        summary = {
-            "metrics": metrics,
-            "actions": actions,
-            "explanation": explanation
-        }
-        
-        self._log("portfolio_evaluated", summary)
-        
-        # Save report
-        report_path = os.path.join(self.storage_dir, "supervisor_final_report.json")
-        with open(report_path, "w") as f:
-            json.dump(summary, f, indent=2, default=str)
-        
-        return summary
+        return {"metrics": metrics, "actions": actions, "explanation": explanation}
 
     def _generate_portfolio_actions(self, metrics: Dict) -> List[Dict]:
-        """
-        Generate portfolio-level action recommendations.
-        Uses CONFIG rules if available, otherwise fallback thresholds.
-        """
         actions = []
-        
-        # Get thresholds from CONFIG or use defaults
-        if "supervisor_rules" in CONFIG and "portfolio" in CONFIG["supervisor_rules"]:
-            portfolio_rules = CONFIG["supervisor_rules"]["portfolio"]
-            max_dd_threshold = portfolio_rules.get("max_portfolio_drawdown", 0.30)
-            min_sharpe_threshold = portfolio_rules.get("min_portfolio_sharpe", -0.3)
-        else:
-            max_dd_threshold = 0.30
-            min_sharpe_threshold = -0.3
-        
-        max_dd = metrics.get("max_drawdown", 0)
-        sharpe = metrics.get("sharpe_ratio", 0)
-        win_rate = metrics.get("win_rate", 0)
-        cvar_95 = metrics.get("cvar_95", 0)
-        
-        if max_dd > max_dd_threshold:
-            actions.append({
-                "action": "reduce_risk",
-                "reason": f"Portfolio drawdown {max_dd:.1%} exceeded limit {max_dd_threshold:.1%}",
-                "severity": "high"
-            })
-        
-        if sharpe < min_sharpe_threshold:
-            actions.append({
-                "action": "review_strategy",
-                "reason": f"Portfolio Sharpe {sharpe:.2f} below minimum {min_sharpe_threshold:.2f}",
-                "severity": "high"
-            })
-        
-        if win_rate < 0.45:
-            actions.append({
-                "action": "improve_entry_exit",
-                "reason": f"Win rate {win_rate:.1%} below target 45%",
-                "severity": "medium"
-            })
-        
-        if cvar_95 < -0.05:
-            actions.append({
-                "action": "reduce_tail_risk",
-                "reason": "Excessive tail losses detected (CVaR < -5%)",
-                "severity": "high"
-            })
-        
+        if metrics['max_drawdown'] > 0.30:
+            actions.append({"action": "reduce_risk", "reason": "Portfolio drawdown > 30%", "severity": "high"})
+        if metrics['sharpe_ratio'] < 0:
+            actions.append({"action": "halt_trading", "reason": "Negative Sharpe Ratio", "severity": "high"})
         return actions
 
-    # ===================================================================
-    # HELPER METHODS
-    # ===================================================================
-    
     def _calculate_sharpe(self, returns: List[float]) -> float:
-
-      returns = [r for r in returns if r != 0]
-      if len(returns) < 2:
-          return 0.0
-      
-      rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-      excess = np.array(returns) - rf_daily
-      
-      mean_excess = np.mean(excess)
-      std_excess = np.std(excess, ddof=1)
-      
-      if std_excess < 1e-8:
-          return 0.0
-      
-      return (mean_excess / std_excess) * np.sqrt(252)
+        if len(returns) < 2: return 0.0
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252
+        exc = np.array(returns) - rf
+        std = np.std(exc, ddof=1)
+        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
     def _calculate_sortino(self, returns: List[float]) -> float:
-      
-        returns = [r for r in returns if r != 0]
-        if len(returns) < 2:
-            return 0.0
-        
-        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-        excess = np.array(returns) - rf_daily
-        
-        mean_excess = np.mean(excess)
-        downside = excess[excess < 0]
-        
-        if len(downside) == 0:
-            return 100.0 if mean_excess > 0 else 0.0
-        
-        downside_std = np.sqrt(np.mean(downside**2))
-        
-        if downside_std < 1e-8:
-            return 100.0 if mean_excess > 0 else 0.0
-        
-        return (mean_excess / downside_std) * np.sqrt(252)
+        if len(returns) < 2: return 0.0
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252
+        exc = np.array(returns) - rf
+        down = exc[exc < 0]
+        std = np.sqrt(np.mean(down**2)) if len(down) > 0 else 0.0
+        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
     def _generate_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
-        """Generate natural language explanation using Gemini or fallback."""
         if not self.use_gemini:
             return self._fallback_explanation(metrics, actions)
         
-        system_instruction = """You are an expert quantitative supervisor analyzing pairs trading performance. 
-        Provide clear, actionable insights about risk and performance."""
+        prompt = f"""
+        Act as a Quantitative Risk Manager. Analyze these pairs trading results:
         
-        prompt = f"""Analyze this pairs trading portfolio and explain the results:
-                    
-                METRICS:
-                {json.dumps(metrics, indent=2)}
-                
-                RECOMMENDED ACTIONS:
-                {json.dumps(actions, indent=2)}
-                
-                Provide a concise 3-4 paragraph executive summary covering:
-                1. Overall performance (Sharpe, Sortino, win rate, drawdown)
-                2. Key risks or concerns
-                3. Rationale for recommended actions
-                4. Brief outlook
-                
-                Keep it professional and actionable. This is a simulated backtest for research purposes."""
+        METRICS:
+        {json.dumps(metrics, indent=2, default=str)}
+        
+        ACTIONS:
+        {json.dumps(actions, indent=2)}
+        
+        Write a professional 3-paragraph executive summary:
+        1. Performance Overview (Returns, Sharpe, Drawdown).
+        2. Risk Analysis (Tail risk, worst pairs, structural breaks).
+        3. Strategic Recommendation (Continue, Reduce Size, Halt).
+        """
         
         try:
-            model = genai.GenerativeModel(
-                model_name=self.model,
-                generation_config={"temperature": self.temperature},
-                system_instruction=system_instruction
-            )
-            response = model.generate_content(prompt)
-            
-            if response.candidates and response.candidates[0].content.parts:
-                return "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, "text"))
-            
-        except Exception as e:
-            print(f"⚠️ Gemini explanation failed: {e}")
-        
-        return self._fallback_explanation(metrics, actions)
+            response = self.client.generate_content(prompt)
+            return response.text
+        except Exception:
+            return self._fallback_explanation(metrics, actions)
 
-    def _fallback_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
-        """Fallback explanation when Gemini unavailable."""
-        text = "Portfolio Performance Summary:\n\n"
-        
-        text += f"The portfolio achieved a Sharpe ratio of {metrics['sharpe_ratio']:.2f} "
-        text += f"and Sortino ratio of {metrics['sortino_ratio']:.2f} with a "
-        text += f"win rate of {metrics['win_rate']:.1%}. "
-        text += f"Maximum drawdown was {metrics['max_drawdown']:.2%}.\n\n"
-        
-        if actions:
-            text += f"Risk Management: {len(actions)} intervention(s) recommended - "
-            text += ", ".join([a['action'] for a in actions]) + ".\n\n"
-        else:
-            text += "No critical risk interventions required.\n\n"
-        
-        text += f"The portfolio traded {metrics['n_pairs']} pairs over "
-        text += f"{metrics['total_steps']} steps with an average return of "
-        text += f"{metrics['avg_return']:.4f} per step."
-        
-        return text
+    def _fallback_explanation(self, metrics, actions):
+        return f"Portfolio Sharpe: {metrics['sharpe_ratio']:.2f}. Drawdown: {metrics['max_drawdown']:.2%}. Win Rate: {metrics['win_rate']:.1%}."
+
+    def _basic_check(self, operator_traces, pair):
+        return {"action": "continue", "reason": "basic_check_pass", "metrics": {}}
