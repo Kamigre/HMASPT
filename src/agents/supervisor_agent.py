@@ -24,6 +24,9 @@ class SupervisorAgent:
     temperature: float = 0.1
     use_gemini: bool = True
     
+    # NEW: How often (in days) to perform deep performance reviews
+    check_frequency: int = 5 
+    
     # Internal state for tracking strikes and warnings per pair
     monitoring_state: Dict[str, Any] = field(default_factory=dict)
 
@@ -56,7 +59,8 @@ class SupervisorAgent:
         
         self._log("init", {
             "gemini_enabled": self.use_gemini,
-            "supervisor_rules_loaded": "supervisor_rules" in CONFIG
+            "supervisor_rules_loaded": "supervisor_rules" in CONFIG,
+            "check_frequency_days": self.check_frequency
         })
 
     def _log(self, event: str, details: Dict[str, Any]):
@@ -156,7 +160,7 @@ class SupervisorAgent:
     ) -> Dict[str, Any]:
         """
         Monitors trading performance with Z-Score Circuit Breakers and a 
-        Three-Strike Warning system to allow for patience.
+        Three-Strike Warning system.
         """
         
         # 1. Base Setup
@@ -170,15 +174,13 @@ class SupervisorAgent:
 
         pair_key = f"{pair[0]}-{pair[1]}"
         latest_trace = operator_traces[-1]
+        days_in_pos = latest_trace.get('days_in_position', 0)
         
         # 2. Initialize/Reset State (Grace Period Logic)
         if pair_key not in self.monitoring_state:
             self.monitoring_state[pair_key] = {'strikes': 0, 'grace_period': True}
 
-        # If days_in_position is small (<= 5), we treat it as a new trade attempt
-        # and reset strikes to give the agent a chance ("Burn-in period").
-        days_in_pos = latest_trace.get('days_in_position', 0)
-        
+        # If days_in_position is small (<= 5), reset strikes ("Burn-in period").
         if days_in_pos <= 5:
             self.monitoring_state[pair_key]['strikes'] = 0
             self.monitoring_state[pair_key]['grace_period'] = True
@@ -189,14 +191,12 @@ class SupervisorAgent:
         metrics = self._compute_live_metrics(operator_traces)
         
         # ============================================================
-        # A. IMMEDIATE KILL (Structural Breaks) - No Mercy
+        # A. IMMEDIATE KILL (Structural Breaks) - CHECK EVERY DAY
         # ============================================================
-        # If the Z-score is > 5, the market has fundamentally broken the pair relationship.
-
+        # We NEVER skip this. If Z > 5, the model is broken now.
         spread_history = [t['current_spread'] for t in operator_traces]
         if len(spread_history) > 30:
             spread_series = pd.Series(spread_history)
-            # Use rolling 30-day window to judge current deviation
             rolling_mean = spread_series.rolling(window=30).mean().iloc[-1]
             rolling_std = spread_series.rolling(window=30).std().iloc[-1]
             
@@ -213,30 +213,42 @@ class SupervisorAgent:
                     }
 
         # ============================================================
-        # B. STALEMATE CHECK (Modified)
+        # FREQUENCY CHECK: Skip "Performance Reviews" on off-days
+        # ============================================================
+        # If it's not a check day, and we passed the safety check above, we relax.
+        is_check_day = (days_in_pos > 0) and (days_in_pos % self.check_frequency == 0)
+        
+        if not is_check_day:
+            return {
+                'action': 'continue',
+                'severity': 'info',
+                'reason': f'Off-cycle day (Day {days_in_pos})',
+                'metrics': metrics
+            }
+
+        # ============================================================
+        # B. STALEMATE CHECK (Modified) - Checked on Check Days
         # ============================================================
         if days_in_pos > 45:
             unrealized_pnl = latest_trace.get('unrealized_pnl', 0.0)
             
-            # If we are stuck but making money, give it more time (Trend might be slow)
             if unrealized_pnl > 0:
                 return {
                     'action': 'continue', 
                     'severity': 'info',
-                    'reason': f'Stalemate ({days_in_pos} days) but profitable (Unrealized: {unrealized_pnl:.2f}). Extending hold.',
+                    'reason': f'Stalemate ({days_in_pos} days) but profitable. Extending hold.',
                     'metrics': metrics
                 }
-            # If we are stuck and losing money, cut the dead capital
             else:
                  return {
                     'action': 'stop', 
                     'severity': 'warning',
-                    'reason': f'Stalemate ({days_in_pos} days) and failing (Unrealized: {unrealized_pnl:.2f}). Closing dead capital.',
+                    'reason': f'Stalemate ({days_in_pos} days) and failing. Closing dead capital.',
                     'metrics': metrics
                 }
 
         # ============================================================
-        # C. SEQUENTIAL WARNINGS (P&L Checks) - With Patience
+        # C. SEQUENTIAL WARNINGS (P&L Checks) - Checked on Check Days
         # ============================================================
         
         # Define Thresholds
@@ -251,14 +263,12 @@ class SupervisorAgent:
             violation = True
             violation_reason = f"Drawdown {metrics['drawdown']:.1%} > {max_dd_limit:.1%}"
         
-        # Only check Sharpe after 20 days to avoid noise from early volatility
         elif metrics['sharpe'] < -2.0 and days_in_pos > 20: 
             violation = True
             violation_reason = f"Sharpe {metrics['sharpe']:.2f} is disastrous"
 
         # Apply Three-Strike Logic
         if violation:
-            # If in grace period, ignore P&L noise
             if self.monitoring_state[pair_key]['grace_period']:
                 return {
                     'action': 'continue',
@@ -267,7 +277,6 @@ class SupervisorAgent:
                     'metrics': metrics
                 }
             
-            # Increment Strikes
             self.monitoring_state[pair_key]['strikes'] += 1
             strikes = self.monitoring_state[pair_key]['strikes']
             
@@ -294,8 +303,7 @@ class SupervisorAgent:
                     'metrics': metrics
                 }
         else:
-            # GOOD BEHAVIOR: Heal strikes slowly
-            # If performance recovers, we forgive past sins
+            # GOOD BEHAVIOR: Heal strikes slowly on check days
             if self.monitoring_state[pair_key]['strikes'] > 0:
                 self.monitoring_state[pair_key]['strikes'] -= 1
                 
@@ -349,11 +357,9 @@ class SupervisorAgent:
             for i in range(1, len(traces)):
                 pnl = traces[i].get("realized_pnl_this_step", 0)
                 
-                # FIXED: Use Total Portfolio Value change to capture unrealized volatility
                 pv_curr = traces[i].get("portfolio_value", 0)
                 pv_prev = traces[i-1].get("portfolio_value", 0)
                 
-                # FIXED: Do not filter out 0 returns. We need them for accurate time weighting.
                 if pv_prev > 0:
                     ret = (pv_curr - pv_prev) / pv_prev
                 else:
@@ -411,7 +417,6 @@ class SupervisorAgent:
         
         # Store cumulative return properly
         if operator_traces:
-            # Re-sort full list to get accurate start/end
             sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
             start_pv = sorted_traces[0].get("portfolio_value", 0)
             end_pv = sorted_traces[-1].get("portfolio_value", 0)
@@ -436,8 +441,6 @@ class SupervisorAgent:
         if len(returns) < 2: return 0.0
         rf = CONFIG.get("risk_free_rate", 0.04) / 252
         
-        # FIXED: Do not filter zeros here. The input list 'returns' 
-        # from evaluate_portfolio now correctly includes 0.0s.
         exc = np.array(returns) - rf
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
