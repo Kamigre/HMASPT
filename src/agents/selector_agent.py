@@ -10,6 +10,7 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
+from config import CONFIG
 
 # ==============================================================================
 # 1. ENHANCED MODEL ARCHITECTURE (GATv2 + Bilinear + Memory Support)
