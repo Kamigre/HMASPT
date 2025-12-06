@@ -1,13 +1,14 @@
 import os
 import json
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 import google.generativeai as genai
 from statsmodels.tsa.stattools import adfuller
 
+# Local imports (Assumed to be in your path)
 from config import CONFIG
 from agents.message_bus import JSONLogger
 from utils import half_life as compute_half_life, compute_spread
@@ -16,47 +17,169 @@ from utils import half_life as compute_half_life, compute_spread
 class SupervisorAgent:
     
     logger: JSONLogger = None
-    df: pd.DataFrame = None
+    df: pd.DataFrame = None  # Full price data for validation
     storage_dir: str = "./storage"
     gemini_api_key: Optional[str] = None
     model: str = "gemini-2.5-flash"
     temperature: float = 0.1
     use_gemini: bool = True
+    
+    # Internal state for tracking strikes and warnings per pair
+    monitoring_state: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
-        # ... [Keep Gemini init logic from before] ...
         
-        # NEW: State tracking for sequential warnings
-        # Format: { 'TickerA-TickerB': {'strikes': 0, 'last_check_step': 0} }
-        self.monitoring_state = {} 
-
-        self._log("init", {"gemini_enabled": self.use_gemini})
+        # Initialize Gemini for explanations
+        if self.use_gemini:
+            try:
+                api_key = self.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                if api_key:
+                    genai.configure(api_key=api_key)
+                    generation_config = {
+                        "temperature": self.temperature,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "max_output_tokens": 2048,
+                    }
+                    self.client = genai.GenerativeModel(
+                        model_name=self.model,
+                        generation_config=generation_config
+                    )
+                    print(f"✅ Gemini API initialized")
+                else:
+                    self.use_gemini = False
+                    print("⚠️ No Gemini API key - using fallback explanations")
+            except Exception as e:
+                self.use_gemini = False
+                print(f"⚠️ Gemini init failed: {e}")
+        
+        self._log("init", {
+            "gemini_enabled": self.use_gemini,
+            "supervisor_rules_loaded": "supervisor_rules" in CONFIG
+        })
 
     def _log(self, event: str, details: Dict[str, Any]):
-        if self.logger: self.logger.log("supervisor", event, details)
+        """Simple logging wrapper."""
+        if self.logger:
+            self.logger.log("supervisor", event, details)
 
-    # ... [Keep validate_pairs as is] ...
+    # ===================================================================
+    # 1. PAIR VALIDATION (Pre-Trading Check)
+    # ===================================================================
+    
+    def validate_pairs(
+        self, 
+        df_pairs: pd.DataFrame, 
+        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
+        half_life_max: float = 60,
+        min_crossings_per_year: int = 12
+    ) -> pd.DataFrame:
+        
+        start, end = validation_window
+        validated = []
 
+        # Pivot price data for fast access
+        prices = self.df.pivot(
+            index="date",
+            columns="ticker",
+            values="adj_close"
+        ).sort_index()
+
+        print(f"\n🔍 Validating {len(df_pairs)} pairs...")
+        
+        for idx, row in df_pairs.iterrows():
+            x, y = row["x"], row["y"]
+
+            if x not in prices.columns or y not in prices.columns:
+                continue
+
+            series_x = prices[x].loc[start:end].dropna()
+            series_y = prices[y].loc[start:end].dropna()
+
+            if min(len(series_x), len(series_y)) < 60:
+                continue
+
+            spread = compute_spread(series_x, series_y)
+            if spread is None or len(spread) == 0:
+                continue
+
+            # Check stationarity (ADF Test)
+            try:
+                adf_res = adfuller(spread.dropna())
+                adf_p = adf_res[1]
+            except:
+                adf_p = 1.0
+
+            # Check mean reversion speed (Half-Life)
+            hl = compute_half_life(spread.values)
+            
+            # Check Crossing Frequency
+            centered = spread - spread.mean()
+            crossings = (centered.shift(1) * centered < 0).sum()
+            days = (series_x.index[-1] - series_x.index[0]).days
+            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
+
+            # Decision Logic
+            pass_criteria = (adf_p < 0.05) and (float(hl) < half_life_max) and (crossings_per_year >= min_crossings_per_year)
+
+            validated.append({
+                "x": x, "y": y,
+                "score": float(row.get("score", np.nan)),
+                "adf_p": float(adf_p),
+                "half_life": float(hl),
+                "crossings_per_year": crossings_per_year,
+                "pass": bool(pass_criteria)
+            })
+
+        result_df = pd.DataFrame(validated)
+        n_passed = result_df["pass"].sum() if len(result_df) > 0 else 0
+        
+        self._log("pairs_validated", {
+            "n_total": len(df_pairs),
+            "n_validated": len(result_df),
+            "n_passed": int(n_passed)
+        })
+        
+        print(f"✅ Validation complete: {n_passed}/{len(result_df)} pairs passed")
+        return result_df
+
+    # ===================================================================
+    # 2. OPERATOR MONITORING (The Intelligent Watchdog)
+    # ===================================================================
+    
     def check_operator_performance(
         self, 
         operator_traces: List[Dict[str, Any]],
         pair: Tuple[str, str],
         phase: str = "holdout"
     ) -> Dict[str, Any]:
+        """
+        Monitors trading performance with Z-Score Circuit Breakers and a 
+        Three-Strike Warning system to allow for patience.
+        """
         
+        # 1. Base Setup
+        if "supervisor_rules" not in CONFIG:
+            return self._basic_check(operator_traces, pair)
+        
+        rules = CONFIG["supervisor_rules"][phase]
+        
+        if len(operator_traces) < rules.get("min_observations", 20):
+            return {"action": "continue", "severity": "info", "reason": "insufficient_data", "metrics": {}}
+
         pair_key = f"{pair[0]}-{pair[1]}"
         latest_trace = operator_traces[-1]
         
-        # 1. Initialize State for this pair if new
+        # 2. Initialize/Reset State (Grace Period Logic)
         if pair_key not in self.monitoring_state:
             self.monitoring_state[pair_key] = {'strikes': 0, 'grace_period': True}
 
-        # 2. Check for "Fresh" Trade (Reset strikes if position flipped or just opened)
-        # If days_in_position is small, we consider it a new trade attempt
+        # If days_in_position is small (<= 5), we treat it as a new trade attempt
+        # and reset strikes to give the agent a chance ("Burn-in period").
         days_in_pos = latest_trace.get('days_in_position', 0)
+        
         if days_in_pos <= 5:
-            # GRACE PERIOD: Reset strikes, be patient
             self.monitoring_state[pair_key]['strikes'] = 0
             self.monitoring_state[pair_key]['grace_period'] = True
         else:
@@ -68,17 +191,23 @@ class SupervisorAgent:
         # ============================================================
         # A. IMMEDIATE KILL (Structural Breaks) - No Mercy
         # ============================================================
-        # If the Z-score is mathematically impossible (e.g. > 4.5), 
-        # the model is broken. Stop immediately.
+        # If the Z-score is > 4.5, the model is statistically broken.
+        # 
+
+[Image of Z-Score Circuit Breaker Diagram]
+
         spread_history = [t['current_spread'] for t in operator_traces]
         if len(spread_history) > 30:
             spread_series = pd.Series(spread_history)
+            # Use rolling 30-day window to judge current deviation
             rolling_mean = spread_series.rolling(window=30).mean().iloc[-1]
             rolling_std = spread_series.rolling(window=30).std().iloc[-1]
             
             if rolling_std > 1e-8:
                 current_z = abs(latest_trace['current_spread'] - rolling_mean) / rolling_std
+                
                 if current_z > 4.5:
+                    self._log("intervention_triggered", {"pair": pair, "reason": "structural_break_zscore", "z": current_z})
                     return {
                         'action': 'stop',
                         'severity': 'critical',
@@ -86,12 +215,20 @@ class SupervisorAgent:
                         'metrics': metrics
                     }
 
+        # Check for Stalemate (Dead Capital)
+        if days_in_pos > 45:
+             return {
+                'action': 'stop', 
+                'severity': 'warning',
+                'reason': f'Stalemate: Held position for {days_in_pos} days. Capital stuck.',
+                'metrics': metrics
+            }
+
         # ============================================================
         # B. SEQUENTIAL WARNINGS (P&L Checks) - With Patience
         # ============================================================
         
         # Define Thresholds
-        rules = CONFIG.get("supervisor_rules", {}).get(phase, {})
         stop_tier = rules.get("stop_tier", {})
         max_dd_limit = stop_tier.get("catastrophic_drawdown", 0.30)
         
@@ -102,14 +239,16 @@ class SupervisorAgent:
         if metrics['drawdown'] > max_dd_limit:
             violation = True
             violation_reason = f"Drawdown {metrics['drawdown']:.1%} > {max_dd_limit:.1%}"
-        elif metrics['sharpe'] < -2.0 and days_in_pos > 20: # Only check Sharpe after 20 days
+        
+        # Only check Sharpe after 20 days to avoid noise from early volatility
+        elif metrics['sharpe'] < -2.0 and days_in_pos > 20: 
             violation = True
             violation_reason = f"Sharpe {metrics['sharpe']:.2f} is disastrous"
 
         # Apply Three-Strike Logic
         if violation:
+            # If in grace period, ignore P&L noise
             if self.monitoring_state[pair_key]['grace_period']:
-                # IGNORING violation because we are in Grace Period
                 return {
                     'action': 'continue',
                     'severity': 'info',
@@ -157,7 +296,7 @@ class SupervisorAgent:
         }
 
     def _compute_live_metrics(self, traces):
-        """Helper to calculate metrics efficiently."""
+        """Helper to calculate metrics efficiently from traces."""
         returns = [t.get("daily_return", 0) for t in traces]
         portfolio_values = [t.get("portfolio_value", 0) for t in traces]
         
@@ -172,10 +311,14 @@ class SupervisorAgent:
             'total_steps': len(traces)
         }
 
-    # ... [Keep helper methods evaluate_portfolio, calculate_sharpe, etc.] ...
+    # ===================================================================
+    # 3. FINAL EVALUATION (Post-Trading Aggregation)
+    # ===================================================================
+    
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Evaluate complete portfolio performance."""
         
+        # Group traces by pair
         traces_by_pair = {}
         for t in operator_traces:
             traces_by_pair.setdefault(t['pair'], []).append(t)
@@ -193,6 +336,7 @@ class SupervisorAgent:
                 pnl = traces[i].get("realized_pnl_this_step", 0)
                 pv_prev = traces[i-1].get("portfolio_value", 0)
                 
+                # Calculate True Return (PnL / Capital At Risk)
                 if pv_prev > 0 and pnl != 0:
                     ret = pnl / pv_prev
                     pair_returns.append(ret)
@@ -210,6 +354,7 @@ class SupervisorAgent:
                 "total_pnl": sum(pair_pnls),
                 "cum_return": cum_ret,
                 "sharpe": self._calculate_sharpe(pair_returns),
+                "sortino": self._calculate_sortino(pair_returns),
                 "max_drawdown": max([t.get("max_drawdown", 0) for t in traces] + [0]),
                 "steps": len(traces)
             })
@@ -284,19 +429,19 @@ class SupervisorAgent:
             return self._fallback_explanation(metrics, actions)
         
         prompt = f"""
-        Act as a Quantitative Risk Manager. Analyze these pairs trading results:
-        
-        METRICS:
-        {json.dumps(metrics, indent=2, default=str)}
-        
-        ACTIONS:
-        {json.dumps(actions, indent=2)}
-        
-        Write a professional 3-paragraph executive summary:
-        1. Performance Overview (Returns, Sharpe, Drawdown).
-        2. Risk Analysis (Tail risk, worst pairs, structural breaks).
-        3. Strategic Recommendation (Continue, Reduce Size, Halt).
-        """
+                Act as a Quantitative Risk Manager. Analyze these pairs trading results:
+                
+                METRICS:
+                {json.dumps(metrics, indent=2, default=str)}
+                
+                ACTIONS:
+                {json.dumps(actions, indent=2)}
+                
+                Write a professional 3-paragraph executive summary:
+                1. Performance Overview (Returns, Sharpe, Drawdown).
+                2. Risk Analysis (Tail risk, worst pairs, structural breaks).
+                3. Strategic Recommendation (Continue, Reduce Size, Halt).
+                """
         
         try:
             response = self.client.generate_content(prompt)
