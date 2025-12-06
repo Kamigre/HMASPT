@@ -34,6 +34,7 @@ class PortfolioVisualizer:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "behavior"), exist_ok=True) # New folder for behavior plots
         
         # Institutional Color Palette
         self.colors = {
@@ -46,7 +47,9 @@ class PortfolioVisualizer:
             'fill_loss': '#e74c3c',
             'neutral': '#95a5a6',
             'accent': '#f39c12',       # Orange (Warnings)
-            'text_bg': '#fdfefe'       # Very light grey for text card
+            'text_bg': '#fdfefe',      # Very light grey for text card
+            'asset_x': '#2980b9',      # Blue for Asset X
+            'asset_y': '#7f8c8d'       # Grey for Asset Y
         }
     
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
@@ -181,6 +184,64 @@ class PortfolioVisualizer:
         plt.savefig(filepath)
         plt.close()
         print(f"   📊 Saved pair analysis: {filepath}")
+
+    def visualize_pair_behavior(self, traces: List[Dict], pair_name: str):
+        """
+        Creates a 'Behavior Analysis' report comparing Price Action vs Strategy Returns.
+        Useful for debugging why a pair worked or failed.
+        """
+        if not traces: return
+        df = pd.DataFrame(traces)
+        
+        # Check if we have price data
+        if 'price_x' not in df.columns or 'price_y' not in df.columns:
+            print(f"⚠️ Cannot generate behavior report for {pair_name}: Missing raw price data.")
+            return
+
+        # Normalize prices to start at 1.0 for comparison
+        df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
+        df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
+        
+        # Setup Figure
+        fig = plt.figure(figsize=(16, 10))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1], hspace=0.15)
+        
+        # 1. Normalized Price Action (Top Panel)
+        ax1 = fig.add_subplot(gs[0])
+        ax1.plot(df['local_step'], df['norm_x'], color=self.colors['asset_x'], lw=2, label=f"Asset X (Normalized)")
+        ax1.plot(df['local_step'], df['norm_y'], color=self.colors['asset_y'], lw=2, label=f"Asset Y (Normalized)")
+        
+        # Fill the spread area to visualize divergence
+        ax1.fill_between(df['local_step'], df['norm_x'], df['norm_y'], color='gray', alpha=0.1, label="Spread Divergence")
+        
+        ax1.set_ylabel("Normalized Price (Start=1.0)")
+        ax1.set_title(f"{pair_name}: Price Co-movement Analysis", loc='left', fontsize=16, weight='bold', color=self.colors['primary'])
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        # Hide x-labels for top plot
+        plt.setp(ax1.get_xticklabels(), visible=False)
+
+        # 2. Strategy Cumulative Return (Bottom Panel)
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        cum_ret_pct = df['cum_return'] * 100
+        ax2.plot(df['local_step'], cum_ret_pct, color=self.colors['primary'], lw=2, label="Strategy Return %")
+        
+        # Color fill based on profitability
+        ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct >= 0), color=self.colors['fill_profit'], alpha=0.2)
+        ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct < 0), color=self.colors['fill_loss'], alpha=0.2)
+        
+        ax2.axhline(0, color='black', linestyle='--', alpha=0.5)
+        ax2.set_ylabel("Cumulative Return (%)")
+        ax2.set_xlabel("Trading Steps")
+        ax2.legend(loc='upper left')
+        ax2.grid(True, alpha=0.3)
+
+        # Save
+        filename = f"behavior_{pair_name.replace('-', '_')}.png"
+        filepath = os.path.join(self.output_dir, "behavior", filename)
+        plt.savefig(filepath)
+        plt.close()
+        print(f"   📉 Saved behavior analysis: {filepath}")
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
@@ -437,13 +498,18 @@ def generate_all_visualizations(all_traces: List[Dict],
     for pair_name, traces in traces_by_pair.items():
         skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
         was_skipped = skip_info is not None
+        
+        # 1. Standard Analysis
         visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
+        
+        # 2. NEW Behavior Analysis (Price vs Return)
+        visualizer.visualize_pair_behavior(traces, pair_name)
     
     # Generate portfolio aggregate
     print("\n📊 Generating portfolio aggregate report...")
     visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
     
-    # Generate Executive Summary Text Card (The new feature)
+    # Generate Executive Summary Text Card
     if 'explanation' in final_summary:
         print("\n📄 Generating executive summary card...")
         visualizer.visualize_executive_summary(final_summary['explanation'])
