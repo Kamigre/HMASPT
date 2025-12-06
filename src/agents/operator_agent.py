@@ -8,11 +8,10 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
-import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
@@ -61,13 +60,14 @@ class PairTradingEnv(gym.Env):
         self.spread = x - y
         
         # Z-scores at different timescales
+        # PAPER ALIGNMENT: The lookback here corresponds to the "Time Window" features
         self.zscore_short = (
-            (self.spread - self.spread.rolling(self.lookback).mean()) /
+            (self.spread - self.spread.rolling(self.lookback).mean()) / 
             (self.spread.rolling(self.lookback).std() + 1e-8)
         )
         
         self.zscore_long = (
-            (self.spread - self.spread.rolling(self.lookback * 2).mean()) /
+            (self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
             (self.spread.rolling(self.lookback * 2).std() + 1e-8)
         )
         
@@ -327,7 +327,7 @@ class PairTradingEnv(gym.Env):
 
 @dataclass
 class OperatorAgent:
-  
+    
     logger: JSONLogger = None
     storage_dir: str = "models/"
 
@@ -365,7 +365,7 @@ class OperatorAgent:
                 self.logger.log("operator", "resumed", {})
 
     def load_model(self, model_path):
-        return PPO.load(model_path)
+        return RecurrentPPO.load(model_path)
 
     def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
                       lookback: int = None, timesteps: int = None,
@@ -374,31 +374,30 @@ class OperatorAgent:
 
         # Get seed from CONFIG
         seed = CONFIG.get("random_seed", 42)
-                          
+                           
         if not self.active:
             return None
     
-        # Defaults
+        # PAPER IMPLEMENTATION: 
+        # Default Time Window (TW) set to 30 as per Section 4.5.1
         if lookback is None:
-            lookback = CONFIG.get("rl_lookback", 20)
+            lookback = CONFIG.get("rl_lookback", 30) 
+            
         if timesteps is None:
             timesteps = CONFIG.get("rl_timesteps", 500000)
-        if shock_prob is None:
-            shock_prob = 0.0  # OFF by default
-        if shock_scale is None:
-            shock_scale = 0.0
 
         series_x = prices[x]
         series_y = prices[y]
 
         print(f"\n{'='*70}")
-        print(f"Training pair: {x} - {y}")
+        print(f"Training pair: {x} - {y} (LSTM POLICY)")
         print(f"  Data length: {len(series_x)} days")
         print(f"  Timesteps: {timesteps:,}")
-        print(f"  Position scale: 100x")
+        print(f"  Time Window (Lookback): {lookback} (Paper optimal: 30)")
+        print(f"  LSTM Hidden Size: 512 (Paper optimal)")
         print(f"{'='*70}")
 
-        print("\n🚀 Training with standard approach (no costs)...")
+        print("\n🚀 Training with Recurrent PPO (LSTM)...")
         env = PairTradingEnv(
             series_x, series_y, lookback, position_scale=100,
             transaction_cost_rate=0.0005, test_mode=False
@@ -407,8 +406,16 @@ class OperatorAgent:
         # Seed the environment
         env.reset(seed=seed)
 
-        model = PPO(
-            "MlpPolicy",
+        # PAPER IMPLEMENTATION:
+        # Hidden Size (HS) = 512 as per Section 4.5.2
+        # n_lstm_layers = 1 (Paper showed 512 single layer > 512*2 layers)
+        policy_kwargs = dict(
+            lstm_hidden_size=512,
+            n_lstm_layers=1
+        )
+
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
             env,
             learning_rate=0.0001,
             n_steps=512,
@@ -416,9 +423,10 @@ class OperatorAgent:
             n_epochs=20,
             gamma=0.99,
             ent_coef=0.01,
-            verbose=1,  # Show progress
+            verbose=1,
             device="cpu",
-            seed=seed
+            seed=seed,
+            policy_kwargs=policy_kwargs  # Applied hyperparams
         )
 
         model.learn(total_timesteps=timesteps)
@@ -440,9 +448,20 @@ class OperatorAgent:
         daily_returns = []
         positions = []
 
+        # Initialize LSTM states
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
+
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
+            action, lstm_states = model.predict(
+                obs, 
+                state=lstm_states, 
+                episode_start=episode_starts,
+                deterministic=True
+            )
             obs, reward, done, _, info = env_eval.step(action)
+            episode_starts = np.array([done])
+            
             daily_returns.append(info.get('daily_return', 0))
             positions.append(info.get('position', 0))
 
@@ -454,8 +473,6 @@ class OperatorAgent:
         sharpe = 0.0
         if len(excess_rets) > 1 and np.std(excess_rets, ddof=1) > 1e-8:
             sharpe = np.mean(excess_rets) / np.std(excess_rets, ddof=1) * np.sqrt(252)
-            print(np.mean(excess_rets))
-            print(np.std(excess_rets, ddof=1))
         
         downside = excess_rets[excess_rets < 0]
         sortino = 0.0
@@ -533,16 +550,6 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
 def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
     """
     Run holdout testing with supervisor monitoring.
-    
-    Args:
-        operator: OperatorAgent instance
-        holdout_prices: DataFrame with holdout price data
-        pairs: List of (x, y) tuples to test
-        supervisor: SupervisorAgent instance
-    
-    Returns:
-        all_traces: List of all trading step traces
-        skipped_pairs: List of pairs that were stopped early by supervisor
     """
     
     # Get check_interval from CONFIG
@@ -586,10 +593,13 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         model = operator.load_model(model_path)
         print(f"  ✓ Model loaded")
 
-        # TEST ENVIRONMENT: With transaction costs
+        # PAPER IMPLEMENTATION: Ensure test environment uses same lookback (30)
+        lookback = CONFIG.get("rl_lookback", 30)
+
+        # TEST ENVIRONMENT
         env = PairTradingEnv(
               series_x=aligned.iloc[:, 0], series_y=aligned.iloc[:, 1], 
-              lookback=CONFIG.get("rl_lookback", 20), position_scale=100,
+              lookback=lookback, position_scale=100,
               transaction_cost_rate = 0.0005, test_mode=True
           )
 
@@ -599,10 +609,22 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         terminated = False
         skip_to_next_pair = False
 
+        # Initialize LSTM states
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
+
         # Trading loop with supervisor monitoring
         while not terminated and not skip_to_next_pair:
-            action, _ = model.predict(obs, deterministic=True)
+            # Pass state and episode_start to model
+            action, lstm_states = model.predict(
+                obs, 
+                state=lstm_states, 
+                episode_start=episode_starts,
+                deterministic=True
+            )
+            
             obs, reward, terminated, _, info = env.step(action)
+            episode_starts = np.array([terminated])
 
             trace = {
                 "pair": f"{pair[0]}-{pair[1]}",
@@ -654,7 +676,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                     print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Skipping to next pair")
                     print(f"   Reason: {decision['reason']}")
                     print(f"   Metrics: {decision['metrics']}")
-                    print(f"   Steps completed: {local_step}/{len(aligned)}")
                     
                     # Record skip information
                     skip_info = {
@@ -669,7 +690,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                     skipped_pairs.append(skip_info)
                     skip_to_next_pair = True
                     
-                    # Log the intervention
                     if operator.logger:
                         operator.logger.log("supervisor", "intervention", skip_info)
                     
@@ -682,17 +702,14 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                         print(f"   💡 Suggestion: {decision['suggestion']}")
                 
                 elif decision["action"] == "warn":
-                    # Only show warnings occasionally (every 4 checks)
                     if local_step % (check_interval * 4) == 0:
                         print(f"\nℹ️  SUPERVISOR INFO:")
                         print(f"   {decision['reason']}")
                 
-                # Show periodic performance updates
                 if local_step % (check_interval * 2) == 0:
                     metrics = decision["metrics"]
                     print(f"\n📊 Step {local_step}: DD={metrics.get('drawdown', 0):.2%}, "
-                          f"Sharpe={metrics.get('sharpe', 0):.2f}, "
-                          f"WinRate={metrics.get('win_rate', 0):.2%}")
+                          f"Sharpe={metrics.get('sharpe', 0):.2f}")
 
             local_step += 1
             global_step += 1
@@ -709,51 +726,42 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         
         # Extract values for metrics
         daily_returns = np.array([t["daily_return"] for t in episode_traces])
-        pnls = np.array([t["realized_pnl_this_step"] for t in episode_traces])
         positions = np.array([t["position"] for t in episode_traces])
 
-        # ---------- TRADE DETECTION ----------
+        # Trade detection
         trades = []
         last_position = 0
         for t in episode_traces:
             pos = t["position"]
             pnl = t.get("realized_pnl_this_step", 0)
-            if pos != last_position and pnl != 0:  # only count trades with non-zero PnL
+            if pos != last_position and pnl != 0:
                 trades.append({"position": pos, "realized_pnl": pnl})
             last_position = pos
 
         pnls_list = [tr["realized_pnl"] for tr in trades]
-
         n_trades = len(pnls_list)
         wins = [1 for pnl in pnls_list if pnl > 0]
         win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
         avg_trade_pnl = np.mean(pnls_list) if n_trades > 0 else 0.0
 
-        # ---------- POSITION USAGE ----------
+        # Position usage
         unique_positions, pos_counts = np.unique(positions, return_counts=True)
         pos_usage = {
             int(p): float(c) / len(positions)
             for p, c in zip(unique_positions, pos_counts)
         }
 
-        # ---------- RETURN METRICS ----------
-        # Filter daily returns to remove zeros
+        # Return metrics
         filtered_returns = [t.get("daily_return", 0) for t in episode_traces if t.get("daily_return", 0) != 0]
-
         ret_mean = np.mean(filtered_returns) if filtered_returns else 0.0
         ret_std = np.std(filtered_returns) if filtered_returns else 0.0
         ret_median = np.median(filtered_returns) if filtered_returns else 0.0
-
-        # ---------- DRAWDOWN ----------
         max_dd = max(t.get("max_drawdown", 0) for t in episode_traces) if episode_traces else 0
 
         # Sharpe and Sortino
         sharpe = calculate_sharpe(episode_traces)
         sortino = calculate_sortino(episode_traces)
 
-        # ============================
-        # STORE IN LOGGING / TRACE
-        # ============================
         extra_stats = {
             "trades": n_trades,
             "win_rate": win_rate,
@@ -796,10 +804,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                     "was_skipped": skip_to_next_pair
                 })
 
-    # ============================================================
-    # FINAL SUMMARY
-    # ============================================================
-    
     print("\n" + "="*70)
     print("HOLDOUT TESTING COMPLETE")
     print("="*70)
@@ -809,22 +813,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
     print(f"Pairs skipped by supervisor: {len(skipped_pairs)}")
     print("="*70)
     
-    # Print skipped pairs summary
     if skipped_pairs:
         print(f"\n{'='*70}")
         print(f"SUPERVISOR INTERVENTION SUMMARY")
         print(f"{'='*70}")
-        print(f"{len(skipped_pairs)} pairs stopped early:\n")
-        
         for skip in skipped_pairs:
-            print(f"  {skip['pair']}:")
-            print(f"    Severity: {skip.get('severity', 'unknown').upper()}")
-            print(f"    Reason: {skip['reason']}")
-            print(f"    Stopped at local step: {skip['local_step_stopped']}")
-            metrics = skip.get('metrics', {})
-            print(f"    Final metrics: DD={metrics.get('drawdown', 0):.2%}, "
-                  f"Sharpe={metrics.get('sharpe', 0):.2f}, "
-                  f"WinRate={metrics.get('win_rate', 0):.2%}\n")
+            print(f"  {skip['pair']}: {skip['reason']} (Metric: {skip['metrics']})")
         print("="*70)
 
     return all_traces, skipped_pairs
@@ -832,47 +826,28 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    
     returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
-    
-    if len(returns) < 2:
-        return 0.0
-    
+    if len(returns) < 2: return 0.0
     rf_daily = risk_free_rate / 252
     excess_returns = returns - rf_daily
-    
     mean_excess = np.mean(excess_returns)
     std_excess = np.std(excess_returns, ddof=1)
-    
-    if std_excess < 1e-8:
-        return 0.0
-    
+    if std_excess < 1e-8: return 0.0
     return (mean_excess / std_excess) * np.sqrt(252)
-
 
 def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    
     returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
-    
-    if len(returns) < 2:
-        return 0.0
-    
+    if len(returns) < 2: return 0.0
     rf_daily = risk_free_rate / 252
     excess_returns = returns - rf_daily
-    
     mean_excess = np.mean(excess_returns)
     downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
-    
-    if downside_deviation < 1e-8:
-        return 100.0 if mean_excess > 0 else 0.0
-    
+    if downside_deviation < 1e-8: return 100.0 if mean_excess > 0 else 0.0
     return (mean_excess / downside_deviation) * np.sqrt(252)
     
 def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
-    """Save detailed trace for visualization."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    
     with open(filepath, "a") as f:
         f.write(json.dumps(trace, default=str) + "\n")
