@@ -37,10 +37,10 @@ class EnhancedTGNN(nn.Module):
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         
         # 3. Graph Attention Layers (GATv2 is more expressive than GAT)
-        self.gat1 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout)
+        self.gat1 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn1 = BatchNorm(hidden_dim)
         
-        self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout)
+        self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn2 = BatchNorm(hidden_dim)
         
         # 4. Pair Scorer (Bilinear + Cosine)
