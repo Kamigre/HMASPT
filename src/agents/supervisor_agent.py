@@ -329,17 +329,27 @@ class SupervisorAgent:
             pair_returns = []
             pair_pnls = []
             
+            # Sort traces by step just in case they are out of order
+            traces = sorted(traces, key=lambda x: x['step'])
+
             for i in range(1, len(traces)):
                 pnl = traces[i].get("realized_pnl_this_step", 0)
+                
+                # FIXED: Use Total Portfolio Value change to capture unrealized volatility
+                pv_curr = traces[i].get("portfolio_value", 0)
                 pv_prev = traces[i-1].get("portfolio_value", 0)
                 
-                # Calculate True Return (PnL / Capital At Risk)
-                if pv_prev > 0 and pnl != 0:
-                    ret = pnl / pv_prev
-                    pair_returns.append(ret)
-                    all_returns.append(ret)
-                    pair_pnls.append(pnl)
-                    all_pnls.append(pnl)
+                # FIXED: Do not filter out 0 returns. We need them for accurate time weighting.
+                if pv_prev > 0:
+                    ret = (pv_curr - pv_prev) / pv_prev
+                else:
+                    ret = 0.0
+                
+                pair_returns.append(ret)
+                all_returns.append(ret)
+                
+                pair_pnls.append(pnl)
+                all_pnls.append(pnl)
 
             # Pair stats
             initial = traces[0]['portfolio_value']
@@ -387,8 +397,10 @@ class SupervisorAgent:
         
         # Store cumulative return properly
         if operator_traces:
-            start_pv = operator_traces[0].get("portfolio_value", 0)
-            end_pv = operator_traces[-1].get("portfolio_value", 0)
+            # Re-sort full list to get accurate start/end
+            sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
+            start_pv = sorted_traces[0].get("portfolio_value", 0)
+            end_pv = sorted_traces[-1].get("portfolio_value", 0)
             metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0
         else:
             metrics["cum_return"] = 0.0
@@ -409,6 +421,9 @@ class SupervisorAgent:
     def _calculate_sharpe(self, returns: List[float]) -> float:
         if len(returns) < 2: return 0.0
         rf = CONFIG.get("risk_free_rate", 0.04) / 252
+        
+        # FIXED: Do not filter zeros here. The input list 'returns' 
+        # from evaluate_portfolio now correctly includes 0.0s.
         exc = np.array(returns) - rf
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
