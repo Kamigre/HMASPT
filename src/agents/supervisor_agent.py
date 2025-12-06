@@ -191,7 +191,7 @@ class SupervisorAgent:
         # ============================================================
         # A. IMMEDIATE KILL (Structural Breaks) - No Mercy
         # ============================================================
-        # If the Z-score is > 4.5, the model is statistically broken.
+        # If the Z-score is > 5, the market has fundamentally broken the pair relationship.
 
         spread_history = [t['current_spread'] for t in operator_traces]
         if len(spread_history) > 30:
@@ -203,26 +203,40 @@ class SupervisorAgent:
             if rolling_std > 1e-8:
                 current_z = abs(latest_trace['current_spread'] - rolling_mean) / rolling_std
                 
-                if current_z > 4.5:
+                if current_z > 5:
                     self._log("intervention_triggered", {"pair": pair, "reason": "structural_break_zscore", "z": current_z})
                     return {
                         'action': 'stop',
                         'severity': 'critical',
-                        'reason': f'Structural Break: Z-Score {current_z:.1f} > 4.5 (Instant Kill)',
+                        'reason': f'Structural Break: Z-Score {current_z:.1f} > 5 (Instant Kill)',
                         'metrics': metrics
                     }
 
-        # Check for Stalemate (Dead Capital)
+        # ============================================================
+        # B. STALEMATE CHECK (Modified)
+        # ============================================================
         if days_in_pos > 45:
-             return {
-                'action': 'stop', 
-                'severity': 'warning',
-                'reason': f'Stalemate: Held position for {days_in_pos} days. Capital stuck.',
-                'metrics': metrics
-            }
+            unrealized_pnl = latest_trace.get('unrealized_pnl', 0.0)
+            
+            # If we are stuck but making money, give it more time (Trend might be slow)
+            if unrealized_pnl > 0:
+                return {
+                    'action': 'continue', 
+                    'severity': 'info',
+                    'reason': f'Stalemate ({days_in_pos} days) but profitable (Unrealized: {unrealized_pnl:.2f}). Extending hold.',
+                    'metrics': metrics
+                }
+            # If we are stuck and losing money, cut the dead capital
+            else:
+                 return {
+                    'action': 'stop', 
+                    'severity': 'warning',
+                    'reason': f'Stalemate ({days_in_pos} days) and failing (Unrealized: {unrealized_pnl:.2f}). Closing dead capital.',
+                    'metrics': metrics
+                }
 
         # ============================================================
-        # B. SEQUENTIAL WARNINGS (P&L Checks) - With Patience
+        # C. SEQUENTIAL WARNINGS (P&L Checks) - With Patience
         # ============================================================
         
         # Define Thresholds
@@ -291,7 +305,7 @@ class SupervisorAgent:
             'reason': 'Performance nominal',
             'metrics': metrics
         }
-
+        
     def _compute_live_metrics(self, traces):
         """Helper to calculate metrics efficiently from traces."""
         returns = [t.get("daily_return", 0) for t in traces]
