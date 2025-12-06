@@ -7,6 +7,7 @@ import seaborn as sns
 import matplotlib.gridspec as gridspec
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
+import textwrap
 
 # --- CONFIG IMPORT ---
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -26,7 +27,7 @@ plt.rcParams['font.family'] = 'sans-serif'
 class PortfolioVisualizer:
     """
     Creates institutional-grade visual reports for pairs trading performance.
-    Features homogenized styling and intelligent data summarization.
+    Features homogenized styling, intelligent data summarization, and AI Text Reports.
     """
     
     def __init__(self, output_dir: str = "reports"):
@@ -44,7 +45,8 @@ class PortfolioVisualizer:
             'fill_profit': '#2ecc71',
             'fill_loss': '#e74c3c',
             'neutral': '#95a5a6',
-            'accent': '#f39c12'        # Orange (Warnings)
+            'accent': '#f39c12',       # Orange (Warnings)
+            'text_bg': '#fdfefe'       # Very light grey for text card
         }
     
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
@@ -183,7 +185,6 @@ class PortfolioVisualizer:
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard with improved Correlation analysis.
-        Replaces cramped heatmaps with clear Distribution plots and Risk Lists.
         """
         metrics = final_summary['metrics']
         pair_summaries = metrics['pair_summaries']
@@ -201,7 +202,7 @@ class PortfolioVisualizer:
 
         # P&L Matrix
         pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
-        pnl_matrix = pnl_matrix.fillna(method='ffill').fillna(0.0)
+        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
         
         # Portfolio Curve
         total_portfolio_pnl_dollars = pnl_matrix.sum(axis=1)
@@ -263,34 +264,35 @@ class PortfolioVisualizer:
         if len(pair_names) > 10:
             plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
 
-        # 3. IMPROVED: Correlation Analysis (No more Cramped Heatmaps)
-        # We calculate daily P&L changes to see correlation
+        # 3. Correlation Analysis
         pnl_changes = pnl_matrix.diff().fillna(0.0)
         
         if pnl_changes.shape[1] > 1:
             corr_matrix = pnl_changes.corr()
-            # Get upper triangle values only (exclude diagonal)
             mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
-            corr_values = corr_matrix.where(mask).stack().values
             
             # 3a. Correlation Distribution (Histogram)
+            corr_values = corr_matrix.where(mask).stack().values
             ax3 = fig.add_subplot(gs[2, 0])
             sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
             ax3.set_title("Diversification Health (Correlation Dist.)", loc='left')
             ax3.set_xlabel("Pairwise Correlation")
             ax3.set_ylabel("Frequency")
-            ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
-            ax3.legend()
+            if len(corr_values) > 0:
+                ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
+                ax3.legend()
 
             # 3b. Top Concentration Risks (Table)
+            corr_stacked = corr_matrix.where(mask).stack()
+            corr_stacked.index.names = ['Pair A', 'Pair B'] 
+            corr_pairs = corr_stacked.reset_index()
+            corr_pairs.columns = ['Pair A', 'Pair B', 'Corr']
+            
+            top_corr = corr_pairs.sort_values('Corr', ascending=False).head(8)
+            
             ax4 = fig.add_subplot(gs[2, 1])
             ax4.axis('off')
             ax4.set_title("⚠️ Top Concentration Risks", loc='center', color=self.colors['loss'])
-            
-            # Find top 5 highest correlations
-            corr_pairs = corr_matrix.where(mask).stack().reset_index()
-            corr_pairs.columns = ['Pair A', 'Pair B', 'Corr']
-            top_corr = corr_pairs.sort_values('Corr', ascending=False).head(8)
             
             cell_text = []
             for _, row in top_corr.iterrows():
@@ -318,7 +320,7 @@ class PortfolioVisualizer:
         ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
         ax5.set_xlabel("Drawdown %")
 
-        # 5. Global Stats Table (Cleaned up)
+        # 5. Global Stats Table
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
@@ -333,38 +335,74 @@ class PortfolioVisualizer:
             ("Skipped Pairs", f"{len(skipped_names)}")
         ]
         
-        # Layout logic for table
         col_count = 4
         row_count = 2
         cell_text = [ [] for _ in range(row_count) ]
-        col_labels = []
         
         for i, (label, val) in enumerate(flat_metrics):
             r = i % row_count
             cell_text[r].extend([label, val])
-            if r == 0: col_labels.extend(["Metric", "Value"])
 
         table = ax6.table(cellText=cell_text, loc='center', cellLoc='center', bbox=[0.05, 0.2, 0.9, 0.6])
         table.auto_set_font_size(False)
         table.set_fontsize(13)
         
-        # Style the table
         for (row, col), cell in table.get_celld().items():
             cell.set_edgecolor('white')
-            if col % 2 == 0: # Labels
+            if col % 2 == 0:
                 cell.set_facecolor('#f7f9f9')
                 cell.set_text_props(weight='bold', color=self.colors['primary'])
-            else: # Values
+            else:
                 cell.set_facecolor('white')
                 cell.set_text_props(color='black')
 
-        # Save
+        # Save Main Dashboard
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(self.output_dir, f"portfolio_dashboard_{timestamp}.png")
         plt.savefig(filepath)
         plt.close()
-        
         print(f"\n📊 Saved portfolio dashboard: {filepath}")
+    
+    def visualize_executive_summary(self, explanation_text: str):
+        """
+        Creates a dedicated Executive Summary card with the Gemini explanation.
+        """
+        if not explanation_text:
+            return
+
+        fig = plt.figure(figsize=(16, 10))
+        fig.patch.set_facecolor(self.colors['text_bg'])
+        ax = fig.add_subplot(111)
+        ax.axis('off')
+
+        # Wrapper to prevent text running off
+        wrapper = textwrap.TextWrapper(width=90, replace_whitespace=False)
+        formatted_text = ""
+        
+        # Formatting to ensure paragraphs are preserved
+        paragraphs = explanation_text.split('\n')
+        for p in paragraphs:
+            if p.strip():
+                formatted_text += "\n".join(wrapper.wrap(p)) + "\n\n"
+
+        # Title
+        ax.text(0.05, 0.95, "Risk Manager: Executive Summary", 
+                fontsize=24, weight='bold', color=self.colors['primary'], va='top')
+        
+        # Body
+        ax.text(0.05, 0.85, formatted_text, 
+                fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
+
+        # Footer
+        ax.text(0.5, 0.05, "Generated by AI Supervisor Agent", 
+                fontsize=12, color=self.colors['neutral'], ha='center')
+
+        # Save
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.output_dir, f"executive_summary_{timestamp}.png")
+        plt.savefig(filepath, facecolor=self.colors['text_bg'])
+        plt.close()
+        print(f"📄 Saved executive summary: {filepath}")
 
     def _calculate_sharpe(self, returns):
         if len(returns) < 2: return 0.0
@@ -404,5 +442,10 @@ def generate_all_visualizations(all_traces: List[Dict],
     # Generate portfolio aggregate
     print("\n📊 Generating portfolio aggregate report...")
     visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
+    
+    # Generate Executive Summary Text Card (The new feature)
+    if 'explanation' in final_summary:
+        print("\n📄 Generating executive summary card...")
+        visualizer.visualize_executive_summary(final_summary['explanation'])
     
     print(f"\n✅ All reports saved to: {output_dir}/")
