@@ -417,14 +417,14 @@ class OperatorAgent:
         model = RecurrentPPO(
             "MlpLstmPolicy",
             env,
-            learning_rate=0.0001,
-            n_steps=512,
-            batch_size=64,
+            learning_rate=0.001,
+            n_steps=4096,
+            batch_size=256,
             n_epochs=20,
             gamma=0.99,
             ent_coef=0.01,
             verbose=1,
-            device="cpu",
+            device="auto",
             seed=seed,
             policy_kwargs=policy_kwargs  # Applied hyperparams
         )
