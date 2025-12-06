@@ -798,25 +798,33 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252
+    rf_daily = risk_free_rate / 252.0
     excess_returns = returns - rf_daily
     mean_excess = np.mean(excess_returns)
     std_excess = np.std(excess_returns, ddof=1)
-    if std_excess < 1e-8: return 0.0
+    if std_excess < 1e-9: return 0.0
     return (mean_excess / std_excess) * np.sqrt(252)
 
 def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252
+    rf_daily = risk_free_rate / 252.0
     excess_returns = returns - rf_daily
     mean_excess = np.mean(excess_returns)
-    downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
-    if downside_deviation < 1e-8: return 100.0 if mean_excess > 0 else 0.0
+    
+    # Sortino uses downside deviation of excess returns below 0
+    downside_returns = excess_returns[excess_returns < 0]
+    
+    # If no downside, Sortino is infinite (technically), but we return high value or 0
+    if len(downside_returns) == 0:
+        return 0.0
+        
+    downside_deviation = np.sqrt(np.mean(downside_returns**2))
+    if downside_deviation < 1e-9: return 0.0    
     return (mean_excess / downside_deviation) * np.sqrt(252)
     
 def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
