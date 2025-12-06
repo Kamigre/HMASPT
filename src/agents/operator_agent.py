@@ -649,6 +649,55 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                     print(f"   Reason: {decision['reason']}")
                     print(f"   Metrics: {decision['metrics']}")
                     
+                    # ---------------------------------------------------------
+                    # FORCE CLOSE POSITION LOGIC ADDED HERE
+                    # ---------------------------------------------------------
+                    if info.get('position', 0) != 0:
+                        print(f"   ⚠️ Force closing position {info.get('position')} to realize PnL...")
+                        
+                        # Action 1 = Flat/Close (since base_position = action - 1)
+                        # Action 0 -> Short (-1), Action 1 -> Flat (0), Action 2 -> Long (1)
+                        action_close = 1 
+                        
+                        # Execute the closing step
+                        obs, reward, terminated, _, info = env.step(action_close)
+                        
+                        # Create trace for the closing action
+                        closing_trace = {
+                            "pair": f"{pair[0]}-{pair[1]}",
+                            "step": global_step + 1,
+                            "local_step": local_step + 1,
+                            "reward": float(reward),
+                            "portfolio_value": float(info.get("portfolio_value", 0.0)),
+                            "cum_return": float(info.get("cum_return", 0.0)),
+                            "cum_reward": float(info.get("cum_reward", 0.0)),
+                            "position": float(info.get("position", 0)), # Should be 0 now
+                            "max_drawdown": float(info.get("drawdown", 0)),
+                            "cash": float(info.get("cash", 0.0)),
+                            "realized_pnl": float(info.get("realized_pnl", 0.0)),
+                            "unrealized_pnl": float(info.get("unrealized_pnl", 0.0)),
+                            "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
+                            "transaction_costs": float(info.get("transaction_costs", 0.0)),
+                            "entry_spread": float(info.get("entry_spread", 0.0)),
+                            "current_spread": float(info.get("current_spread", 0.0)),
+                            "days_in_position": int(info.get("days_in_position", 0)),
+                            "daily_return": float(info.get("daily_return", 0.0)),
+                            "num_trades": int(info.get("num_trades", 0)),
+                            "trade_occurred": bool(info.get("trade_occurred", False)),
+                            "forced_close_by_supervisor": True
+                        }
+                        
+                        episode_traces.append(closing_trace)
+                        all_traces.append(closing_trace)
+                        operator.add_trace(closing_trace)
+                        
+                        if hasattr(operator, 'save_detailed_trace'):
+                            operator.save_detailed_trace(closing_trace)
+                            
+                        # Increment global steps to account for the closing action
+                        global_step += 1
+                        local_step += 1
+
                     # Record skip information
                     skip_info = {
                         "pair": f"{pair[0]}-{pair[1]}",
@@ -656,7 +705,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                         "severity": severity,
                         "step_stopped": global_step,
                         "local_step_stopped": local_step,
-                        "metrics": decision['metrics']
+                        "metrics": decision['metrics'],
+                        "final_pnl": float(info.get("realized_pnl", 0.0)) # PnL after close
                     }
                     
                     skipped_pairs.append(skip_info)
