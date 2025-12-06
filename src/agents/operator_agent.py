@@ -126,52 +126,38 @@ class PairTradingEnv(gym.Env):
 
     def step(self, action: int):
         """
-        Execute one trading step with proper P&L calculation.
-        
-        Action mapping:
-        0 → Short position (-1 * scale)
-        1 → Flat (0)
-        2 → Long position (+1 * scale)
+        Execute one trading step. 
+        CRITICAL UPDATE: Forces a close (position=0) at the last timestep 
+        to ensure all P&L is realized and logged before termination.
         """
-        
-        # Map action to target position
-        base_position = int(action) - 1  # Maps to -1, 0, +1
-        target_position = base_position * self.position_scale
-        
         current_idx = self.idx
         
-        # Check if episode is done
-        terminated = current_idx >= len(self.spread_np) - 1
-        if terminated:
-            obs = self._get_observation(current_idx)
-            info = {
-                'portfolio_value': float(self.portfolio_value),
-                'cash': float(self.cash),
-                'realized_pnl': float(self.realized_pnl),
-                'unrealized_pnl': float(self.unrealized_pnl),
-                'realized_pnl_this_step': 0.0,
-                'transaction_costs': 0.0,
-                'position': int(self.position),
-                'entry_spread': float(self.entry_spread),
-                'current_spread': float(self.spread_np[current_idx]),
-                'days_in_position': int(self.days_in_position),
-                'daily_return': 0.0,
-                'drawdown': (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8),
-                'num_trades': int(self.num_trades),
-                'trade_occurred': False,
-                'cum_return': float(self.portfolio_value / self.initial_capital - 1)
-            }
-            return obs, 0.0, True, False, info
+        # 1. Determine if this is the last available step in the data
+        is_last_step = (current_idx >= len(self.spread_np) - 1)
+        
+        # 2. Determine Action
+        if is_last_step:
+            # FORCE EXIT: Ignore agent action, set target to 0 (Flat)
+            target_position = 0
+        else:
+            # Standard agent action
+            base_position = int(action) - 1  # Maps to -1, 0, +1
+            target_position = base_position * self.position_scale
 
-        next_idx = current_idx + 1
-        
-        # Get current and next spread
+        # 3. Setup Data
         current_spread = float(self.spread_np[current_idx])
-        next_spread = float(self.spread_np[next_idx])
         
-        # ============================================================
-        # POSITION CHANGE LOGIC
-        # ============================================================
+        if is_last_step:
+            # There is no "next" spread, so we calculate as if spread stayed same
+            # (Unrealized P&L goes to 0 anyway because position becomes 0)
+            next_spread = current_spread 
+            next_idx = current_idx  # Don't increment index beyond bounds
+        else:
+            next_idx = current_idx + 1
+            next_spread = float(self.spread_np[next_idx])
+            
+        # 4. Execute Trade & Update Financials
+        # (This logic handles realized P&L calc automatically when target_position=0)
         
         position_change = target_position - self.position
         trade_occurred = (position_change != 0)
@@ -180,129 +166,88 @@ class PairTradingEnv(gym.Env):
         transaction_costs = 0.0
         
         if trade_occurred:
-            # --------------------------------------------------------
-            # CASE 1: Closing or reducing a position → Realize P&L
-            # --------------------------------------------------------
+            # Calculate Realized P&L (Closing logic)
             if self.position != 0:
-                # Calculate P&L on the portion being closed
                 spread_change = current_spread - self.entry_spread
                 
-                if target_position == 0:
-                    # Fully closing position
+                # If closing or flipping, calculation is simple
+                # For forced exit (target=0), closed_size is full position
+                if target_position == 0 or np.sign(target_position) != np.sign(self.position):
                     closed_size = abs(self.position)
-                    pnl_on_closed = self.position * spread_change
-                    
-                elif np.sign(target_position) == np.sign(self.position):
-                    # Reducing position (same direction)
-                    closed_size = abs(position_change)
-                    pnl_on_closed = position_change * spread_change
-                    
                 else:
-                    # Flipping position (e.g., from long to short)
-                    # Close entire old position, then open new one
-                    closed_size = abs(self.position)
-                    pnl_on_closed = self.position * spread_change
-                
-                realized_pnl_this_step += pnl_on_closed
-                
-                # Record trade
-                self.trade_history.append({
-                    'entry_spread': self.entry_spread,
-                    'exit_spread': current_spread,
-                    'position': self.position,
-                    'pnl': pnl_on_closed,
-                    'holding_days': self.days_in_position
-                })
-            
-            # --------------------------------------------------------
-            # CASE 2: Opening or increasing position → Set entry price
-            # --------------------------------------------------------
-            if target_position != 0:
-                if np.sign(target_position) != np.sign(self.position):
-                    # New position or flip → reset entry price
-                    self.entry_spread = current_spread
-                    self.days_in_position = 0
-                # If increasing same direction, keep original entry price
-            else:
-                # Flat position
-                self.entry_spread = 0.0
-                self.days_in_position = 0
-            
-            # --------------------------------------------------------
-            # Transaction costs
-            # --------------------------------------------------------
+                    closed_size = abs(position_change)
+                    
+                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
+
+            # Transaction Costs
             trade_size = abs(position_change)
             notional = trade_size * abs(current_spread)
             transaction_costs = notional * self.transaction_cost_rate
-            
             self.num_trades += 1
             
+            # Reset Entry Price logic
+            if target_position != 0 and np.sign(target_position) != np.sign(self.position):
+                self.entry_spread = current_spread
+                self.days_in_position = 0
+            elif target_position == 0:
+                self.entry_spread = 0.0
+                self.days_in_position = 0
+                
+            # Log trade history
+            if self.position != 0:
+                 self.trade_history.append({
+                    'entry_spread': self.entry_spread,
+                    'exit_spread': current_spread,
+                    'position': self.position,
+                    'pnl': realized_pnl_this_step,
+                    'holding_days': self.days_in_position,
+                    'forced_close': is_last_step # Tag this specific trade
+                })
         else:
-            # No trade occurred
             self.days_in_position += 1
-        
-        # ============================================================
-        # UPDATE FINANCIAL STATE
-        # ============================================================
-        
-        # Update position
+            
+        # Commit State Updates
         self.position = target_position
-        
-        # Update realized P&L (subtract transaction costs)
         self.realized_pnl += realized_pnl_this_step - transaction_costs
-        
-        # Update cash
         self.cash = self.initial_capital + self.realized_pnl
         
-        # Calculate unrealized P&L on current position
+        # Mark to Market (Unrealized PnL)
         if self.position != 0:
             self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
         else:
             self.unrealized_pnl = 0.0
-        
-        # Total portfolio value
+            
         self.portfolio_value = self.cash + self.unrealized_pnl
         
-        # Update index
-        self.idx = next_idx
+        # 5. Calculate Returns (using previous portfolio value for accurate daily return)
+        if not hasattr(self, 'prev_portfolio_value'):
+            self.prev_portfolio_value = self.initial_capital
+
+        daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
+        self.prev_portfolio_value = self.portfolio_value
         
-        # ============================================================
-        # PERFORMANCE METRICS
-        # ============================================================
-        
-        # Daily return (on total portfolio value)
-        previous_value = self.cash - realized_pnl_this_step + transaction_costs + \
-                        (self.position * (current_spread - self.entry_spread))
-        daily_return = (self.portfolio_value - previous_value) / max(previous_value, 1e-8)
-        
-        # Drawdown
+        # 6. Update Metrics
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # ============================================================
-        # REWARD FUNCTION
-        # ============================================================
-        
-        # Main objective: portfolio return
-        reward = 10.0 * daily_return
-        
-        # Penalize drawdown
-        reward -= 5.0 * (drawdown ** 2)
-        
-        # Small penalty for holding time (encourage mean reversion trading)
+        # 7. Calculate Reward
+        # (Standard logic, you can swap with your optimized one if you have it)
+        reward = daily_return * 100.0
+        reward -= 0.5 * drawdown
         if self.position != 0:
-            reward -= 0.00 * self.days_in_position
-        
-        # Bonus for realized profits
+            reward -= 0.05 * self.days_in_position
         if realized_pnl_this_step > 0:
-            reward += 0.5 * (realized_pnl_this_step / self.initial_capital)
+            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 100.0
+        reward = np.clip(reward, -10.0, 10.0)
         
-        reward -= 0.0005 * abs(position_change)
+        # 8. Update Index (only if not last step)
+        if not is_last_step:
+            self.idx = next_idx
         
-        # ============================================================
-        # INFO DICT
-        # ============================================================
+        # 9. Get Observation
+        obs = self._get_observation(self.idx)
         
+        # 10. Info
         info = {
             'portfolio_value': float(self.portfolio_value),
             'cash': float(self.cash),
@@ -312,16 +257,18 @@ class PairTradingEnv(gym.Env):
             'transaction_costs': float(transaction_costs),
             'position': int(self.position),
             'entry_spread': float(self.entry_spread),
-            'current_spread': float(next_spread),
+            'current_spread': float(current_spread),
             'days_in_position': int(self.days_in_position),
             'daily_return': float(daily_return),
             'drawdown': float(drawdown),
             'num_trades': int(self.num_trades),
             'trade_occurred': bool(trade_occurred),
-            'cum_return': float(self.portfolio_value / self.initial_capital - 1)
+            'cum_return': float(self.portfolio_value / self.initial_capital - 1),
+            'forced_close': is_last_step and trade_occurred  # Flag for visualizer
         }
         
-        obs = self._get_observation(self.idx)
+        # If this was the last step, we are done
+        terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
 
@@ -417,12 +364,14 @@ class OperatorAgent:
         model = RecurrentPPO(
             "MlpLstmPolicy",
             env,
-            learning_rate=0.001,
+            learning_rate=0.0001,
             n_steps=4096,
             batch_size=256,
             n_epochs=20,
             gamma=0.99,
-            ent_coef=0.01,
+            # 0.01 is standard. 0.05 forces the agent to try random actions 
+            # (buying/selling) more often during early training.
+            ent_coef=0.05,
             verbose=1,
             device="auto",
             seed=seed,
