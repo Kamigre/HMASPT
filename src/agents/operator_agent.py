@@ -184,6 +184,10 @@ class PairTradingEnv(gym.Env):
         # 3. Setup Data
         current_spread = float(self.spread_np[current_idx])
         
+        # NEW: Capture raw prices for behavior analysis
+        current_price_x = float(self.data.iloc[current_idx, 0])
+        current_price_y = float(self.data.iloc[current_idx, 1])
+        
         if is_last_step:
             next_spread = current_spread 
             next_idx = current_idx 
@@ -293,7 +297,10 @@ class PairTradingEnv(gym.Env):
             'num_trades': int(self.num_trades),
             'trade_occurred': bool(trade_occurred),
             'cum_return': float(self.portfolio_value / self.initial_capital - 1),
-            'forced_close': is_last_step and trade_occurred
+            'forced_close': is_last_step and trade_occurred,
+            # NEW DATA FIELDS
+            'price_x': current_price_x,
+            'price_y': current_price_y
         }
         
         terminated = is_last_step
@@ -349,7 +356,7 @@ class OperatorAgent:
 
         # Get seed from CONFIG
         seed = CONFIG.get("random_seed", 42)
-                           
+                            
         if not self.active:
             return None
 
@@ -619,6 +626,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "daily_return": float(info.get("daily_return", 0.0)),
                 "num_trades": int(info.get("num_trades", 0)),
                 "trade_occurred": bool(info.get("trade_occurred", False)),
+                # NEW FIELDS FOR VISUALIZATION
+                "price_x": float(info.get("price_x", 0.0)),
+                "price_y": float(info.get("price_y", 0.0))
             }
 
             episode_traces.append(trace)
@@ -649,55 +659,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                     print(f"   Reason: {decision['reason']}")
                     print(f"   Metrics: {decision['metrics']}")
                     
-                    # ---------------------------------------------------------
-                    # FORCE CLOSE POSITION LOGIC ADDED HERE
-                    # ---------------------------------------------------------
-                    if info.get('position', 0) != 0:
-                        print(f"   ⚠️ Force closing position {info.get('position')} to realize PnL...")
-                        
-                        # Action 1 = Flat/Close (since base_position = action - 1)
-                        # Action 0 -> Short (-1), Action 1 -> Flat (0), Action 2 -> Long (1)
-                        action_close = 1 
-                        
-                        # Execute the closing step
-                        obs, reward, terminated, _, info = env.step(action_close)
-                        
-                        # Create trace for the closing action
-                        closing_trace = {
-                            "pair": f"{pair[0]}-{pair[1]}",
-                            "step": global_step + 1,
-                            "local_step": local_step + 1,
-                            "reward": float(reward),
-                            "portfolio_value": float(info.get("portfolio_value", 0.0)),
-                            "cum_return": float(info.get("cum_return", 0.0)),
-                            "cum_reward": float(info.get("cum_reward", 0.0)),
-                            "position": float(info.get("position", 0)), # Should be 0 now
-                            "max_drawdown": float(info.get("drawdown", 0)),
-                            "cash": float(info.get("cash", 0.0)),
-                            "realized_pnl": float(info.get("realized_pnl", 0.0)),
-                            "unrealized_pnl": float(info.get("unrealized_pnl", 0.0)),
-                            "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
-                            "transaction_costs": float(info.get("transaction_costs", 0.0)),
-                            "entry_spread": float(info.get("entry_spread", 0.0)),
-                            "current_spread": float(info.get("current_spread", 0.0)),
-                            "days_in_position": int(info.get("days_in_position", 0)),
-                            "daily_return": float(info.get("daily_return", 0.0)),
-                            "num_trades": int(info.get("num_trades", 0)),
-                            "trade_occurred": bool(info.get("trade_occurred", False)),
-                            "forced_close_by_supervisor": True
-                        }
-                        
-                        episode_traces.append(closing_trace)
-                        all_traces.append(closing_trace)
-                        operator.add_trace(closing_trace)
-                        
-                        if hasattr(operator, 'save_detailed_trace'):
-                            operator.save_detailed_trace(closing_trace)
-                            
-                        # Increment global steps to account for the closing action
-                        global_step += 1
-                        local_step += 1
-
                     # Record skip information
                     skip_info = {
                         "pair": f"{pair[0]}-{pair[1]}",
@@ -705,8 +666,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                         "severity": severity,
                         "step_stopped": global_step,
                         "local_step_stopped": local_step,
-                        "metrics": decision['metrics'],
-                        "final_pnl": float(info.get("realized_pnl", 0.0)) # PnL after close
+                        "metrics": decision['metrics']
                     }
                     
                     skipped_pairs.append(skip_info)
@@ -848,33 +808,25 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t.get('daily_return', 0.0) for t in traces])
+    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252.0
+    rf_daily = risk_free_rate / 252
     excess_returns = returns - rf_daily
     mean_excess = np.mean(excess_returns)
     std_excess = np.std(excess_returns, ddof=1)
-    if std_excess < 1e-9: return 0.0
+    if std_excess < 1e-8: return 0.0
     return (mean_excess / std_excess) * np.sqrt(252)
 
 def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None:
         risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t.get('daily_return', 0.0) for t in traces])
+    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252.0
+    rf_daily = risk_free_rate / 252
     excess_returns = returns - rf_daily
     mean_excess = np.mean(excess_returns)
-    
-    # Sortino uses downside deviation of excess returns below 0
-    downside_returns = excess_returns[excess_returns < 0]
-    
-    # If no downside, Sortino is infinite (technically), but we return high value or 0
-    if len(downside_returns) == 0:
-        return 0.0
-        
-    downside_deviation = np.sqrt(np.mean(downside_returns**2))
-    if downside_deviation < 1e-9: return 0.0    
+    downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
+    if downside_deviation < 1e-8: return 100.0 if mean_excess > 0 else 0.0
     return (mean_excess / downside_deviation) * np.sqrt(252)
     
 def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
