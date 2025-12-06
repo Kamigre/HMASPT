@@ -10,6 +10,7 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 
 # ==============================================================================
