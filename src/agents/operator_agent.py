@@ -12,16 +12,16 @@ from sb3_contrib import RecurrentPPO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
+from statsmodels.tsa.stattools import adfuller
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import CONFIG
+from config import CONFIG 
 from utils import half_life, compute_spread
 from agents.message_bus import JSONLogger
-from statsmodels.tsa.stattools import coint
 
 class PairTradingEnv(gym.Env):
 
-    def __init__(self, series_x: pd.Series, series_y: pd.Series, 
+    def __init__(self, series_x: pd.Series, series_y: pd.Series,
                  lookback: int = 30,
                  initial_capital: float = 10000,
                  position_scale: int = 100,
@@ -38,19 +38,23 @@ class PairTradingEnv(gym.Env):
         self.position_scale = position_scale
         self.transaction_cost_rate = transaction_cost_rate
         
+        # --- NEW RISK PARAMETERS ---
+        self.STOP_LOSS_FACTOR = 3.0  # Stop loss at 3 standard deviations
+        self.TAKE_PROFIT_FACTOR = 1.0 # Take profit at 1 standard deviation
+        
         # Action: 3 discrete actions (short, flat, long)
         self.action_space = spaces.Discrete(3)
         
-        # Observation space INCREASED to 14 (Added RSI and Vol Ratio)
+        # Observation space INCREASED to 16 (ADF, Half-Life, Prev Position, Prev Spread)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(16,), dtype=np.float32
         )
         
         # PARAMETERS
         self.reward_scale = 10.0
-        self.drawdown_penalty_factor = 0.5
-        self.holding_penalty = 0.05
-        self.profit_bonus = 2.0
+        self.drawdown_penalty_factor = 1.0 # Increased penalty
+        self.holding_penalty_factor = 0.005 # Reduced factor, reward adjustment is more direct
+        self.profit_bonus = 5.0 # Increased bonus for successful trade closure
         
         # Precompute spread and features
         self._precompute_features()
@@ -73,45 +77,51 @@ class PairTradingEnv(gym.Env):
         # Raw spread
         self.spread = x - y
         
-        # 1. Z-scores (Mean Reversion Signals)
-        self.zscore_short = (
-            (self.spread - self.spread.rolling(self.lookback).mean()) / 
-            (self.spread.rolling(self.lookback).std() + 1e-8)
-        )
+        # 1. Mean Reversion Signals
+        rolling_mean = self.spread.rolling(self.lookback).mean()
+        rolling_std = self.spread.rolling(self.lookback).std() + 1e-8
+        
+        self.zscore_short = (self.spread - rolling_mean) / rolling_std
         
         self.zscore_long = (
             (self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
             (self.spread.rolling(self.lookback * 2).std() + 1e-8)
         )
         
-        # 2. Volatility Features (Risk Detection)
-        self.vol_short = self.spread.rolling(self.lookback).std()
+        # 2. Volatility Features
+        self.vol_short = rolling_std
         self.vol_long = self.spread.rolling(self.lookback * 3).std()
-        
-        # Volatility Ratio: If > 1.0, market is becoming more turbulent (Regime Change)
         self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
         
-        # 3. Momentum Features (Trend Detection)
-        # RSI helps distinguish "Oversold" (Good Entry) from "Crashing" (Bad Entry)
+        # 3. Momentum Features
         self.rsi = self._compute_rsi(self.spread, period=14)
-        
+
+        # 4. Stationarity/Regime Features (NEW)
+        # Compute ADF p-value and Half-Life on rolling lookback window
+        adf_pvalue = self.spread.rolling(self.lookback).apply(lambda s: adfuller(s.dropna())[1], raw=False)
+        half_life_series = self.spread.rolling(self.lookback).apply(lambda s: half_life(s.dropna()), raw=False)
+
+        self.adf_pvalue_np = np.nan_to_num(adf_pvalue.to_numpy(), nan=1.0) # Default to non-stationary (1.0)
+        self.half_life_np = np.nan_to_num(half_life_series.to_numpy(), nan=252.0) # Default to 1 year (slowest)
+
         # Convert to numpy and fill NaNs
         self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0)
         self.zscore_short_np = np.nan_to_num(self.zscore_short.to_numpy(), nan=0.0)
         self.zscore_long_np = np.nan_to_num(self.zscore_long.to_numpy(), nan=0.0)
         self.vol_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0)
         self.vol_ratio_np = np.nan_to_num(self.vol_ratio.to_numpy(), nan=1.0)
-        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0) # Default to neutral 50
-
+        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0)
+        
     def _get_observation(self, idx: int) -> np.ndarray:
         """Build NORMALIZED observation vector"""
         if idx < 0 or idx >= len(self.spread_np):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
         
-        # Normalize financial metrics by initial capital
-        # This keeps values generally between -1.0 and 1.0, which neural nets love.
         norm_unrealized = self.unrealized_pnl / self.initial_capital
         norm_realized = self.realized_pnl / self.initial_capital
+        
+        # Get previous step's observation for LSTMs (t-1)
+        prev_idx = max(0, idx - 1)
         
         obs = np.array([
             self.zscore_short_np[idx],
@@ -119,22 +129,27 @@ class PairTradingEnv(gym.Env):
             self.vol_np[idx],
             self.spread_np[idx],
             
-            # NEW FEATURES
-            self.rsi_np[idx] / 100.0,       # Scale RSI to 0.0-1.0
-            self.vol_ratio_np[idx],         # Ratio is already small (~1.0)
+            self.rsi_np[idx] / 100.0,
+            self.vol_ratio_np[idx],
             
-            float(self.position / self.position_scale),  
+            # --- NEW STATIONARITY FEATURES ---
+            self.adf_pvalue_np[idx],
+            self.half_life_np[idx] / 252.0, # Scale Half-Life
+            
+            # --- AGENT STATE & NORMALIZED FINANCIALS ---
+            float(self.position / self.position_scale),
             float(self.entry_spread) if self.position != 0 else 0.0,
             
-            # NORMALIZED FINANCIALS
             float(norm_unrealized),
             float(norm_realized),
             
-            float(self.cash / self.initial_capital - 1),  
-            float(self.portfolio_value / self.initial_capital - 1),  
+            float(self.cash / self.initial_capital - 1),
+            float(self.portfolio_value / self.initial_capital - 1),
             
-            float(self.days_in_position) / 252.0, # Scale days to ~0.0-1.0 (assuming max 1 year hold)
-            float(self.num_trades) / 100.0,       # Soft scaling for trade count
+            # --- LAGGED STATE FEATURES (NEW) ---
+            float(self.prev_position / self.position_scale), 
+            float(self.spread_np[prev_idx]),
+            
         ], dtype=np.float32)
         
         return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -145,13 +160,14 @@ class PairTradingEnv(gym.Env):
         
         self.idx = self.lookback if not self.test_mode else 0
         self.position = 0
-        self.entry_spread = 0.0 
+        self.prev_position = 0.0 # NEW
+        self.entry_spread = 0.0
         self.days_in_position = 0
         
         # Financial tracking
         self.cash = self.initial_capital
-        self.realized_pnl = 0.0 
-        self.unrealized_pnl = 0.0 
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
         self.portfolio_value = self.initial_capital
         
         # Performance tracking
@@ -170,73 +186,100 @@ class PairTradingEnv(gym.Env):
         Forces a close (position=0) at the last timestep.
         """
         current_idx = self.idx
+        self.prev_position = self.position # Track previous position
         
         # 1. Determine if this is the last available step
         is_last_step = (current_idx >= len(self.spread_np) - 1)
         
-        # 2. Determine Action
-        if is_last_step:
-            target_position = 0 # FORCE EXIT
-        else:
-            base_position = int(action) - 1
-            target_position = base_position * self.position_scale
-
-        # 3. Setup Data
+        # 2. Setup Data
         current_spread = float(self.spread_np[current_idx])
-        
-        # NEW: Capture raw prices for behavior analysis
-        current_price_x = float(self.data.iloc[current_idx, 0])
-        current_price_y = float(self.data.iloc[current_idx, 1])
+        current_vol = float(self.vol_np[current_idx])
         
         if is_last_step:
-            next_spread = current_spread 
-            next_idx = current_idx 
+            next_spread = current_spread
+            next_idx = current_idx
+            base_target_action = 0 # FORCE EXIT
         else:
             next_idx = current_idx + 1
             next_spread = float(self.spread_np[next_idx])
-            
-        # 4. Execute Trade & Update Financials
-        position_change = target_position - self.position
-        trade_occurred = (position_change != 0)
+            base_target_action = int(action) - 1 # -1, 0, 1
+
+        target_position_from_agent = base_target_action * self.position_scale
         
         realized_pnl_this_step = 0.0
         transaction_costs = 0.0
+        
+        # --- NEW: Hard Risk Management Check ---
+        forced_exit = False
+        if self.position != 0 and self.entry_spread != 0.0:
+            pnl_on_current_spread = self.position * (current_spread - self.entry_spread)
+            
+            # Stop Loss (if unrealized loss exceeds STDs)
+            sl_threshold = abs(self.position) * current_vol * self.STOP_LOSS_FACTOR
+            if pnl_on_current_spread < -sl_threshold:
+                target_position_from_agent = 0
+                forced_exit = True
+            
+            # Take Profit (if unrealized gain exceeds STDs)
+            tp_threshold = abs(self.position) * current_vol * self.TAKE_PROFIT_FACTOR
+            if pnl_on_current_spread > tp_threshold:
+                target_position_from_agent = 0
+                # NOTE: The agent still gets the profit, but the position is closed.
+                # The profit bonus in the reward function will further incentivize this.
+                forced_exit = True
+
+        # FINAL Target Position
+        target_position = target_position_from_agent
+
+        # 4. Execute Trade & Update Financials
+        position_change = target_position - self.position
+        trade_occurred = (position_change != 0)
         
         if trade_occurred:
             # Calculate Realized P&L
             if self.position != 0:
                 spread_change = current_spread - self.entry_spread
                 
-                if target_position == 0 or np.sign(target_position) != np.sign(self.position):
-                    closed_size = abs(self.position)
-                else:
+                # Close the full old position or the change amount
+                closed_size = abs(self.position)
+                if abs(target_position) < abs(self.position) and np.sign(target_position) == np.sign(self.position):
                     closed_size = abs(position_change)
-                    
-                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
 
+                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
+                
             # Costs
             trade_size = abs(position_change)
-            notional = trade_size * abs(current_spread)
+            # Use current price of X/Y to estimate notional for cost calculation
+            current_price_x = float(self.data.iloc[current_idx, 0])
+            current_price_y = float(self.data.iloc[current_idx, 1])
+            notional = trade_size * (current_price_x + current_price_y) / 2 # Approximated total notional
+            
             transaction_costs = notional * self.transaction_cost_rate
             self.num_trades += 1
             
-            # Reset Entry Price
+            # Reset Entry Price/Days
             if target_position != 0 and np.sign(target_position) != np.sign(self.position):
+                # Reverse and Open: New trade starts now
+                self.entry_spread = current_spread
+                self.days_in_position = 0
+            elif target_position != 0 and self.position == 0:
+                 # Open from Flat
                 self.entry_spread = current_spread
                 self.days_in_position = 0
             elif target_position == 0:
+                # Close to Flat
                 self.entry_spread = 0.0
                 self.days_in_position = 0
                 
-            # Log history
-            if self.position != 0:
-                 self.trade_history.append({
+            # Log history (only when closing a full position)
+            if self.position != 0 and target_position == 0:
+                self.trade_history.append({
                     'entry_spread': self.entry_spread,
                     'exit_spread': current_spread,
                     'position': self.position,
                     'pnl': realized_pnl_this_step,
                     'holding_days': self.days_in_position,
-                    'forced_close': is_last_step
+                    'forced_close': is_last_step or forced_exit
                 })
         else:
             self.days_in_position += 1
@@ -254,9 +297,6 @@ class PairTradingEnv(gym.Env):
         self.portfolio_value = self.cash + self.unrealized_pnl
         
         # 5. Returns
-        if not hasattr(self, 'prev_portfolio_value'):
-            self.prev_portfolio_value = self.initial_capital
-
         daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
         self.prev_portfolio_value = self.portfolio_value
         
@@ -264,14 +304,30 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # 7. Reward
-        reward = daily_return * 100.0
-        reward -= 0.5 * drawdown
-        if self.position != 0:
-            reward -= 0.05 * self.days_in_position
+        # 7. Reward (NEW: Sharpe-like and Drawdown-focused)
+        
+        # Calculate recent return volatility
+        # Note: In a real training setup, this should be calculated from a separate log of returns.
+        # Here we use a rolling window of the daily return itself.
+        current_return_volatility = np.std([t['daily_return'] for t in self.trade_history[-20:] if 'daily_return' in t], ddof=1) if len(self.trade_history) >= 2 else 1e-4
+
+        # Sharpe-like term: Reward = Return / Volatility (capped to prevent division by zero/tiny vol)
+        sharpe_term = daily_return / max(current_return_volatility, 1e-4)
+        
+        # Drawdown Penalty: Penalize deep drawdowns more heavily
+        drawdown_penalty = self.drawdown_penalty_factor * drawdown
+        
+        # Holding Penalty: Mild penalty for holding to encourage quicker trades
+        holding_penalty = self.holding_penalty_factor * self.days_in_position * (1.0 if self.position != 0 else 0.0)
+
+        # Profit Bonus: High bonus for successfully closing a profitable trade
+        profit_bonus = 0.0
         if realized_pnl_this_step > 0:
-            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 100.0
-        reward = np.clip(reward, -10.0, 10.0)
+            profit_bonus = self.profit_bonus * (realized_pnl_this_step / self.initial_capital)
+        
+        reward = (sharpe_term * self.reward_scale) - drawdown_penalty - holding_penalty + profit_bonus
+
+        reward = np.clip(reward, -self.reward_scale, self.reward_scale)
         
         # 8. Index
         if not is_last_step:
@@ -298,9 +354,11 @@ class PairTradingEnv(gym.Env):
             'trade_occurred': bool(trade_occurred),
             'cum_return': float(self.portfolio_value / self.initial_capital - 1),
             'forced_close': is_last_step and trade_occurred,
-            # NEW DATA FIELDS
-            'price_x': current_price_x,
-            'price_y': current_price_y
+            'risk_exit': bool(forced_exit), # NEW: Flag for SL/TP exit
+            'adf_pvalue': float(self.adf_pvalue_np[current_idx]), # NEW for monitoring
+            'half_life': float(self.half_life_np[current_idx]), # NEW for monitoring
+            'price_x': float(self.data.iloc[current_idx, 0]),
+            'price_y': float(self.data.iloc[current_idx, 1])
         }
         
         terminated = is_last_step
@@ -312,6 +370,8 @@ class OperatorAgent:
     
     logger: JSONLogger = None
     storage_dir: str = "models/"
+    # Add save_detailed_trace method to the class dynamically
+    save_detailed_trace = save_detailed_trace
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
@@ -354,14 +414,13 @@ class OperatorAgent:
                       shock_prob: float = None, shock_scale: float = None,
                       use_curriculum: bool = False):
 
-        # Get seed from CONFIG
         seed = CONFIG.get("random_seed", 42)
                             
         if not self.active:
             return None
 
         if lookback is None:
-            lookback = CONFIG.get("rl_lookback", 30) 
+            lookback = CONFIG.get("rl_lookback", 30)
             
         if timesteps is None:
             timesteps = CONFIG.get("rl_timesteps", 500000)
@@ -373,8 +432,7 @@ class OperatorAgent:
         print(f"Training pair: {x} - {y} (LSTM POLICY)")
         print(f"  Data length: {len(series_x)} days")
         print(f"  Timesteps: {timesteps:,}")
-        print(f"  Time Window (Lookback): {lookback} (Paper optimal: 30)")
-        print(f"  LSTM Hidden Size: 512 (Paper optimal)")
+        print(f"  Time Window (Lookback): {lookback}")
         print(f"{'='*70}")
 
         print("\n🚀 Training with Recurrent PPO (LSTM)...")
@@ -391,6 +449,7 @@ class OperatorAgent:
             n_lstm_layers=1
         )
 
+        # ADJUSTED HYPERPARAMS for better stability and convergence
         model = RecurrentPPO(
             "MlpLstmPolicy",
             env,
@@ -399,13 +458,12 @@ class OperatorAgent:
             batch_size=256,
             n_epochs=20,
             gamma=0.99,
-            # 0.01 is standard. 0.05 forces the agent to try random actions 
-            # (buying/selling) more often during early training.
-            ent_coef=0.05,
+            ent_coef=0.02, # Lowered from 0.05 to favor exploitation for a stable policy
+            clip_range=0.1, # Lowered from 0.2 for more conservative, stable updates
             verbose=1,
             device="auto",
             seed=seed,
-            policy_kwargs=policy_kwargs  # Applied hyperparams
+            policy_kwargs=policy_kwargs
         )
 
         model.learn(total_timesteps=timesteps)
@@ -466,12 +524,6 @@ class OperatorAgent:
         print(f"  Final Return: {final_return:.2f}%")
         print(f"  Sharpe Ratio: {sharpe:.3f}")
         print(f"  Sortino Ratio: {sortino:.3f}")
-        print(f"  Positions used: {unique_positions}")
-
-        for pos in unique_positions:
-            count = np.sum(np.array(positions) == pos)
-            pct = count / len(positions) * 100
-            print(f"    Position {int(pos)}: {pct:.1f}% of time")
 
         trace = {
             "pair": (x, y),
@@ -488,9 +540,8 @@ class OperatorAgent:
 
         return trace
 
-
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
-                        pairs: list, max_workers: int = None):
+                          pairs: list, max_workers: int = None):
 
     if max_workers is None:
         max_workers = CONFIG.get("max_workers", 2)
@@ -612,7 +663,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "reward": float(reward),
                 "portfolio_value": float(info.get("portfolio_value", 0.0)),
                 "cum_return": float(info.get("cum_return", 0.0)),
-                "cum_reward": float(info.get("cum_reward", 0.0)),
                 "position": float(info.get("position", 0)),
                 "max_drawdown": float(info.get("drawdown", 0)),
                 "cash": float(info.get("cash", 0.0)),
@@ -626,6 +676,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "daily_return": float(info.get("daily_return", 0.0)),
                 "num_trades": int(info.get("num_trades", 0)),
                 "trade_occurred": bool(info.get("trade_occurred", False)),
+                "risk_exit": bool(info.get("risk_exit", False)), # NEW
                 # NEW FIELDS FOR VISUALIZATION
                 "price_x": float(info.get("price_x", 0.0)),
                 "price_y": float(info.get("price_y", 0.0))
@@ -656,8 +707,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 if decision["action"] == "stop":
                     severity = decision.get("severity", "critical")
                     print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Skipping to next pair")
-                    print(f"   Reason: {decision['reason']}")
-                    print(f"   Metrics: {decision['metrics']}")
+                    print(f"    Reason: {decision['reason']}")
+                    print(f"    Metrics: {decision['metrics']}")
                     
                     # Record skip information
                     skip_info = {
@@ -679,14 +730,14 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 
                 elif decision["action"] == "adjust":
                     print(f"\n⚠️  SUPERVISOR WARNING [{decision.get('severity', 'warning').upper()}]:")
-                    print(f"   {decision['reason']}")
+                    print(f"    {decision['reason']}")
                     if 'suggestion' in decision:
-                        print(f"   💡 Suggestion: {decision['suggestion']}")
+                        print(f"    💡 Suggestion: {decision['suggestion']}")
                 
                 elif decision["action"] == "warn":
                     if local_step % (check_interval * 4) == 0:
                         print(f"\nℹ️  SUPERVISOR INFO:")
-                        print(f"   {decision['reason']}")
+                        print(f"    {decision['reason']}")
                 
                 if local_step % (check_interval * 2) == 0:
                     metrics = decision["metrics"]
