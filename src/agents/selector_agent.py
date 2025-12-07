@@ -11,12 +11,23 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import CONFIG
+
+# --- Placeholder for CONFIG (Adapt as needed based on your project structure) ---
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from config import CONFIG
+except ImportError:
+    # Fallback if config is not found
+    class DummyConfig:
+        def get(self, key, default):
+            if key == "random_seed": return 42
+            return default
+    CONFIG = DummyConfig()
+# --------------------------------------------------------------------------------
 
 class EnhancedTGNN(nn.Module):
     
-    def __init__(self, node_dim, hidden_dim=64, num_heads=4, dropout=0.2):
+    def __init__(self, node_dim, hidden_dim=64, num_heads=4, dropout=0.3):
         super().__init__()
         
         # 1. Input Encoder
@@ -91,7 +102,7 @@ class EnhancedTGNN(nn.Module):
         return h_out
 
 # ==============================================================================
-# 2. OPTIMIZED AGENT (Volatility Matching + Temporal Training + Early Stopping)
+# 2. OPTIMIZED AGENT
 # ==============================================================================
 
 @dataclass
@@ -101,12 +112,14 @@ class OptimizedSelectorAgent:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     trace_path: str = "traces/selector.jsonl"
     
-    # Hyperparameters
-    corr_threshold: float = 0.65  # Lower threshold, let GNN filter
+    # --- Improved Hyperparameters ---
+    corr_threshold: float = 0.65       # Graph construction threshold (keep broad)
+    train_corr_threshold: float = 0.8  # NEW: Stricter threshold for training samples
     lookback_weeks: int = 4
     holdout_months: int = 18
-    hidden_dim: int = 64
-    num_heads: int = 4
+    hidden_dim: int = 128              # INCREASED CAPACITY
+    num_heads: int = 6                 # INCREASED CAPACITY
+    dropout: float = 0.3               # INCREASED REGULARIZATION (Trace Analysis)
     
     # Internal State
     model: Any = None
@@ -178,10 +191,9 @@ class OptimizedSelectorAgent:
         if "sector" in df.columns:
             if self.industry_encoder is None:
                 self.industry_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                industry_encoded = self.industry_encoder.fit_transform(df[["sector"]])
-            else:
-                industry_encoded = self.industry_encoder.transform(df[["sector"]])
-                
+                self.industry_encoder.fit(df[["sector"]])
+            industry_encoded = self.industry_encoder.transform(df[["sector"]])
+            
             ind_cols = [f"ind_{i}" for i in range(industry_encoded.shape[1])]
             ind_df = pd.DataFrame(industry_encoded, columns=ind_cols, index=df.index)
             df = pd.concat([df, ind_df], axis=1)
@@ -230,26 +242,30 @@ class OptimizedSelectorAgent:
         self.test_df = df[df["date"] >= mid_point].copy()
         
         print(f"✅ Data Prepared. Tickers: {len(self.tickers)}")
-        print(f"   Train: {len(self.train_df)} | Val: {len(self.val_df)} | Test: {len(self.test_df)}")
+        print(f"    Train: {len(self.train_df)} | Val: {len(self.val_df)} | Test: {len(self.test_df)}")
         
         return self.train_df, self.val_df, self.test_df
 
     # ------------------------------------------------------------------------
-    # Graph Construction (Unchanged)
+    # Graph Construction (IMPROVED: Ratio Stability Factor)
     # ------------------------------------------------------------------------
 
     def build_temporal_snapshots(self, df: pd.DataFrame, window_days: int = 20):
-        """Builds graph snapshots with volatility-aware edge weights."""
+        """Builds graph snapshots with volatility-aware and ratio-stability-aware edge weights."""
         df = df.sort_values('date')
         
-        # Returns Pivot
+        # Returns Pivot (for Correlation)
         returns_pivot = df.pivot(index='date', columns='ticker', values='log_returns').fillna(0)
         returns_pivot = returns_pivot.reindex(columns=self.tickers, fill_value=0)
         
         # Volatility Pivot (for penalty)
-        vol_col = [c for c in df.columns if 'volatility' in c][-1] 
+        vol_col = [c for c in df.columns if 'volatility' in c][-1]  
         vol_pivot = df.pivot(index='date', columns='ticker', values=vol_col).fillna(0)
         vol_pivot = vol_pivot.reindex(columns=self.tickers, fill_value=0)
+        
+        # Price Pivot (for Ratio Stability) - NEW
+        adj_close_pivot = df.pivot(index='date', columns='ticker', values='adj_close').fillna(1.0)
+        adj_close_pivot = adj_close_pivot.reindex(columns=self.tickers, fill_value=1.0)
 
         snapshots = []
         dates = returns_pivot.index
@@ -258,18 +274,37 @@ class OptimizedSelectorAgent:
             end_date = dates[i]
             start_idx = max(0, i - window_days)
             
-            # Correlation
+            # 1. Correlation
             window_returns = returns_pivot.iloc[start_idx:i+1]
             corr_matrix = window_returns.corr().values
             corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
             
-            # Volatility Penalty
+            # 2. Volatility Penalty
             avg_vols = vol_pivot.iloc[start_idx:i+1].mean().values
             vol_diff = np.abs(avg_vols[:, None] - avg_vols[None, :])
-            vol_penalty = 1.0 / (1.0 + vol_diff * 10) 
+            vol_penalty = 1.0 / (1.0 + vol_diff * 10)  
             
+            # 3. Ratio Stability Factor (NEW IMPROVEMENT)
+            # This penalizes pairs whose price ratio fluctuates wildly
+            window_adj_close = adj_close_pivot.iloc[start_idx:i+1].values
+            num_nodes = len(self.tickers)
+            ratio_stds = np.zeros_like(corr_matrix)
+            
+            # We calculate this approximately to keep it fast
+            for n1 in range(num_nodes):
+                for n2 in range(n1 + 1, num_nodes):
+                    if abs(corr_matrix[n1, n2]) < self.corr_threshold: 
+                        continue # Skip calculation for uncorrelated pairs
+                        
+                    ratio = window_adj_close[:, n1] / (window_adj_close[:, n2] + 1e-6)
+                    std_dev = np.std(ratio)
+                    ratio_stds[n1, n2] = ratio_stds[n2, n1] = std_dev
+            
+            max_std = np.max(ratio_stds) if np.max(ratio_stds) > 0 else 1.0
+            ratio_stability_factor = 1.0 / (1.0 + ratio_stds / max_std * 5)
+
             # Final Adjacency
-            adj_matrix = corr_matrix * vol_penalty
+            adj_matrix = corr_matrix * vol_penalty * ratio_stability_factor
             
             # Edges
             edges = np.argwhere(np.abs(adj_matrix) >= self.corr_threshold)
@@ -281,7 +316,7 @@ class OptimizedSelectorAgent:
             else:
                 edge_index = torch.tensor(edges.T, dtype=torch.long)
                 edge_weights = torch.tensor([adj_matrix[i, j] for i, j in edges], dtype=torch.float)
-            
+                
             snapshots.append({
                 'date': end_date,
                 'edge_index': edge_index,
@@ -302,13 +337,11 @@ class OptimizedSelectorAgent:
         return torch.tensor(node_features.values, dtype=torch.float)
 
     # ------------------------------------------------------------------------
-    # NEW: Validation Method for Early Stopping
+    # Validation Method (Unchanged)
     # ------------------------------------------------------------------------
     def _validate_model(self, df: pd.DataFrame, criterion, snapshot_stride: int = 1):
-        """Calculates loss on the validation set."""
         self.model.eval()
         
-        # Build snapshots for the validation period
         val_graphs = self.build_temporal_snapshots(df, self.lookback_weeks * 5)
         snapshots = val_graphs[::snapshot_stride]
         if not snapshots: return float('inf')
@@ -332,22 +365,20 @@ class OptimizedSelectorAgent:
                 num_pos = len(pos_pairs)
                 if num_pos == 0: continue
                 
-                # Sample negative pairs (1x for faster validation)
                 neg_src = torch.randint(0, num_nodes, (num_pos,), device=self.device)
                 neg_dst = torch.randint(0, num_nodes, (num_pos,), device=self.device)
                 neg_pairs = torch.stack([neg_src, neg_dst], dim=1)
                 
                 all_pairs = torch.cat([pos_pairs, neg_pairs], dim=0)
                 labels = torch.cat([
-                    torch.ones(num_pos, device=self.device) * 0.9, 
+                    torch.ones(num_pos, device=self.device) * 0.9,  
                     torch.zeros(num_pos, device=self.device)
                 ])
                 
-                # Full Graph Pass (Updates Hidden State)
+                # Full Graph Pass
                 embeddings = self.model(x, edge_index, edge_weights, hidden_state=hidden_state)
-                hidden_state = embeddings # Keep state for sequential processing
+                hidden_state = embeddings 
                 
-                # Score and accumulate loss
                 for i in range(0, len(all_pairs), batch_size):
                     batch_pairs = all_pairs[i:i+batch_size].T
                     batch_labels = labels[i:i+batch_size]
@@ -364,7 +395,7 @@ class OptimizedSelectorAgent:
         return total_val_loss / max(num_batches, 1)
 
     # ------------------------------------------------------------------------
-    # Training Loop (Modified with Early Stopping Logic)
+    # Training Loop (IMPROVED: Harder Sampling + Scheduler + Patience)
     # ------------------------------------------------------------------------
 
     def train(self, epochs: int = 10, lr: float = 0.001, batch_size: int = 1024, snapshot_stride: int = 1):
@@ -373,15 +404,15 @@ class OptimizedSelectorAgent:
         torch.manual_seed(seed)
         if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
         
-        if self.train_df is None or self.val_df is None: 
+        if self.train_df is None or self.val_df is None:  
             raise ValueError("Call prepare_data() first and ensure validation data exists.")
 
         # --- Early Stopping Setup ---
-        PATIENCE = 3
+        # IMPROVEMENT: Increased patience to handle validation noise
+        PATIENCE = 7  
         epochs_without_improvement = 0
         best_val_loss = float('inf')
         
-        # Define a temporary path for the best model weights
         temp_model_path = os.path.join(os.path.dirname(self.trace_path), "best_model_temp.pth")
         
         # Setup Model
@@ -390,10 +421,17 @@ class OptimizedSelectorAgent:
         self.model = EnhancedTGNN(
             node_dim=feat_dim,
             hidden_dim=self.hidden_dim,
-            num_heads=self.num_heads
+            num_heads=self.num_heads,
+            dropout=self.dropout
         ).to(self.device)
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        
+        # IMPROVEMENT: Learning Rate Scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        )
+        
         criterion = nn.BCEWithLogitsLoss()
         
         print("Building temporal snapshots...")
@@ -408,19 +446,21 @@ class OptimizedSelectorAgent:
             self.model.train()
             total_loss = 0.0
             num_batches = 0
-            # Initialize/reset hidden state at the start of each epoch
-            hidden_state = None 
+            hidden_state = None  
             
             for snapshot in snapshots:
-                edge_index = snapshot['edge_index'].to(self.device)
-                edge_weights = snapshot['edge_weights'].to(self.device)
+                full_edge_index = snapshot['edge_index'].to(self.device)
+                full_edge_weights = snapshot['edge_weights'].to(self.device)
                 x = self.create_snapshot_features(self.train_df, snapshot['date']).to(self.device)
                 
-                # Skip if no edges
-                if edge_index.numel() == 0: continue
+                if full_edge_index.numel() == 0: continue
                 
                 # --- Sampling ---
-                pos_pairs = edge_index.T
+                # IMPROVEMENT: Harder Positive Sampling
+                # Only use edge with weight >= train_corr_threshold (0.8) as positive samples
+                high_corr_mask = (full_edge_weights.abs() >= self.train_corr_threshold)
+                pos_pairs = full_edge_index[:, high_corr_mask].T
+                
                 num_pos = len(pos_pairs)
                 if num_pos == 0: continue
                 
@@ -447,15 +487,13 @@ class OptimizedSelectorAgent:
                     
                     optimizer.zero_grad()
                     
-                    # Detach hidden state to prevent backprop through time steps within the epoch
                     current_hidden_state = hidden_state.detach() if hidden_state is not None else None
                     
-                    # Forward pass for loss calculation and state update
-                    scores, embeddings = self.model(x, edge_index, edge_weights, pair_index=batch_pairs, hidden_state=current_hidden_state)
+                    # 1. Forward pass for loss calculation
+                    scores, embeddings = self.model(x, full_edge_index, full_edge_weights, pair_index=batch_pairs, hidden_state=current_hidden_state)
                     
-                    # Update hidden_state for the next time snapshot (must be attached for the next GRU step)
-                    # We detach here to avoid backpropagation through the entire time series in a single training step
-                    hidden_state = self.model(x, edge_index, edge_weights, hidden_state=current_hidden_state).detach()
+                    # 2. Update hidden_state for next snapshot (detached)
+                    hidden_state = self.model(x, full_edge_index, full_edge_weights, hidden_state=current_hidden_state).detach()
 
                     loss = criterion(scores, batch_labels)
                     loss.backward()
@@ -470,29 +508,30 @@ class OptimizedSelectorAgent:
             # --- Early Stopping Check ---
             val_loss = self._validate_model(self.val_df, criterion, snapshot_stride=snapshot_stride)
             
-            print(f"  Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            # Step the scheduler
+            scheduler.step(val_loss)
+            
+            print(f"  Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f}")
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
                 torch.save(self.model.state_dict(), temp_model_path)
                 self._log_event("training_status", {"epoch": epoch+1, "train_loss": avg_train_loss, "val_loss": val_loss, "status": "improved", "best_loss": best_val_loss})
-                print("  🟢 Validation loss improved. Saving best model state.")
+                print("  🟢 Validation loss improved. Saving best model state.")
             else:
                 epochs_without_improvement += 1
                 self._log_event("training_status", {"epoch": epoch+1, "train_loss": avg_train_loss, "val_loss": val_loss, "status": "no_improvement", "patience_left": PATIENCE - epochs_without_improvement})
                 
             if epochs_without_improvement >= PATIENCE:
-                print(f"  🛑 Early stopping triggered. Validation loss hasn't improved for {PATIENCE} epochs. Loading best weights.")
-                # Load the best weights
+                print(f"  🛑 Early stopping triggered. Validation loss hasn't improved for {PATIENCE} epochs. Loading best weights.")
                 if os.path.exists(temp_model_path):
                     self.model.load_state_dict(torch.load(temp_model_path))
-                    os.remove(temp_model_path) # Clean up temporary file
+                    os.remove(temp_model_path)
                 else:
-                    print("⚠️ Warning: Best model state not found (likely no improvement ever). Proceeding with current model.")
+                    print("⚠️ Warning: Best model state not found. Proceeding with current model.")
                 break
                 
-        # Final cleanup if training completed all epochs
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
             
@@ -514,7 +553,6 @@ class OptimizedSelectorAgent:
         snapshots = self.build_temporal_snapshots(df, self.lookback_weeks * 5)
         if not snapshots: raise ValueError("No snapshots")
         
-        # Use the LAST snapshot for scoring (has most recent info)
         snapshot = snapshots[-1]
         
         edge_index = snapshot['edge_index'].to(self.device)
@@ -528,11 +566,8 @@ class OptimizedSelectorAgent:
         batch_size = 10000
         
         with torch.no_grad():
-            # Get embeddings
-            # Run one pass to get the final state embeddings (assuming cold start for scoring phase)
-            embeddings = self.model(x, edge_index, edge_weights, hidden_state=None) 
+            embeddings = self.model(x, edge_index, edge_weights, hidden_state=None)  
             
-            # Score pairs using embeddings
             for i in range(0, len(src_idx), batch_size):
                 batch_src = torch.tensor(src_idx[i:i+batch_size], device=self.device)
                 batch_dst = torch.tensor(dst_idx[i:i+batch_size], device=self.device)
