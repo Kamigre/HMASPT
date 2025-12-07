@@ -13,10 +13,28 @@ def main():
     print("=" * 70)
     print()
 
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("traces", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
+    BASE_OUTPUT_DIR = "/content/drive/MyDrive/TFM test"
 
+    required_dirs = [
+        "models",
+        "results",
+        "reports",
+        "reports/pairs",
+        "traces"
+    ]
+
+    for d in required_dirs:
+        full_path = os.path.join(BASE_OUTPUT_DIR, d)
+        os.makedirs(full_path, exist_ok=True)
+        print(f"Ensuring directory exists: {full_path}")
+    
+    # Create project root directories
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    
+    # Setup environment variables
+    os.environ['PYTHONHASHSEED'] = str(42)
+    sys.path.append("/content/HMASPT/")
+    
 if __name__ == "__main__":
     main()
