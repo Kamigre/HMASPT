@@ -409,7 +409,7 @@ class OperatorAgent:
 
         print(f"\n{'='*70}")
         print(f"Training pair: {x} - {y} (LSTM POLICY)")
-        print(f"  Timesteps: {timesteps:,}")
+        print(f"  Timesteps (RL): {timesteps:,}")
         print(f"{'='*70}")
 
         # Note: position_scale is removed for the continuous environment (V3)
