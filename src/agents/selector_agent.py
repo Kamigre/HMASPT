@@ -12,18 +12,8 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 
-# --- Placeholder for CONFIG (Adapt as needed based on your project structure) ---
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from config import CONFIG
-except ImportError:
-    # Fallback if config is not found
-    class DummyConfig:
-        def get(self, key, default):
-            if key == "random_seed": return 42
-            return default
-    CONFIG = DummyConfig()
-# --------------------------------------------------------------------------------
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import CONFIG
 
 class EnhancedTGNN(nn.Module):
     
