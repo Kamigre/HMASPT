@@ -102,14 +102,13 @@ class OptimizedSelectorAgent:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     trace_path: str = "traces/selector.jsonl"
     
-    # --- Improved Hyperparameters ---
-    corr_threshold: float = 0.65
-    train_corr_threshold: float = 0.85
+    # --- Hyperparameters ---
+    corr_threshold: float = 0.7
     lookback_weeks: int = 4
     holdout_months: int = 18
-    hidden_dim: int = 32
-    num_heads: int = 2
-    dropout: float = 0.4
+    hidden_dim: int = 64
+    num_heads: int = 3
+    dropout: float = 0.25
     
     # Internal State
     model: Any = None
@@ -143,7 +142,7 @@ class OptimizedSelectorAgent:
             f.write(json.dumps(entry, default=str) + "\n")
     
     # ------------------------------------------------------------------------
-    # Feature Engineering (Unchanged)
+    # Feature Engineering
     # ------------------------------------------------------------------------
     
     def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
@@ -237,11 +236,11 @@ class OptimizedSelectorAgent:
         return self.train_df, self.val_df, self.test_df
 
     # ------------------------------------------------------------------------
-    # Graph Construction (IMPROVED: Ratio Stability Factor)
+    # Graph Construction
     # ------------------------------------------------------------------------
 
     def build_temporal_snapshots(self, df: pd.DataFrame, window_days: int = 20):
-        """Builds graph snapshots with volatility-aware and ratio-stability-aware edge weights."""
+        """Builds graph snapshots with volatility-aware edge weights."""
         df = df.sort_values('date')
         
         # Returns Pivot (for Correlation)
@@ -253,10 +252,6 @@ class OptimizedSelectorAgent:
         vol_pivot = df.pivot(index='date', columns='ticker', values=vol_col).fillna(0)
         vol_pivot = vol_pivot.reindex(columns=self.tickers, fill_value=0)
         
-        # Price Pivot (for Ratio Stability) - NEW
-        adj_close_pivot = df.pivot(index='date', columns='ticker', values='adj_close').fillna(1.0)
-        adj_close_pivot = adj_close_pivot.reindex(columns=self.tickers, fill_value=1.0)
-
         snapshots = []
         dates = returns_pivot.index
         
@@ -264,40 +259,10 @@ class OptimizedSelectorAgent:
             end_date = dates[i]
             start_idx = max(0, i - window_days)
             
-            # 1. Correlation
             window_returns = returns_pivot.iloc[start_idx:i+1]
             corr_matrix = window_returns.corr().values
             corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-            
-            # 2. Volatility Penalty
-            avg_vols = vol_pivot.iloc[start_idx:i+1].mean().values
-            vol_diff = np.abs(avg_vols[:, None] - avg_vols[None, :])
-            vol_penalty = 1.0 / (1.0 + vol_diff * 3)  
-            
-            # 3. Ratio Stability Factor (NEW IMPROVEMENT)
-            # This penalizes pairs whose price ratio fluctuates wildly
-            window_adj_close = adj_close_pivot.iloc[start_idx:i+1].values
-            num_nodes = len(self.tickers)
-            ratio_stds = np.zeros_like(corr_matrix)
-            
-            # We calculate this approximately to keep it fast
-            for n1 in range(num_nodes):
-                for n2 in range(n1 + 1, num_nodes):
-                    if abs(corr_matrix[n1, n2]) < self.corr_threshold: 
-                        continue # Skip calculation for uncorrelated pairs
-                        
-                    ratio = window_adj_close[:, n1] / (window_adj_close[:, n2] + 1e-6)
-                    std_dev = np.std(ratio)
-                    ratio_stds[n1, n2] = ratio_stds[n2, n1] = std_dev
-            
-            max_std = np.max(ratio_stds) if np.max(ratio_stds) > 0 else 1.0
-            ratio_stability_factor = 1.0 / (1.0 + ratio_stds / max_std * 5)
-
-            # Final Adjacency
-            adj_matrix = corr_matrix * vol_penalty * ratio_stability_factor
-            
-            # Edges
-            edges = np.argwhere(np.abs(adj_matrix) >= self.corr_threshold)
+            edges = np.argwhere(np.abs(corr_matrix) >= self.corr_threshold)
             edges = edges[edges[:, 0] < edges[:, 1]]
             
             if len(edges) == 0:
@@ -305,7 +270,7 @@ class OptimizedSelectorAgent:
                 edge_weights = torch.empty(0, dtype=torch.float)
             else:
                 edge_index = torch.tensor(edges.T, dtype=torch.long)
-                edge_weights = torch.tensor([adj_matrix[i, j] for i, j in edges], dtype=torch.float)
+                edge_weights = torch.tensor([corr_matrix[i, j] for i, j in edges], dtype=torch.float)
                 
             snapshots.append({
                 'date': end_date,
@@ -327,7 +292,7 @@ class OptimizedSelectorAgent:
         return torch.tensor(node_features.values, dtype=torch.float)
 
     # ------------------------------------------------------------------------
-    # Validation Method (Unchanged)
+    # Validation Method
     # ------------------------------------------------------------------------
     def _validate_model(self, df: pd.DataFrame, criterion, snapshot_stride: int = 1):
         self.model.eval()
@@ -385,7 +350,7 @@ class OptimizedSelectorAgent:
         return total_val_loss / max(num_batches, 1)
 
     # ------------------------------------------------------------------------
-    # Training Loop (IMPROVED: Harder Sampling + Scheduler + Patience)
+    # Training Loop
     # ------------------------------------------------------------------------
 
     def train(self, epochs: int = 10, lr: float = 0.001, batch_size: int = 1024, snapshot_stride: int = 1):
@@ -398,7 +363,6 @@ class OptimizedSelectorAgent:
             raise ValueError("Call prepare_data() first and ensure validation data exists.")
 
         # --- Early Stopping Setup ---
-        # IMPROVEMENT: Increased patience to handle validation noise
         PATIENCE = 7  
         epochs_without_improvement = 0
         best_val_loss = float('inf')
@@ -417,7 +381,6 @@ class OptimizedSelectorAgent:
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
         
-        # IMPROVEMENT: Learning Rate Scheduler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=3
         )
@@ -445,11 +408,9 @@ class OptimizedSelectorAgent:
                 
                 if full_edge_index.numel() == 0: continue
                 
-                # --- Sampling ---
-                # IMPROVEMENT: Harder Positive Sampling
-                # Only use edge with weight >= train_corr_threshold (0.8) as positive samples
-                high_corr_mask = (full_edge_weights.abs() >= self.train_corr_threshold)
-                pos_pairs = full_edge_index[:, high_corr_mask].T
+                # --- Sampling (Reverted to Standard) ---
+                # We simply take all edges existing in the graph as positive pairs
+                pos_pairs = full_edge_index.T
                 
                 num_pos = len(pos_pairs)
                 if num_pos == 0: continue
@@ -528,7 +489,7 @@ class OptimizedSelectorAgent:
         print("✅ Training complete")
 
     # ------------------------------------------------------------------------
-    # Score Pairs (Unchanged)
+    # Score Pairs
     # ------------------------------------------------------------------------
 
     def score_pairs(self, use_validation: bool = True, top_k: int = 100):
