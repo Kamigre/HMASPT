@@ -103,13 +103,13 @@ class OptimizedSelectorAgent:
     trace_path: str = "traces/selector.jsonl"
     
     # --- Improved Hyperparameters ---
-    corr_threshold: float = 0.65       # Graph construction threshold (keep broad)
-    train_corr_threshold: float = 0.8  # NEW: Stricter threshold for training samples
+    corr_threshold: float = 0.65
+    train_corr_threshold: float = 0.85
     lookback_weeks: int = 4
     holdout_months: int = 18
     hidden_dim: int = 32
     num_heads: int = 2
-    dropout: float = 0.3
+    dropout: float = 0.4
     
     # Internal State
     model: Any = None
@@ -272,7 +272,7 @@ class OptimizedSelectorAgent:
             # 2. Volatility Penalty
             avg_vols = vol_pivot.iloc[start_idx:i+1].mean().values
             vol_diff = np.abs(avg_vols[:, None] - avg_vols[None, :])
-            vol_penalty = 1.0 / (1.0 + vol_diff * 10)  
+            vol_penalty = 1.0 / (1.0 + vol_diff * 3)  
             
             # 3. Ratio Stability Factor (NEW IMPROVEMENT)
             # This penalizes pairs whose price ratio fluctuates wildly
