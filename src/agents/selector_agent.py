@@ -14,17 +14,12 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 
-# ==============================================================================
-# 1. ENHANCED MODEL ARCHITECTURE (GATv2 + Bilinear + Memory Support)
-# ==============================================================================
-
 class EnhancedTGNN(nn.Module):
     
     def __init__(self, node_dim, hidden_dim=64, num_heads=4, dropout=0.2):
         super().__init__()
         
         # 1. Input Encoder
-        # We process raw features into a latent vector
         self.node_encoder = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -33,10 +28,9 @@ class EnhancedTGNN(nn.Module):
         )
         
         # 2. Memory Gate (GRU Cell)
-        # This allows the model to update node states over time steps
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         
-        # 3. Graph Attention Layers (GATv2 is more expressive than GAT)
+        # 3. Graph Attention Layers
         self.gat1 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn1 = BatchNorm(hidden_dim)
         
@@ -44,7 +38,6 @@ class EnhancedTGNN(nn.Module):
         self.bn2 = BatchNorm(hidden_dim)
         
         # 4. Pair Scorer (Bilinear + Cosine)
-        # Bilinear captures interactions: x1 * W * x2
         self.bilinear = nn.Bilinear(hidden_dim, hidden_dim, 1)
         
         self.dropout = dropout
@@ -82,7 +75,7 @@ class EnhancedTGNN(nn.Module):
             h = F.relu(h)
             h = h + h_in  # Residual
         
-        # D. Normalize for similarity search
+        # D. Normalize for similarity search (Output node embedding)
         h_out = F.normalize(h, p=2, dim=1)
         
         # E. Score Pairs (if requested)
@@ -98,7 +91,7 @@ class EnhancedTGNN(nn.Module):
         return h_out
 
 # ==============================================================================
-# 2. OPTIMIZED AGENT (Volatility Matching + Temporal Training)
+# 2. OPTIMIZED AGENT (Volatility Matching + Temporal Training + Early Stopping)
 # ==============================================================================
 
 @dataclass
@@ -132,6 +125,7 @@ class OptimizedSelectorAgent:
     temporal_graphs: Optional[List[Dict[str, Any]]] = field(default_factory=list)
     
     def __post_init__(self):
+        # Create trace directory dynamically for robustness
         os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
         self._log_event("init", {"device": self.device})
     
@@ -146,7 +140,7 @@ class OptimizedSelectorAgent:
             f.write(json.dumps(entry, default=str) + "\n")
     
     # ------------------------------------------------------------------------
-    # Feature Engineering
+    # Feature Engineering (Unchanged)
     # ------------------------------------------------------------------------
     
     def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
@@ -192,7 +186,7 @@ class OptimizedSelectorAgent:
             ind_df = pd.DataFrame(industry_encoded, columns=ind_cols, index=df.index)
             df = pd.concat([df, ind_df], axis=1)
             df.drop(columns=["sector"], inplace=True, errors="ignore")
-        
+            
         df.fillna(0.0, inplace=True)
         
         # Identify numeric columns for scaling
@@ -236,12 +230,12 @@ class OptimizedSelectorAgent:
         self.test_df = df[df["date"] >= mid_point].copy()
         
         print(f"✅ Data Prepared. Tickers: {len(self.tickers)}")
-        print(f"   Train: {len(self.train_df)} | Val: {len(self.val_df)} | Test: {len(self.test_df)}")
+        print(f"   Train: {len(self.train_df)} | Val: {len(self.val_df)} | Test: {len(self.test_df)}")
         
         return self.train_df, self.val_df, self.test_df
 
     # ------------------------------------------------------------------------
-    # Graph Construction (Volatility Matching)
+    # Graph Construction (Unchanged)
     # ------------------------------------------------------------------------
 
     def build_temporal_snapshots(self, df: pd.DataFrame, window_days: int = 20):
@@ -308,7 +302,69 @@ class OptimizedSelectorAgent:
         return torch.tensor(node_features.values, dtype=torch.float)
 
     # ------------------------------------------------------------------------
-    # Training Loop (With Sequential Memory)
+    # NEW: Validation Method for Early Stopping
+    # ------------------------------------------------------------------------
+    def _validate_model(self, df: pd.DataFrame, criterion, snapshot_stride: int = 1):
+        """Calculates loss on the validation set."""
+        self.model.eval()
+        
+        # Build snapshots for the validation period
+        val_graphs = self.build_temporal_snapshots(df, self.lookback_weeks * 5)
+        snapshots = val_graphs[::snapshot_stride]
+        if not snapshots: return float('inf')
+        
+        total_val_loss = 0.0
+        num_batches = 0
+        num_nodes = len(self.tickers)
+        batch_size = 1024
+        
+        with torch.no_grad():
+            hidden_state = None
+            for snapshot in snapshots:
+                edge_index = snapshot['edge_index'].to(self.device)
+                edge_weights = snapshot['edge_weights'].to(self.device)
+                x = self.create_snapshot_features(df, snapshot['date']).to(self.device)
+                
+                if edge_index.numel() == 0: continue
+                
+                # --- Sampling ---
+                pos_pairs = edge_index.T
+                num_pos = len(pos_pairs)
+                if num_pos == 0: continue
+                
+                # Sample negative pairs (1x for faster validation)
+                neg_src = torch.randint(0, num_nodes, (num_pos,), device=self.device)
+                neg_dst = torch.randint(0, num_nodes, (num_pos,), device=self.device)
+                neg_pairs = torch.stack([neg_src, neg_dst], dim=1)
+                
+                all_pairs = torch.cat([pos_pairs, neg_pairs], dim=0)
+                labels = torch.cat([
+                    torch.ones(num_pos, device=self.device) * 0.9, 
+                    torch.zeros(num_pos, device=self.device)
+                ])
+                
+                # Full Graph Pass (Updates Hidden State)
+                embeddings = self.model(x, edge_index, edge_weights, hidden_state=hidden_state)
+                hidden_state = embeddings # Keep state for sequential processing
+                
+                # Score and accumulate loss
+                for i in range(0, len(all_pairs), batch_size):
+                    batch_pairs = all_pairs[i:i+batch_size].T
+                    batch_labels = labels[i:i+batch_size]
+                    
+                    src_emb = embeddings[batch_pairs[0]]
+                    dst_emb = embeddings[batch_pairs[1]]
+                    scores = self.model.bilinear(src_emb, dst_emb).squeeze(-1) + F.cosine_similarity(src_emb, dst_emb)
+                    
+                    loss = criterion(scores, batch_labels)
+                    total_val_loss += loss.item()
+                    num_batches += 1
+
+        self.model.train()
+        return total_val_loss / max(num_batches, 1)
+
+    # ------------------------------------------------------------------------
+    # Training Loop (Modified with Early Stopping Logic)
     # ------------------------------------------------------------------------
 
     def train(self, epochs: int = 10, lr: float = 0.001, batch_size: int = 1024, snapshot_stride: int = 1):
@@ -317,8 +373,17 @@ class OptimizedSelectorAgent:
         torch.manual_seed(seed)
         if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
         
-        if self.train_df is None: raise ValueError("Call prepare_data() first")
+        if self.train_df is None or self.val_df is None: 
+            raise ValueError("Call prepare_data() first and ensure validation data exists.")
 
+        # --- Early Stopping Setup ---
+        PATIENCE = 3
+        epochs_without_improvement = 0
+        best_val_loss = float('inf')
+        
+        # Define a temporary path for the best model weights
+        temp_model_path = os.path.join(os.path.dirname(self.trace_path), "best_model_temp.pth")
+        
         # Setup Model
         feat_dim = self.create_snapshot_features(self.train_df, self.train_df['date'].iloc[0]).shape[1]
         
@@ -343,8 +408,7 @@ class OptimizedSelectorAgent:
             self.model.train()
             total_loss = 0.0
             num_batches = 0
-            
-            # MEMORY STATE: Initialize hidden state for nodes
+            # Initialize/reset hidden state at the start of each epoch
             hidden_state = None 
             
             for snapshot in snapshots:
@@ -352,13 +416,9 @@ class OptimizedSelectorAgent:
                 edge_weights = snapshot['edge_weights'].to(self.device)
                 x = self.create_snapshot_features(self.train_df, snapshot['date']).to(self.device)
                 
-                # --- Skip empty graphs ---
-                if edge_index.numel() == 0:
-                    # Even if no edges, we forward pass to update memory (GRU)
-                    # Use dummy edge index for GNN part or just skip GNN
-                    # For simplicity, we just persist state if no edges
-                    continue
-
+                # Skip if no edges
+                if edge_index.numel() == 0: continue
+                
                 # --- Sampling ---
                 pos_pairs = edge_index.T
                 num_pos = len(pos_pairs)
@@ -380,30 +440,23 @@ class OptimizedSelectorAgent:
                 all_pairs = all_pairs[perm]
                 labels = labels[perm]
                 
-                # --- Forward Pass with Memory ---
-                # We process the whole snapshot at once to get updated node embeddings & state
-                # Then we calculate loss on the pairs
-                
-                # Full Graph Pass (Updates Hidden State)
-                # Pass pair_index=None first to get embeddings
-                embeddings = self.model(x, edge_index, edge_weights, hidden_state=hidden_state)
-                
-                # Update hidden state for next snapshot (detach to prevent backprop through all time)
-                hidden_state = embeddings.detach() 
-                
-                # --- Mini-batch Loss Calculation ---
+                # --- Forward Pass & Optimization ---
                 for i in range(0, len(all_pairs), batch_size):
                     batch_pairs = all_pairs[i:i+batch_size].T
                     batch_labels = labels[i:i+batch_size]
                     
                     optimizer.zero_grad()
                     
-                    # We re-run forward pass for gradients OR use the embeddings we just computed
-                    # For correctness with computational graph, we run forward pass with pairs
-                    # Note: We must re-feed hidden_state attached to graph
+                    # Detach hidden state to prevent backprop through time steps within the epoch
+                    current_hidden_state = hidden_state.detach() if hidden_state is not None else None
                     
-                    scores, _ = self.model(x, edge_index, edge_weights, pair_index=batch_pairs, hidden_state=hidden_state.detach())
+                    # Forward pass for loss calculation and state update
+                    scores, embeddings = self.model(x, edge_index, edge_weights, pair_index=batch_pairs, hidden_state=current_hidden_state)
                     
+                    # Update hidden_state for the next time snapshot (must be attached for the next GRU step)
+                    # We detach here to avoid backpropagation through the entire time series in a single training step
+                    hidden_state = self.model(x, edge_index, edge_weights, hidden_state=current_hidden_state).detach()
+
                     loss = criterion(scores, batch_labels)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -412,10 +465,42 @@ class OptimizedSelectorAgent:
                     total_loss += loss.item()
                     num_batches += 1
             
-            avg_loss = total_loss / max(num_batches, 1)
-            print(f"  Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
+            avg_train_loss = total_loss / max(num_batches, 1)
+            
+            # --- Early Stopping Check ---
+            val_loss = self._validate_model(self.val_df, criterion, snapshot_stride=snapshot_stride)
+            
+            print(f"  Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+                torch.save(self.model.state_dict(), temp_model_path)
+                self._log_event("training_status", {"epoch": epoch+1, "train_loss": avg_train_loss, "val_loss": val_loss, "status": "improved", "best_loss": best_val_loss})
+                print("  🟢 Validation loss improved. Saving best model state.")
+            else:
+                epochs_without_improvement += 1
+                self._log_event("training_status", {"epoch": epoch+1, "train_loss": avg_train_loss, "val_loss": val_loss, "status": "no_improvement", "patience_left": PATIENCE - epochs_without_improvement})
+                
+            if epochs_without_improvement >= PATIENCE:
+                print(f"  🛑 Early stopping triggered. Validation loss hasn't improved for {PATIENCE} epochs. Loading best weights.")
+                # Load the best weights
+                if os.path.exists(temp_model_path):
+                    self.model.load_state_dict(torch.load(temp_model_path))
+                    os.remove(temp_model_path) # Clean up temporary file
+                else:
+                    print("⚠️ Warning: Best model state not found (likely no improvement ever). Proceeding with current model.")
+                break
+                
+        # Final cleanup if training completed all epochs
+        if os.path.exists(temp_model_path):
+            os.remove(temp_model_path)
             
         print("✅ Training complete")
+
+    # ------------------------------------------------------------------------
+    # Score Pairs (Unchanged)
+    # ------------------------------------------------------------------------
 
     def score_pairs(self, use_validation: bool = True, top_k: int = 100):
         if self.model is None: raise ValueError("Model not trained")
@@ -436,11 +521,6 @@ class OptimizedSelectorAgent:
         edge_weights = snapshot['edge_weights'].to(self.device)
         x = self.create_snapshot_features(df, snapshot['date']).to(self.device)
         
-        # Run inference
-        # Ideally, we would run through all snapshots to build up memory, 
-        # but for simple scoring, one pass is often sufficient or we can warm start.
-        # Here we just do a static score on the final state.
-        
         num_nodes = len(self.tickers)
         src_idx, dst_idx = np.triu_indices(num_nodes, k=1)
         
@@ -448,9 +528,9 @@ class OptimizedSelectorAgent:
         batch_size = 10000
         
         with torch.no_grad():
-            # Get embeddings first
-            # Pass hidden_state=None (cold start) or maintain state from training if desired
-            _, embeddings = self.model(x, edge_index, edge_weights, pair_index=torch.zeros((2,1), dtype=torch.long, device=self.device))
+            # Get embeddings
+            # Run one pass to get the final state embeddings (assuming cold start for scoring phase)
+            embeddings = self.model(x, edge_index, edge_weights, hidden_state=None) 
             
             # Score pairs using embeddings
             for i in range(0, len(src_idx), batch_size):
