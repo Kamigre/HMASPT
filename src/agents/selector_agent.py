@@ -107,9 +107,9 @@ class OptimizedSelectorAgent:
     train_corr_threshold: float = 0.8  # NEW: Stricter threshold for training samples
     lookback_weeks: int = 4
     holdout_months: int = 18
-    hidden_dim: int = 128              # INCREASED CAPACITY
-    num_heads: int = 6                 # INCREASED CAPACITY
-    dropout: float = 0.3               # INCREASED REGULARIZATION (Trace Analysis)
+    hidden_dim: int = 32
+    num_heads: int = 2
+    dropout: float = 0.3
     
     # Internal State
     model: Any = None
