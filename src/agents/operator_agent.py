@@ -3,7 +3,7 @@ import json
 import time
 import datetime
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import numpy as np
 import pandas as pd
 import gymnasium as gym
@@ -14,14 +14,30 @@ from tqdm import tqdm
 import sys
 from statsmodels.tsa.stattools import adfuller
 
+# Ensure paths are correct for local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import CONFIG 
-from utils import half_life, compute_spread
-from agents.message_bus import JSONLogger
+
+# Try/Except block to handle different directory structures for config/utils
+try:
+    from config import CONFIG
+    from utils import half_life, compute_spread
+    # Use relative import for message_bus to prevent circular dependency
+    from .message_bus import JSONLogger
+except ImportError:
+    # Fallback/Assumption if running from root
+    import sys
+    sys.path.append(".")
+    from config import CONFIG
+    from utils import half_life, compute_spread
+    from src.agents.message_bus import JSONLogger
+
+# ==============================================================================
+# 1. TRADING ENVIRONMENT (Fixed Logic)
+# ==============================================================================
 
 class PairTradingEnv(gym.Env):
 
-    def __init__(self, series_x: pd.Series, series_y: pd.Series,
+    def __init__(self, series_x: pd.Series, series_y: pd.Series, 
                  lookback: int = 30,
                  initial_capital: float = 10000,
                  position_scale: int = 100,
@@ -53,8 +69,8 @@ class PairTradingEnv(gym.Env):
         # PARAMETERS
         self.reward_scale = 10.0
         self.drawdown_penalty_factor = 1.0 # Increased penalty
-        self.holding_penalty_factor = 0.005 # Reduced factor, reward adjustment is more direct
-        self.profit_bonus = 5.0 # Increased bonus for successful trade closure
+        self.holding_penalty_factor = 0.005 # Reduced factor
+        self.profit_bonus = 5.0 # Increased bonus
         
         # Precompute spread and features
         self._precompute_features()
@@ -98,11 +114,18 @@ class PairTradingEnv(gym.Env):
 
         # 4. Stationarity/Regime Features (NEW)
         # Compute ADF p-value and Half-Life on rolling lookback window
-        adf_pvalue = self.spread.rolling(self.lookback).apply(lambda s: adfuller(s.dropna())[1], raw=False)
-        half_life_series = self.spread.rolling(self.lookback).apply(lambda s: half_life(s.dropna()), raw=False)
+        # Note: raw=False is slower but safer for custom functions like adfuller inside apply
+        adf_pvalue = self.spread.rolling(self.lookback).apply(
+            lambda s: adfuller(s.dropna())[1] if len(s.dropna()) > 10 else 1.0, 
+            raw=False
+        )
+        half_life_series = self.spread.rolling(self.lookback).apply(
+            lambda s: half_life(s.dropna()) if len(s.dropna()) > 10 else 252.0, 
+            raw=False
+        )
 
-        self.adf_pvalue_np = np.nan_to_num(adf_pvalue.to_numpy(), nan=1.0) # Default to non-stationary (1.0)
-        self.half_life_np = np.nan_to_num(half_life_series.to_numpy(), nan=252.0) # Default to 1 year (slowest)
+        self.adf_pvalue_np = np.nan_to_num(adf_pvalue.to_numpy(), nan=1.0) 
+        self.half_life_np = np.nan_to_num(half_life_series.to_numpy(), nan=252.0) 
 
         # Convert to numpy and fill NaNs
         self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0)
@@ -183,7 +206,6 @@ class PairTradingEnv(gym.Env):
     def step(self, action: int):
         """
         Execute one trading step. 
-        Forces a close (position=0) at the last timestep.
         """
         current_idx = self.idx
         self.prev_position = self.position # Track previous position
@@ -194,6 +216,10 @@ class PairTradingEnv(gym.Env):
         # 2. Setup Data
         current_spread = float(self.spread_np[current_idx])
         current_vol = float(self.vol_np[current_idx])
+        
+        # FIX: Define price variables HERE, so they exist even if no trade occurs
+        current_price_x = float(self.data.iloc[current_idx, 0])
+        current_price_y = float(self.data.iloc[current_idx, 1])
         
         if is_last_step:
             next_spread = current_spread
@@ -224,8 +250,6 @@ class PairTradingEnv(gym.Env):
             tp_threshold = abs(self.position) * current_vol * self.TAKE_PROFIT_FACTOR
             if pnl_on_current_spread > tp_threshold:
                 target_position_from_agent = 0
-                # NOTE: The agent still gets the profit, but the position is closed.
-                # The profit bonus in the reward function will further incentivize this.
                 forced_exit = True
 
         # FINAL Target Position
@@ -249,9 +273,6 @@ class PairTradingEnv(gym.Env):
                 
             # Costs
             trade_size = abs(position_change)
-            # Use current price of X/Y to estimate notional for cost calculation
-            current_price_x = float(self.data.iloc[current_idx, 0])
-            current_price_y = float(self.data.iloc[current_idx, 1])
             notional = trade_size * (current_price_x + current_price_y) / 2 # Approximated total notional
             
             transaction_costs = notional * self.transaction_cost_rate
@@ -279,7 +300,8 @@ class PairTradingEnv(gym.Env):
                     'position': self.position,
                     'pnl': realized_pnl_this_step,
                     'holding_days': self.days_in_position,
-                    'forced_close': is_last_step or forced_exit
+                    'forced_close': is_last_step or forced_exit,
+                    'daily_return': (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
                 })
         else:
             self.days_in_position += 1
@@ -305,28 +327,23 @@ class PairTradingEnv(gym.Env):
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
         # 7. Reward (NEW: Sharpe-like and Drawdown-focused)
-        
-        # Calculate recent return volatility
-        # Note: In a real training setup, this should be calculated from a separate log of returns.
-        # Here we use a rolling window of the daily return itself.
-        current_return_volatility = np.std([t['daily_return'] for t in self.trade_history[-20:] if 'daily_return' in t], ddof=1) if len(self.trade_history) >= 2 else 1e-4
+        current_return_volatility = np.std([t.get('daily_return', 0) for t in self.trade_history[-20:]], ddof=1) if len(self.trade_history) >= 2 else 1e-4
 
-        # Sharpe-like term: Reward = Return / Volatility (capped to prevent division by zero/tiny vol)
+        # Sharpe-like term
         sharpe_term = daily_return / max(current_return_volatility, 1e-4)
         
-        # Drawdown Penalty: Penalize deep drawdowns more heavily
+        # Drawdown Penalty
         drawdown_penalty = self.drawdown_penalty_factor * drawdown
         
-        # Holding Penalty: Mild penalty for holding to encourage quicker trades
+        # Holding Penalty
         holding_penalty = self.holding_penalty_factor * self.days_in_position * (1.0 if self.position != 0 else 0.0)
 
-        # Profit Bonus: High bonus for successfully closing a profitable trade
+        # Profit Bonus
         profit_bonus = 0.0
         if realized_pnl_this_step > 0:
             profit_bonus = self.profit_bonus * (realized_pnl_this_step / self.initial_capital)
         
         reward = (sharpe_term * self.reward_scale) - drawdown_penalty - holding_penalty + profit_bonus
-
         reward = np.clip(reward, -self.reward_scale, self.reward_scale)
         
         # 8. Index
@@ -354,24 +371,26 @@ class PairTradingEnv(gym.Env):
             'trade_occurred': bool(trade_occurred),
             'cum_return': float(self.portfolio_value / self.initial_capital - 1),
             'forced_close': is_last_step and trade_occurred,
-            'risk_exit': bool(forced_exit), # NEW: Flag for SL/TP exit
-            'adf_pvalue': float(self.adf_pvalue_np[current_idx]), # NEW for monitoring
-            'half_life': float(self.half_life_np[current_idx]), # NEW for monitoring
-            'price_x': float(self.data.iloc[current_idx, 0]),
-            'price_y': float(self.data.iloc[current_idx, 1])
+            'risk_exit': bool(forced_exit),
+            'adf_pvalue': float(self.adf_pvalue_np[current_idx]),
+            'half_life': float(self.half_life_np[current_idx]),
+            'price_x': current_price_x,
+            'price_y': current_price_y
         }
         
         terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
 
+# ==============================================================================
+# 2. OPERATOR AGENT (Fixed Class Logic)
+# ==============================================================================
+
 @dataclass
 class OperatorAgent:
     
     logger: JSONLogger = None
     storage_dir: str = "models/"
-    # Add save_detailed_trace method to the class dynamically
-    save_detailed_trace = save_detailed_trace
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
@@ -380,6 +399,13 @@ class OperatorAgent:
         self.current_step = 0
         self.traces_buffer = []
         self.max_buffer_size = 1000
+
+    # --- Added method directly to class to avoid NameError ---
+    def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
+        """Saves trade details to a JSONL file."""
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "a") as f:
+            f.write(json.dumps(trace, default=str) + "\n")
 
     def get_current_step(self):
         return self.current_step
@@ -458,8 +484,8 @@ class OperatorAgent:
             batch_size=256,
             n_epochs=20,
             gamma=0.99,
-            ent_coef=0.02, # Lowered from 0.05 to favor exploitation for a stable policy
-            clip_range=0.1, # Lowered from 0.2 for more conservative, stable updates
+            ent_coef=0.02, 
+            clip_range=0.1, 
             verbose=1,
             device="auto",
             seed=seed,
@@ -539,6 +565,10 @@ class OperatorAgent:
             self.logger.log("operator", "pair_trained", trace)
 
         return trace
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
+# ==============================================================================
 
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
                           pairs: list, max_workers: int = None):
@@ -677,7 +707,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "num_trades": int(info.get("num_trades", 0)),
                 "trade_occurred": bool(info.get("trade_occurred", False)),
                 "risk_exit": bool(info.get("risk_exit", False)), # NEW
-                # NEW FIELDS FOR VISUALIZATION
                 "price_x": float(info.get("price_x", 0.0)),
                 "price_y": float(info.get("price_y", 0.0))
             }
@@ -879,8 +908,3 @@ def calculate_sortino(traces, risk_free_rate=None):
     downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
     if downside_deviation < 1e-8: return 100.0 if mean_excess > 0 else 0.0
     return (mean_excess / downside_deviation) * np.sqrt(252)
-    
-def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "a") as f:
-        f.write(json.dumps(trace, default=str) + "\n")
