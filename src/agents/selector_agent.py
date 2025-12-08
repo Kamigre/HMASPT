@@ -129,7 +129,7 @@ class OptimizedSelectorAgent:
     trace_path: str = "traces/selector.jsonl"
     
     # Hyperparameters
-    corr_threshold: float = 0.60
+    corr_threshold: float = 0.5
     lookback_weeks: int = 4
     forecast_horizon: int = 1
     holdout_months: int = 18
