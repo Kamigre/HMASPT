@@ -9,8 +9,12 @@ from typing import List, Dict, Any, Tuple
 from datetime import datetime
 import textwrap
 
+# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import CONFIG
+try:
+    from config import CONFIG
+except ImportError:
+    CONFIG = {"risk_free_rate": 0.04}
 
 # --- GLOBAL STYLE SETTINGS ---
 sns.set_theme(style="whitegrid", context="talk", font_scale=0.9)
@@ -61,7 +65,8 @@ class PortfolioVisualizer:
         # Fill missing columns for robustness
         required_cols = {
             'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
-            'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0
+            'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
+            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0
         }
         for col, val in required_cols.items():
             if col not in df.columns: df[col] = val
@@ -70,27 +75,29 @@ class PortfolioVisualizer:
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
-        trades_entry = df[df['trade_occurred'] == True] # Note: This counts entries, not closed cycles
+        trades_entry = df[df['trade_occurred'] == True] 
         forced_exit = df[df['forced_close'] == True]
 
-        # --- Corrected Stats Logic (Win Rate on CLOSED Trades) ---
-        total_pnl = df['realized_pnl'].iloc[-1]
-        final_ret = df['cum_return'].iloc[-1]
+        # --- CORRECTED Win Rate Logic (Per Pair) ---
+        # A trade is "Closed" if we realized PnL this step (entry_spread != 0 is for position tracking, but PnL happens on close)
+        # We look for steps where realized_pnl_this_step is non-zero (indicating a close or flip)
+        closed_trades_mask = df['realized_pnl_this_step'] != 0
+        closed_trades_df = df[closed_trades_mask].copy()
         
-        # Identify rows where a trade was fully closed/P&L realized (assuming realized_pnl != 0.0 only on closure)
-        closed_trades_df = df[df['realized_pnl'] != 0.0]
+        # Calculate Net PnL per trade event
+        closed_trades_df['net_trade_pnl'] = closed_trades_df['realized_pnl_this_step'] - closed_trades_df['transaction_costs']
+        
         total_closed_trades = len(closed_trades_df)
-
         if total_closed_trades > 0:
-            winning_trades = (closed_trades_df['realized_pnl'] > 0).sum()
-            # Win rate is calculated on the count of winning *closed trades* vs. total *closed trades*
+            winning_trades = (closed_trades_df['net_trade_pnl'] > 0).sum()
             win_rate = winning_trades / total_closed_trades
         else:
             win_rate = 0.0
-        
-        # Use trades_entry count for 'Trades' in the scorecard
-        total_entries = len(trades_entry) 
-        
+            
+        total_pnl = df['realized_pnl'].iloc[-1]
+        final_ret = df['cum_return'].iloc[-1]
+        total_entries = len(trades_entry)
+
         # --- Plotting ---
         fig = plt.figure(figsize=(20, 14))
         gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.4, wspace=0.3)
@@ -108,9 +115,9 @@ class PortfolioVisualizer:
         
         # Fill
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
+                         where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                          where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
+                         where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
 
         if not forced_exit.empty:
             ax1.scatter(forced_exit['local_step'], 100 * (1 + forced_exit['cum_return']), 
@@ -129,10 +136,8 @@ class PortfolioVisualizer:
             ("Total P&L", f"${total_pnl:,.2f}", self.colors['profit'] if total_pnl > 0 else self.colors['loss']),
             ("Return", f"{final_ret*100:+.2f}%", self.colors['profit'] if final_ret > 0 else self.colors['loss']),
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
-            # Use the corrected win_rate
             ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
             ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
-            # Use trade entries for total trades executed
             ("Trades Executed", f"{total_entries}", self.colors['primary']) 
         ]
         
@@ -145,18 +150,24 @@ class PortfolioVisualizer:
             ax2.plot([0.1, 0.9], [y_pos-0.05, y_pos-0.05], color='#ecf0f1', lw=1.5)
             y_pos -= 0.15
 
-        # 3. Z-Score & Position
+        # 3. Z-Score & Position (FIXED)
         ax3 = fig.add_subplot(gs[1, :])
         
-        if 'current_spread' in df.columns:
-            spread = df['current_spread']
-            # Rolling Z-score for visualization
-            zscore = (spread - spread.rolling(30).mean()) / (spread.rolling(30).std() + 1e-8)
+        # Check for pre-calculated Z-score from traces (Robustness Fix)
+        if 'z_score' in df.columns:
+            # Use logged Z-score
+            zscore = df['z_score']
             ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score')
-            ax3.axhline(2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
-            ax3.axhline(-2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
-            ax3.axhline(0, color=self.colors['primary'], lw=1)
-            ax3.set_ylabel('Z-Score')
+        elif 'current_spread' in df.columns:
+            # Fallback for old traces
+            spread = df['current_spread']
+            zscore = (spread - spread.rolling(30).mean()) / (spread.rolling(30).std() + 1e-8)
+            ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score (Est)')
+
+        ax3.axhline(2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        ax3.axhline(-2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        ax3.axhline(0, color=self.colors['primary'], lw=1)
+        ax3.set_ylabel('Z-Score')
         
         ax3b = ax3.twinx()
         ax3b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
@@ -194,7 +205,7 @@ class PortfolioVisualizer:
         filepath = os.path.join(self.output_dir, "pairs", filename)
         plt.savefig(filepath)
         plt.close()
-        print(f"   📊 Saved pair analysis: {filepath}")
+        print(f"    📊 Saved pair analysis: {filepath}")
 
     def visualize_pair_behavior(self, traces: List[Dict], pair_name: str):
         """
@@ -252,7 +263,7 @@ class PortfolioVisualizer:
         filepath = os.path.join(self.output_dir, "behavior", filename)
         plt.savefig(filepath)
         plt.close()
-        print(f"   📉 Saved behavior analysis: {filepath}")
+        print(f"    📉 Saved behavior analysis: {filepath}")
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
@@ -263,6 +274,28 @@ class PortfolioVisualizer:
         
         # --- Data Processing ---
         df_all = pd.DataFrame(all_traces)
+        if df_all.empty:
+            print("⚠️ No traces to visualize.")
+            return
+
+        # Ensure columns exist
+        if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
+        if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
+
+        # --- RECALCULATE GLOBAL WIN RATE CORRECTLY ---
+        # Identifying trade closures across the entire portfolio
+        # We look for steps where realized PnL occurred (indicating a close or flip)
+        trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
+        
+        trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
+        
+        total_global_trades = len(trade_events)
+        if total_global_trades > 0:
+            global_wins = (trade_events['net_pnl'] > 0).sum()
+            global_win_rate = global_wins / total_global_trades
+        else:
+            global_win_rate = 0.0
+
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
 
         # Total Capital Est
@@ -400,7 +433,7 @@ class PortfolioVisualizer:
             ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
             ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
-            ("Win Rate", f"{metrics['win_rate']*100:.2f}%"),
+            ("Win Rate", f"{global_win_rate*100:.2f}%"), # Using correctly calculated global rate
             ("Max Portfolio DD", f"{metrics['max_drawdown']*100:.2f}%"),
             ("VaR (95%)", f"{metrics['var_95']:.4f}"),
             ("Active Pairs", f"{len(pair_names)}"),
@@ -515,7 +548,7 @@ def generate_all_visualizations(all_traces: List[Dict],
         # 1. Standard Analysis
         visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
         
-        # 2. NEW Behavior Analysis (Price vs Return)
+        # 2. Behavior Analysis
         visualizer.visualize_pair_behavior(traces, pair_name)
     
     # Generate portfolio aggregate
