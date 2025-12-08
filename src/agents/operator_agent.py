@@ -13,11 +13,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
 
+# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from config import CONFIG
-from utils import half_life, compute_spread
-from agents.message_bus import JSONLogger
-from statsmodels.tsa.stattools import coint
+try:
+    from config import CONFIG
+    from agents.message_bus import JSONLogger
+except ImportError:
+    # Fallback if running standalone
+    CONFIG = {"transaction_cost": 0.0005, "rl_lookback": 30, "risk_free_rate": 0.04}
+    JSONLogger = None
 
 class PairTradingEnv(gym.Env):
 
@@ -41,16 +45,10 @@ class PairTradingEnv(gym.Env):
         # Action: 3 discrete actions (short, flat, long)
         self.action_space = spaces.Discrete(3)
         
-        # Observation space INCREASED to 14 (Added RSI and Vol Ratio)
+        # Observation space: 14 features
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
         )
-        
-        # PARAMETERS
-        self.reward_scale = 10.0
-        self.drawdown_penalty_factor = 0.5
-        self.holding_penalty = 0.05
-        self.profit_bonus = 2.0
         
         # Precompute spread and features
         self._precompute_features()
@@ -88,11 +86,10 @@ class PairTradingEnv(gym.Env):
         self.vol_short = self.spread.rolling(self.lookback).std()
         self.vol_long = self.spread.rolling(self.lookback * 3).std()
         
-        # Volatility Ratio: If > 1.0, market is becoming more turbulent (Regime Change)
+        # Volatility Ratio
         self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
         
         # 3. Momentum Features (Trend Detection)
-        # RSI helps distinguish "Oversold" (Good Entry) from "Crashing" (Bad Entry)
         self.rsi = self._compute_rsi(self.spread, period=14)
         
         # Convert to numpy and fill NaNs
@@ -101,15 +98,17 @@ class PairTradingEnv(gym.Env):
         self.zscore_long_np = np.nan_to_num(self.zscore_long.to_numpy(), nan=0.0)
         self.vol_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0)
         self.vol_ratio_np = np.nan_to_num(self.vol_ratio.to_numpy(), nan=1.0)
-        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0) # Default to neutral 50
+        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0)
+        
+        # Store prices for logging
+        self.price_x_np = x.to_numpy()
+        self.price_y_np = y.to_numpy()
 
     def _get_observation(self, idx: int) -> np.ndarray:
         """Build NORMALIZED observation vector"""
         if idx < 0 or idx >= len(self.spread_np):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
         
-        # Normalize financial metrics by initial capital
-        # This keeps values generally between -1.0 and 1.0, which neural nets love.
         norm_unrealized = self.unrealized_pnl / self.initial_capital
         norm_realized = self.realized_pnl / self.initial_capital
         
@@ -120,8 +119,8 @@ class PairTradingEnv(gym.Env):
             self.spread_np[idx],
             
             # NEW FEATURES
-            self.rsi_np[idx] / 100.0,       # Scale RSI to 0.0-1.0
-            self.vol_ratio_np[idx],         # Ratio is already small (~1.0)
+            self.rsi_np[idx] / 100.0,
+            self.vol_ratio_np[idx],
             
             float(self.position / self.position_scale),  
             float(self.entry_spread) if self.position != 0 else 0.0,
@@ -133,8 +132,8 @@ class PairTradingEnv(gym.Env):
             float(self.cash / self.initial_capital - 1),  
             float(self.portfolio_value / self.initial_capital - 1),  
             
-            float(self.days_in_position) / 252.0, # Scale days to ~0.0-1.0 (assuming max 1 year hold)
-            float(self.num_trades) / 100.0,       # Soft scaling for trade count
+            float(self.days_in_position) / 252.0,
+            float(self.num_trades) / 100.0,
         ], dtype=np.float32)
         
         return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -165,10 +164,7 @@ class PairTradingEnv(gym.Env):
         return self._get_observation(self.idx), {}
 
     def step(self, action: int):
-        """
-        Execute one trading step. 
-        Forces a close (position=0) at the last timestep.
-        """
+        """Execute one trading step."""
         current_idx = self.idx
         
         # 1. Determine if this is the last available step
@@ -255,19 +251,18 @@ class PairTradingEnv(gym.Env):
 
         daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
         self.prev_portfolio_value = self.portfolio_value
-        log_return = np.log(self.portfolio_value / max(self.prev_portfolio_value, 1e-8))
 
         # 6. Metrics
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
         # 7. Reward
-        reward = log_return * 1000
+        reward = daily_return * 100
         reward -= 0.3 * drawdown
         if self.position != 0:
             reward -= 0.01 * self.days_in_position
         if realized_pnl_this_step > 0:
-            reward += 2.0 * (realized_pnl_this_step / self.initial_capital)
+            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 10
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
@@ -277,7 +272,7 @@ class PairTradingEnv(gym.Env):
         # 9. Obs
         obs = self._get_observation(self.idx)
         
-        # 10. Info
+        # 10. Info - UPDATED: Include Z-Score directly here
         info = {
             'portfolio_value': float(self.portfolio_value),
             'cash': float(self.cash),
@@ -288,13 +283,17 @@ class PairTradingEnv(gym.Env):
             'position': int(self.position),
             'entry_spread': float(self.entry_spread),
             'current_spread': float(current_spread),
+            # CRITICAL FIX: Pass the calculated z-score to logs
+            'z_score': float(self.zscore_short_np[current_idx]),
             'days_in_position': int(self.days_in_position),
             'daily_return': float(daily_return),
             'drawdown': float(drawdown),
             'num_trades': int(self.num_trades),
             'trade_occurred': bool(trade_occurred),
             'cum_return': float(self.portfolio_value / self.initial_capital - 1),
-            'forced_close': is_last_step and trade_occurred
+            'forced_close': is_last_step and trade_occurred,
+            'price_x': float(self.price_x_np[current_idx]),
+            'price_y': float(self.price_y_np[current_idx])
         }
         
         terminated = is_last_step
@@ -304,7 +303,7 @@ class PairTradingEnv(gym.Env):
 @dataclass
 class OperatorAgent:
     
-    logger: JSONLogger = None
+    logger: Optional[JSONLogger] = None
     storage_dir: str = "models/"
 
     def __post_init__(self):
@@ -343,14 +342,14 @@ class OperatorAgent:
     def load_model(self, model_path):
         return RecurrentPPO.load(model_path)
 
-    def train_on_pair(self, prices: pd.DataFrame, x: str, y: str,
-                      lookback: int = None, timesteps: int = None,
+    def train_on_pair(self, prices: pd.DataFrame, x: str, y: str, 
+                      lookback: int = None, timesteps: int = None, 
                       shock_prob: float = None, shock_scale: float = None,
                       use_curriculum: bool = False):
 
         # Get seed from CONFIG
         seed = CONFIG.get("random_seed", 42)
-                           
+                            
         if not self.active:
             return None
 
@@ -373,7 +372,7 @@ class OperatorAgent:
 
         print("\n🚀 Training with Recurrent PPO (LSTM)...")
         env = PairTradingEnv(
-            series_x, series_y, lookback, position_scale=100,
+            series_x, series_y, lookback, position_scale=100, 
             transaction_cost_rate=0.0005, test_mode=False
         )
         
@@ -397,7 +396,7 @@ class OperatorAgent:
             verbose=1,
             device="auto",
             seed=seed,
-            policy_kwargs=policy_kwargs  # Applied hyperparams
+            policy_kwargs=policy_kwargs 
         )
 
         model.learn(total_timesteps=timesteps)
@@ -480,8 +479,13 @@ class OperatorAgent:
 
         return trace
 
+    def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "a") as f:
+            f.write(json.dumps(trace, default=str) + "\n")
 
-def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
+
+def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
                         pairs: list, max_workers: int = None):
 
     if max_workers is None:
@@ -684,6 +688,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "transaction_costs": float(info.get("transaction_costs", 0.0)),
                 "entry_spread": float(info.get("entry_spread", 0.0)),
                 "current_spread": float(info.get("current_spread", 0.0)),
+                # CRITICAL: Capture z_score here to avoid recalculation in visualizer
+                "z_score": float(info.get("z_score", 0.0)), 
                 "days_in_position": int(info.get("days_in_position", 0)),
                 "daily_return": float(info.get("daily_return", 0.0)),
                 "num_trades": int(info.get("num_trades", 0)),
@@ -791,15 +797,9 @@ def calculate_sortino(traces, risk_free_rate=None):
     # Sortino uses downside deviation of excess returns below 0
     downside_returns = excess_returns[excess_returns < 0]
     
-    # If no downside, Sortino is infinite (technically), but we return high value or 0
     if len(downside_returns) == 0:
         return 0.0
         
     downside_deviation = np.sqrt(np.mean(downside_returns**2))
     if downside_deviation < 1e-9: return 0.0    
     return (mean_excess / downside_deviation) * np.sqrt(252)
-    
-def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "a") as f:
-        f.write(json.dumps(trace, default=str) + "\n")
