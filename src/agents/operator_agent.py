@@ -258,36 +258,43 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # 7. Reward Calculation
-        reward = daily_return * 100
-        reward -= 0.3 * drawdown
+        # ---------------------------------------------------------------------
+        # OPTIMIZED SHARPE REWARD CALCULATION
+        # ---------------------------------------------------------------------
         
+        # 1. Log Return (Symmetric)
+        log_return = np.log(self.portfolio_value / max(self.prev_portfolio_value, 1e-8))
+        
+        # 2. Sortino-style Penalty (Punish downside volatility 3x more than upside)
+        if log_return < 0:
+            risk_penalty = 3.0 * (log_return ** 2)
+        else:
+            risk_penalty = 0.0 # Don't punish upside volatility
+            
+        reward = (log_return * 100) - (risk_penalty * 100)
+        
+        # 3. Time Decay (The "Rent")
+        # Charges the agent for every day it keeps capital tied up
         if self.position != 0:
-            reward -= 0.01 * self.days_in_position
-
-        if realized_pnl_this_step > 0:
-            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 10
+            reward -= 0.1  # Increased from 0.01
             
-        # ---------------------------------------------------------------------
-        # NEW: Z-Score Alignment Reward
-        # ---------------------------------------------------------------------
-        # Logic: 
-        #   If Z > 0 (Overvalued), we want Position < 0 (Short). 
-        #      Example: Z=2, Pos=-1 => -1 * 2 * -1 = +2 (Reward)
-        #   If Z < 0 (Undervalued), we want Position > 0 (Long).
-        #      Example: Z=-2, Pos=+1 => -1 * -2 * 1 = +2 (Reward)
-        # ---------------------------------------------------------------------
-        if self.position != 0:
-            # Normalize position to -1.0, 0.0, or 1.0
-            norm_pos = self.position / self.position_scale
-            
-            # The scaling factor (0.1) ensures this guides the agent 
-            # but doesn't overpower the actual PnL.
-            alignment_bonus = -1.0 * current_zscore * norm_pos * 0.1
-            
-            reward += alignment_bonus
-
-        # Clip reward to maintain stability
+        # 4. Mean Reversion Alignment (The "Magnet")
+        # If Z-score is extreme (>1.5), heavily reward counter-trading
+        # If Z-score is neutral (<0.5), heavily reward being FLAT
+        if abs(current_zscore) > 1.5:
+            # We want to be in a position opposite to Z
+            target_pos_sign = -np.sign(current_zscore)
+            current_pos_sign = np.sign(self.position)
+            if current_pos_sign == target_pos_sign:
+                reward += 0.5
+        elif abs(current_zscore) < 0.5:
+            # We want to be flat
+            if self.position == 0:
+                reward += 0.5
+            else:
+                reward -= 0.5 # Penalty for holding through the mean
+                
+        # Clip for stability
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
@@ -416,7 +423,7 @@ class OperatorAgent:
             batch_size=256,
             n_epochs=10,
             gamma=0.99,
-            ent_coef=0.04,
+            ent_coef=0.01,
             verbose=1,
             device="auto",
             seed=seed,
