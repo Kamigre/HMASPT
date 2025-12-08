@@ -163,7 +163,7 @@ class PairTradingEnv(gym.Env):
         
         return self._get_observation(self.idx), {}
 
-   def step(self, action: int):
+    def step(self, action: int):
         """
         Execute one trading step. 
         Forces a close (position=0) at the last timestep.
