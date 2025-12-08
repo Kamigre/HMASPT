@@ -258,43 +258,36 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # ---------------------------------------------------------------------
-        # WIDE-CLIP REWARD (Allows up to 100% moves)
-        # ---------------------------------------------------------------------
+        # 7. Reward Calculation
+        reward = daily_return * 100
+        reward -= 0.3 * drawdown
         
-        # 1. Calculate Normal Return
-        denom = self.prev_portfolio_value if self.prev_portfolio_value != 0 else 1.0
-        step_return = (self.portfolio_value - self.prev_portfolio_value) / denom
-
-        # This catches "infinite" errors but allows massive market moves.
-        step_return = np.clip(step_return, -0.6, 0.6)
-
-        # 2. Base Reward (REDUCED MULTIPLIER)
-        # Previously we used * 100.0. 
-        # Since step_return can now be huge (1.0), we reduce this to * 10.0.
-        # Max Reward = 1.0 * 10.0 = 10.0 (Safe range)
-        reward = step_return * 10.0
-
-        # 3. Asymmetric Volatility Penalty
-        # If return is negative, double the pain.
-        if step_return < 0:
-            reward *= 2.0 
-
-        # 4. "Rent" (Time Decay)
         if self.position != 0:
-            reward -= 0.05 
+            reward -= 0.01 * self.days_in_position
 
-        # 5. Z-Score Alignment
+        if realized_pnl_this_step > 0:
+            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 10
+            
+        # ---------------------------------------------------------------------
+        # NEW: Z-Score Alignment Reward
+        # ---------------------------------------------------------------------
+        # Logic: 
+        #   If Z > 0 (Overvalued), we want Position < 0 (Short). 
+        #      Example: Z=2, Pos=-1 => -1 * 2 * -1 = +2 (Reward)
+        #   If Z < 0 (Undervalued), we want Position > 0 (Long).
+        #      Example: Z=-2, Pos=+1 => -1 * -2 * 1 = +2 (Reward)
+        # ---------------------------------------------------------------------
         if self.position != 0:
-            pos_sign = np.sign(self.position)
-            z_sign = np.sign(current_zscore)
-            if pos_sign != z_sign:
-                reward += 0.1 
-            else:
-                reward -= 0.1
+            # Normalize position to -1.0, 0.0, or 1.0
+            norm_pos = self.position / self.position_scale
+            
+            # The scaling factor (0.1) ensures this guides the agent 
+            # but doesn't overpower the actual PnL.
+            alignment_bonus = -1.0 * current_zscore * norm_pos * 0.1
+            
+            reward += alignment_bonus
 
-        # 6. Final Stability Clip
-        # Keep this at +/- 10.0 to ensure mathematical stability
+        # Clip reward to maintain stability
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
@@ -423,7 +416,7 @@ class OperatorAgent:
             batch_size=256,
             n_epochs=10,
             gamma=0.99,
-            ent_coef=0.01,
+            ent_coef=0.04,
             verbose=1,
             device="auto",
             seed=seed,
