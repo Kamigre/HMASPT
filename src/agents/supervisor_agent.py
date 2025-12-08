@@ -8,15 +8,25 @@ import pandas as pd
 import google.generativeai as genai
 from statsmodels.tsa.stattools import adfuller
 
-# Local imports (Assumed to be in your path)
-from config import CONFIG
-from agents.message_bus import JSONLogger
-from utils import half_life as compute_half_life, compute_spread
+# Local imports
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+try:
+    from config import CONFIG
+    from agents.message_bus import JSONLogger
+    from utils import half_life as compute_half_life, compute_spread
+except ImportError:
+    # Fallback for standalone testing
+    CONFIG = {"risk_free_rate": 0.04}
+    JSONLogger = None
+    compute_half_life = lambda x: 10
+    compute_spread = lambda x, y: x - y
 
 @dataclass
 class SupervisorAgent:
     
-    logger: JSONLogger = None
+    logger: Optional[JSONLogger] = None
     df: pd.DataFrame = None  # Full price data for validation
     storage_dir: str = "./storage"
     gemini_api_key: Optional[str] = None
@@ -24,7 +34,7 @@ class SupervisorAgent:
     temperature: float = 0.1
     use_gemini: bool = True
     
-    # NEW: How often (in days) to perform deep performance reviews
+    # How often (in days) to perform deep performance reviews
     check_frequency: int = 5 
     
     # Internal state for tracking strikes and warnings per pair
@@ -84,6 +94,10 @@ class SupervisorAgent:
         validated = []
 
         # Pivot price data for fast access
+        if self.df is None or self.df.empty:
+            print("⚠️ Supervisor has no data for validation.")
+            return df_pairs
+
         prices = self.df.pivot(
             index="date",
             columns="ticker",
@@ -167,7 +181,7 @@ class SupervisorAgent:
         if "supervisor_rules" not in CONFIG:
             return self._basic_check(operator_traces, pair)
         
-        rules = CONFIG["supervisor_rules"][phase]
+        rules = CONFIG["supervisor_rules"].get(phase, {})
         
         if len(operator_traces) < rules.get("min_observations", 20):
             return {"action": "continue", "severity": "info", "reason": "insufficient_data", "metrics": {}}
@@ -194,6 +208,8 @@ class SupervisorAgent:
         # A. IMMEDIATE KILL (Structural Breaks) - CHECK EVERY DAY
         # ============================================================
         # We NEVER skip this. If Z > 5, the model is broken now.
+        
+        # We calculate spread stats independently of the operator to act as a double-check
         spread_history = [t['current_spread'] for t in operator_traces]
         if len(spread_history) > 30:
             spread_series = pd.Series(spread_history)
@@ -326,7 +342,6 @@ class SupervisorAgent:
         return {
             'drawdown': drawdown,
             'sharpe': self._calculate_sharpe(returns),
-            'win_rate': sum(1 for r in returns if r > 0) / len(returns) if returns else 0,
             'total_steps': len(traces)
         }
 
@@ -392,12 +407,21 @@ class SupervisorAgent:
             "sharpe_ratio": self._calculate_sharpe(all_returns),
             "sortino_ratio": self._calculate_sortino(all_returns),
             "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
-            "win_rate": sum(1 for r in all_returns if r > 0) / len(all_returns) if all_returns else 0,
             "avg_return": float(np.mean(all_returns)) if all_returns else 0,
             "total_steps": len(operator_traces),
             "n_pairs": len(traces_by_pair),
             "pair_summaries": pair_summaries
         }
+        
+        # --- CORRECT WIN RATE CALCULATION (Matching Visualizer) ---
+        # Filter for steps where a trade was explicitly closed/adjusted
+        closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
+        if closed_trades:
+            # A win is defined as Positive PnL AFTER transaction costs
+            wins = sum(1 for t in closed_trades if (t.get("realized_pnl_this_step", 0) - t.get("transaction_costs", 0)) > 0)
+            metrics["win_rate"] = wins / len(closed_trades)
+        else:
+            metrics["win_rate"] = 0.0
         
         # Calculate Risk Metrics (VaR/CVaR)
         if all_returns:
