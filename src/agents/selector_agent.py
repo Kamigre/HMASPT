@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 
-
 # ==============================================================================
 # 1. ENHANCED MODEL ARCHITECTURE (BCE Loss + Vectorization)
 # ==============================================================================
@@ -48,6 +47,8 @@ class EnhancedTGNN(nn.Module):
         
         self.dropout = dropout
 
+        # --- FIX: Initialize the Loss Function ---
+        # We use BCEWithLogitsLoss because _score_vectors returns raw values, not probabilities.
         self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
