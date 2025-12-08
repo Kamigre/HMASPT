@@ -163,8 +163,11 @@ class PairTradingEnv(gym.Env):
         
         return self._get_observation(self.idx), {}
 
-    def step(self, action: int):
-        """Execute one trading step."""
+   def step(self, action: int):
+        """
+        Execute one trading step. 
+        Forces a close (position=0) at the last timestep.
+        """
         current_idx = self.idx
         
         # 1. Determine if this is the last available step
@@ -179,6 +182,9 @@ class PairTradingEnv(gym.Env):
 
         # 3. Setup Data
         current_spread = float(self.spread_np[current_idx])
+        
+        # --- NEW: Retrieve Current Z-Score for Reward Calculation ---
+        current_zscore = float(self.zscore_short_np[current_idx])
         
         if is_last_step:
             next_spread = current_spread 
@@ -256,13 +262,36 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # 7. Reward
+        # 7. Reward Calculation
         reward = daily_return * 100
         reward -= 0.3 * drawdown
+        
         if self.position != 0:
             reward -= 0.01 * self.days_in_position
+
         if realized_pnl_this_step > 0:
             reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 10
+            
+        # ---------------------------------------------------------------------
+        # NEW: Z-Score Alignment Reward
+        # ---------------------------------------------------------------------
+        # Logic: 
+        #   If Z > 0 (Overvalued), we want Position < 0 (Short). 
+        #      Example: Z=2, Pos=-1 => -1 * 2 * -1 = +2 (Reward)
+        #   If Z < 0 (Undervalued), we want Position > 0 (Long).
+        #      Example: Z=-2, Pos=+1 => -1 * -2 * 1 = +2 (Reward)
+        # ---------------------------------------------------------------------
+        if self.position != 0:
+            # Normalize position to -1.0, 0.0, or 1.0
+            norm_pos = self.position / self.position_scale
+            
+            # The scaling factor (0.1) ensures this guides the agent 
+            # but doesn't overpower the actual PnL.
+            alignment_bonus = -1.0 * current_zscore * norm_pos * 0.1
+            
+            reward += alignment_bonus
+
+        # Clip reward to maintain stability
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
@@ -272,7 +301,7 @@ class PairTradingEnv(gym.Env):
         # 9. Obs
         obs = self._get_observation(self.idx)
         
-        # 10. Info - UPDATED: Include Z-Score directly here
+        # 10. Info
         info = {
             'portfolio_value': float(self.portfolio_value),
             'cash': float(self.cash),
@@ -283,8 +312,7 @@ class PairTradingEnv(gym.Env):
             'position': int(self.position),
             'entry_spread': float(self.entry_spread),
             'current_spread': float(current_spread),
-            # CRITICAL FIX: Pass the calculated z-score to logs
-            'z_score': float(self.zscore_short_np[current_idx]),
+            'z_score': float(current_zscore), # Using the variable we extracted earlier
             'days_in_position': int(self.days_in_position),
             'daily_return': float(daily_return),
             'drawdown': float(drawdown),
