@@ -94,7 +94,7 @@ class PairTradingEnv(gym.Env):
         self.drawdown_penalty_factor = 1.0 
         self.holding_penalty_factor = 0.005 
         self.profit_bonus = 5.0 
-        self.VOLATILITY_WINDOW = 60 # Window size for volatility calculation (Stabilized Reward)
+        self.VOLATILITY_WINDOW = 60 # Window size for volatility calculation (No longer directly used for reward)
         
         self._precompute_features()
         
@@ -121,7 +121,7 @@ class PairTradingEnv(gym.Env):
         
         self.zscore_short = (self.spread - rolling_mean) / rolling_std
         self.zscore_long = ((self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
-                            (self.spread.rolling(self.lookback * 2).std() + 1e-8))
+                             (self.spread.rolling(self.lookback * 2).std() + 1e-8))
         self.vol_short = rolling_std
         self.vol_long = self.spread.rolling(self.lookback * 3).std()
         self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
@@ -321,21 +321,23 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # 7. Reward (Sharpe-like and Drawdown-focused)
-        # Use volatility of a smooth window of daily returns
-        returns_window = self.daily_returns_history[-self.VOLATILITY_WINDOW:]
-        current_return_volatility = np.std(returns_window, ddof=1) if len(returns_window) >= 2 else 1e-4
+        # 7. Reward (Simplified: Scaled Daily Return + Drawdown Penalty) ⬅️ MODIFIED
 
-        sharpe_term = daily_return / max(current_return_volatility, 1e-4)
-        drawdown_penalty = self.drawdown_penalty_factor * drawdown
+        # Scale daily return (e.g., multiply by 1000 to get a meaningful reward magnitude)
+        daily_return_scaled = daily_return * 1000.0 
+
+        # Increased penalty scale for faster learning
+        drawdown_penalty = self.drawdown_penalty_factor * drawdown * 5.0 
         holding_penalty = self.holding_penalty_factor * self.days_in_position * (1.0 if self.position != 0 else 0.0)
-        
+
         profit_bonus = 0.0
         if realized_pnl_this_step > 0:
+            # Bonus for realized profit, scaled by initial capital
             profit_bonus = self.profit_bonus * (realized_pnl_this_step / self.initial_capital)
-        
-        reward = (sharpe_term * self.reward_scale) - drawdown_penalty - holding_penalty + profit_bonus
 
+        # The Reward Formula: Raw Return - Drawdown Penalty - Holding Cost + Realized Bonus
+        reward = daily_return_scaled - drawdown_penalty - holding_penalty + profit_bonus
+        
         reward = np.clip(reward, -self.reward_scale, self.reward_scale)
         
         # 8. Index and 9. Obs
