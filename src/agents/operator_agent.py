@@ -546,10 +546,11 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     return all_traces
 
 
-def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
     """
-    Run holdout testing with supervisor monitoring, including a warm-up loop
-    to correctly initialize features and the RecurrentPPO LSTM state.
+    Run holdout testing with supervisor monitoring.
+    Uses 'warmup_steps' at the start of holdout_prices to initialize LSTM
+    and internal indicators without recording PnL.
     """
     
     # Check supervisor config
@@ -557,7 +558,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         check_interval = CONFIG["supervisor_rules"]["holdout"].get("check_interval", 20)
     else:
         check_interval = 20
-    
+        
     operator.traces_buffer = []
     operator.current_step = 0
 
@@ -568,10 +569,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
     # Ensure lookback matches training
     lookback = CONFIG.get("rl_lookback", 30)
     
-    # WARM_UP_STEPS: Number of steps to feed the LSTM before tracking PnL.
-    # This aligns the internal state with recent market history.
-    WARM_UP_STEPS = 90 
-
     for pair in pairs:
         print(f"\n{'='*70}")
         print(f"Testing pair: {pair[0]} - {pair[1]}")
@@ -588,8 +585,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         aligned = pd.concat([series_x, series_y], axis=1).dropna()
 
         # Ensure we have enough data for Lookback + Warmup + At least 1 trade step
-        if len(aligned) < lookback + WARM_UP_STEPS + 1:
-            print(f"⚠️ Insufficient data ({len(aligned)} steps total). Needs {lookback + WARM_UP_STEPS + 1} - skipping")
+        if len(aligned) < lookback + warmup_steps + 1:
+            print(f"⚠️ Insufficient data ({len(aligned)} steps total). Needs {lookback + warmup_steps + 1} - skipping")
             skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Insufficient data", "severity": "skip"})
             continue
 
@@ -604,7 +601,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         print(f"  ✓ Model loaded")
 
         # 3. Environment Setup (Test Mode)
-        # Note: In test_mode=True, env.idx usually starts at 0.
+        # Note: In test_mode=True, env.idx usually starts at 0 or lookback.
         env = PairTradingEnv(
             series_x=aligned.iloc[:, 0], 
             series_y=aligned.iloc[:, 1], 
@@ -619,9 +616,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         obs, info = env.reset() 
 
         # ==============================================================================
-        # WARM-UP LOGIC START
+        # WARM-UP PHASE
         # ==============================================================================
-        print(f"  ✓ Warming up model state on {WARM_UP_STEPS} steps of history...")
+        print(f"  ⏳ Warming up model state on {warmup_steps} steps of history...")
         
         # Initialize LSTM states
         lstm_states = None
@@ -629,15 +626,13 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         
         warmup_completed = True
         
-        # Run the model on the first chunk of data without logging to trace
-        for i in range(WARM_UP_STEPS):
-            # Check if data ends prematurely
+        # Run the model to update states, BUT ignore results/pnl
+        for i in range(warmup_steps):
             if env.idx >= len(env.spread_np) - 1:
                 print("  ⚠️ Data ended during warm-up. Skipping pair.")
                 warmup_completed = False
                 break 
                 
-            # Predict action (updates lstm_states internally)
             action, lstm_states = model.predict(
                 obs, 
                 state=lstm_states, 
@@ -645,46 +640,47 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 deterministic=True
             )
             
-            # Step environment (advances env.idx)
-            obs, _, _, _, _ = env.step(action) 
+            obs, _, done, _, _ = env.step(action)
+            episode_starts = np.array([done])
             
-            # After first step, it's no longer the start of the episode
-            episode_starts = np.array([False]) 
+            if done:
+                warmup_completed = False
+                break
         
         if not warmup_completed:
             continue
 
         # ==============================================================================
-        # STATE RESET LOGIC START
+        # FINANCIAL RESET (Prepare for Real Trading)
         # ==============================================================================
-        # 1. Capture the current data pointer (where we are in history)
-        start_idx_for_trading = env.idx 
+        # The agent has "seen" the market for 90 days (updated LSTM), 
+        # but now we must reset the PnL counters so testing starts at $0.
         
-        # 2. Reset the environment. 
-        #    This clears Cash, PnL, Positions, and Metrics to 0/Initial Capital.
-        #    WARNING: This usually resets env.idx to 0 or lookback.
-        env.reset() 
+        env.cash = env.initial_capital
+        env.portfolio_value = env.initial_capital
+        env.realized_pnl = 0.0 
+        env.unrealized_pnl = 0.0 
+        env.num_trades = 0
+        env.trade_history = []
+        env.peak_value = env.initial_capital
         
-        # 3. Manually restore the data pointer to the end of the warm-up period.
-        #    We preserve the LSTM state (lstm_states variable) from the loop above.
-        env.idx = start_idx_for_trading 
-        
-        # 4. Get the correct observation for this specific index to start trading
-        #    (The env.reset() returned obs for index 0, we need obs for start_idx_for_trading)
-        obs = env._get_observation(env.idx)
+        # Force Flat Position to ensure clean start
+        if env.position != 0:
+            env.position = 0
+            env.entry_spread = 0.0
+            env.days_in_position = 0
 
         print(f"  ✓ Warm-up complete. Financials reset. Trading starts at Index {env.idx}.")
-        # ==============================================================================
-        # STATE RESET LOGIC END
-        # ==============================================================================
 
+        # ==============================================================================
+        # MAIN TRADING LOOP
+        # ==============================================================================
         terminated = False
         skip_to_next_pair = False
         
-        # 4. Main Trading Loop
         while not terminated and not skip_to_next_pair:
             
-            # Pass the warmed-up lstm_states here
+            # Predict using the warmed-up lstm_states
             action, lstm_states = model.predict(
                 obs, 
                 state=lstm_states, 
@@ -712,7 +708,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "transaction_costs": float(info.get("transaction_costs", 0.0)),
                 "entry_spread": float(info.get("entry_spread", 0.0)),
                 "current_spread": float(info.get("current_spread", 0.0)),
-                # CRITICAL: Capture z_score here to avoid recalculation in visualizer
                 "z_score": float(info.get("z_score", 0.0)), 
                 "days_in_position": int(info.get("days_in_position", 0)),
                 "daily_return": float(info.get("daily_return", 0.0)),
