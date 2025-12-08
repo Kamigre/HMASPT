@@ -159,10 +159,9 @@ class PairTradingEnv(gym.Env):
         
         return self._get_observation(self.idx), {}
 
-    def step(self, action: int):
+   def step(self, action: int):
         """
-        Execute one trading step. 
-        Forces a close (position=0) at the last timestep.
+        Execute one trading step with IMPROVED Reward Calculation.
         """
         current_idx = self.idx
         
@@ -178,8 +177,6 @@ class PairTradingEnv(gym.Env):
 
         # 3. Setup Data
         current_spread = float(self.spread_np[current_idx])
-        
-        # --- NEW: Retrieve Current Z-Score for Reward Calculation ---
         current_zscore = float(self.zscore_short_np[current_idx])
         
         if is_last_step:
@@ -201,24 +198,28 @@ class PairTradingEnv(gym.Env):
             if self.position != 0:
                 spread_change = current_spread - self.entry_spread
                 
+                # Check if we are closing or flipping
                 if target_position == 0 or np.sign(target_position) != np.sign(self.position):
                     closed_size = abs(self.position)
                 else:
                     closed_size = abs(position_change)
                     
+                # Standard PnL Calculation
                 realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
 
-            # Costs
+            # Transaction Costs
             trade_size = abs(position_change)
             notional = trade_size * abs(current_spread)
             transaction_costs = notional * self.transaction_cost_rate
             self.num_trades += 1
             
-            # Reset Entry Price
+            # Reset/Update Entry Price
             if target_position != 0 and np.sign(target_position) != np.sign(self.position):
+                # Flipping or Opening New
                 self.entry_spread = current_spread
                 self.days_in_position = 0
             elif target_position == 0:
+                # Flat
                 self.entry_spread = 0.0
                 self.days_in_position = 0
                 
@@ -233,6 +234,7 @@ class PairTradingEnv(gym.Env):
                     'forced_close': is_last_step
                 })
         else:
+            # Holding existing position
             self.days_in_position += 1
             
         # Update State
@@ -251,43 +253,75 @@ class PairTradingEnv(gym.Env):
         if not hasattr(self, 'prev_portfolio_value'):
             self.prev_portfolio_value = self.initial_capital
 
+        # Calculate log returns for better stability, or standard % returns
         daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
         self.prev_portfolio_value = self.portfolio_value
 
         # 6. Metrics
+        prev_peak = self.peak_value
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # 7. Reward Calculation
-        reward = daily_return * 100
-        reward -= 0.3 * drawdown
+        # ==============================================================================
+        # 7. IMPROVED REWARD CALCULATION
+        # ==============================================================================
         
-        if self.position != 0:
-            reward -= 0.01 * self.days_in_position
+        reward = 0.0
 
+        # A. PnL Reward (Risk-Adjusted)
+        # -------------------------------------------------------------------------
+        # Instead of raw return, we penalize volatility implicitly via the Sortino-style logic.
+        # If return is positive, full reward. If negative, heavier penalty.
+        if daily_return > 0:
+            reward += daily_return * 100.0  # Scale up small % returns
+        else:
+            reward += daily_return * 120.0  # 1.2x penalty for losses (Loss Aversion)
+
+        # B. Realized PnL Bonus (The "Cookie")
+        # -------------------------------------------------------------------------
+        # We give a significant one-time bonus for locking in a profit.
+        # This encourages the agent to actually CLOSE trades rather than hold forever.
         if realized_pnl_this_step > 0:
-            reward += 2.0 * (realized_pnl_this_step / self.initial_capital) * 10
-            
-        # ---------------------------------------------------------------------
-        # NEW: Z-Score Alignment Reward
-        # ---------------------------------------------------------------------
-        # Logic: 
-        #   If Z > 0 (Overvalued), we want Position < 0 (Short). 
-        #      Example: Z=2, Pos=-1 => -1 * 2 * -1 = +2 (Reward)
-        #   If Z < 0 (Undervalued), we want Position > 0 (Long).
-        #      Example: Z=-2, Pos=+1 => -1 * -2 * 1 = +2 (Reward)
-        # ---------------------------------------------------------------------
-        if self.position != 0:
-            # Normalize position to -1.0, 0.0, or 1.0
-            norm_pos = self.position / self.position_scale
-            
-            # The scaling factor (0.1) ensures this guides the agent 
-            # but doesn't overpower the actual PnL.
-            alignment_bonus = -1.0 * current_zscore * norm_pos * 0.1
-            
-            reward += alignment_bonus
+            # Reward is proportional to the % gain on capital
+            pnl_pct = realized_pnl_this_step / self.initial_capital
+            reward += pnl_pct * 500.0 # Big spike for banking profit
+        
+        # C. Drawdown Delta Penalty (The "Stop Loss")
+        # -------------------------------------------------------------------------
+        # CRITICAL CHANGE: Only penalize if drawdown INCREASES.
+        # This avoids the "Death Spiral" where an agent in drawdown gets punished 
+        # even if it makes a good trade that recovers 1% of the loss.
+        # We check if peak_value didn't update, meaning we are below high water mark.
+        if self.portfolio_value < prev_peak:
+            # Calculate how much deeper the drawdown got this step
+            # If we recovered (daily_return > 0), this adds nothing or is positive.
+            # We want to punish negative returns specifically when already in drawdown.
+            if daily_return < 0:
+                reward -= abs(daily_return) * 50.0 # Extra penalty for losing money while down
 
-        # Clip reward to maintain stability
+        # D. Holding Cost (Time Value of Money)
+        # -------------------------------------------------------------------------
+        # Non-linear penalty. Holding for 5 days is fine. Holding for 50 is bad.
+        # Caps at a certain point to prevent explosion.
+        if self.position != 0:
+            holding_penalty = min(self.days_in_position, 50) * 0.005
+            reward -= holding_penalty
+
+        # E. Z-Score Alignment (Guidance / Shaping)
+        # -------------------------------------------------------------------------
+        # Only apply this if the agent is NOT in a trade (to guide entry) 
+        # or if the position opposes the Z-score logic.
+        norm_pos = self.position / self.position_scale
+        
+        # "Anti-alignment": If Z > 1 (Expensive) and we are Long (Pos > 0) -> Penalize!
+        if (current_zscore > 1.0 and norm_pos > 0) or (current_zscore < -1.0 and norm_pos < 0):
+             reward -= 0.1 # Small constant penalty for fighting the mean reversion
+             
+        # "Pro-alignment": If Z > 1 and we Short, or Z < -1 and we Long -> Small drip feed
+        if (current_zscore > 1.0 and norm_pos < 0) or (current_zscore < -1.0 and norm_pos > 0):
+             reward += 0.05 
+
+        # Clip reward to maintain stability for PPO (prevents gradients exploding)
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
@@ -308,7 +342,7 @@ class PairTradingEnv(gym.Env):
             'position': int(self.position),
             'entry_spread': float(self.entry_spread),
             'current_spread': float(current_spread),
-            'z_score': float(current_zscore), # Using the variable we extracted earlier
+            'z_score': float(current_zscore), 
             'days_in_position': int(self.days_in_position),
             'daily_return': float(daily_return),
             'drawdown': float(drawdown),
@@ -323,7 +357,7 @@ class PairTradingEnv(gym.Env):
         terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
-
+       
 @dataclass
 class OperatorAgent:
     
