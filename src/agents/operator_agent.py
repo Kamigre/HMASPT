@@ -259,42 +259,42 @@ class PairTradingEnv(gym.Env):
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
         # ---------------------------------------------------------------------
-        # OPTIMIZED SHARPE REWARD CALCULATION
+        # WIDE-CLIP REWARD (Allows up to 100% moves)
         # ---------------------------------------------------------------------
         
-        # 1. Log Return (Symmetric)
-        log_return = np.log(self.portfolio_value / max(self.prev_portfolio_value, 1e-8))
-        
-        # 2. Sortino-style Penalty (Punish downside volatility 3x more than upside)
-        if log_return < 0:
-            risk_penalty = 3.0 * (log_return ** 2)
-        else:
-            risk_penalty = 0.0 # Don't punish upside volatility
-            
-        reward = (log_return * 100) - (risk_penalty * 100)
-        
-        # 3. Time Decay (The "Rent")
-        # Charges the agent for every day it keeps capital tied up
+        # 1. Calculate Normal Return
+        denom = self.prev_portfolio_value if self.prev_portfolio_value != 0 else 1.0
+        step_return = (self.portfolio_value - self.prev_portfolio_value) / denom
+
+        # This catches "infinite" errors but allows massive market moves.
+        step_return = np.clip(step_return, -0.6, 0.6)
+
+        # 2. Base Reward (REDUCED MULTIPLIER)
+        # Previously we used * 100.0. 
+        # Since step_return can now be huge (1.0), we reduce this to * 10.0.
+        # Max Reward = 1.0 * 10.0 = 10.0 (Safe range)
+        reward = step_return * 10.0
+
+        # 3. Asymmetric Volatility Penalty
+        # If return is negative, double the pain.
+        if step_return < 0:
+            reward *= 2.0 
+
+        # 4. "Rent" (Time Decay)
         if self.position != 0:
-            reward -= 0.1  # Increased from 0.01
-            
-        # 4. Mean Reversion Alignment (The "Magnet")
-        # If Z-score is extreme (>1.5), heavily reward counter-trading
-        # If Z-score is neutral (<0.5), heavily reward being FLAT
-        if abs(current_zscore) > 1.5:
-            # We want to be in a position opposite to Z
-            target_pos_sign = -np.sign(current_zscore)
-            current_pos_sign = np.sign(self.position)
-            if current_pos_sign == target_pos_sign:
-                reward += 0.5
-        elif abs(current_zscore) < 0.5:
-            # We want to be flat
-            if self.position == 0:
-                reward += 0.5
+            reward -= 0.05 
+
+        # 5. Z-Score Alignment
+        if self.position != 0:
+            pos_sign = np.sign(self.position)
+            z_sign = np.sign(current_zscore)
+            if pos_sign != z_sign:
+                reward += 0.1 
             else:
-                reward -= 0.5 # Penalty for holding through the mean
-                
-        # Clip for stability
+                reward -= 0.1
+
+        # 6. Final Stability Clip
+        # Keep this at +/- 10.0 to ensure mathematical stability
         reward = np.clip(reward, -10.0, 10.0)
         
         # 8. Index
