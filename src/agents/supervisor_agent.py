@@ -482,18 +482,35 @@ class SupervisorAgent:
             return self._fallback_explanation(metrics, actions)
         
         prompt = f"""
-                Act as a Quantitative Risk Manager. Analyze these pairs trading results:
+                You are the Chief Risk Officer (CRO) at a Quantitative Hedge Fund. 
+                Your mandate is capital preservation and risk-adjusted growth.
                 
-                METRICS:
+                Analyze the following Pairs Trading Portfolio results:
+                
+                --- METRICS ---
                 {json.dumps(metrics, indent=2, default=str)}
                 
-                ACTIONS:
+                --- AUTOMATED ACTIONS TRIGGERED ---
                 {json.dumps(actions, indent=2)}
                 
-                Write a professional 3-paragraph executive summary:
-                1. Performance Overview (Returns, Sharpe, Drawdown).
-                2. Risk Analysis (Tail risk, worst pairs, structural breaks).
-                3. Strategic Recommendation (Continue, Reduce Size, Halt).
+                Produce a strict, institutional-grade Executive Risk Memo. 
+                Avoid generic pleasantries. Focus on data interpretation.
+                
+                Structure your response into these three specific sections:
+                
+                ### 1. Performance Attribution
+                - Evaluate the quality of returns (Sharpe > 2.0 is target).
+                - Analyze the "Quality of Earnings": Compare Win Rate vs. Total PnL. (e.g., If Win Rate is high but PnL is low/negative, are we taking small profits and large losses?)
+                - Comment on the disparity between Average Return and Median Return (skewness).
+                
+                ### 2. Risk Decomposition
+                - Analyze Tail Risk: specific comment on Max Drawdown vs. VaR/CVaR (95%).
+                - Assess "Stalemate Risk": Look at 'avg_steps_per_pair'. Are we holding positions too long for a mean-reversion strategy?
+                - Identify if specific pairs are dragging down the aggregate (Concentration of loss).
+                
+                ### 3. CRO Verdict & Adjustments
+                - Review the AUTOMATED ACTIONS above. Do you concur, or do you recommend a manual override?
+                - Provide a final "Traffic Light" signal: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
                 """
         
         try:
