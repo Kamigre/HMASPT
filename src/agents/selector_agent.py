@@ -11,9 +11,10 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
-CONFIG = {"random_seed": 42}
+
 
 # ==============================================================================
 # 1. ENHANCED MODEL ARCHITECTURE (BCE Loss + Vectorization)
@@ -129,12 +130,12 @@ class OptimizedSelectorAgent:
     trace_path: str = "traces/selector.jsonl"
     
     # Hyperparameters
-    corr_threshold: float = 0.5
+    corr_threshold: float = 0.60
     lookback_weeks: int = 4
     forecast_horizon: int = 1
     holdout_months: int = 18
     hidden_dim: int = 64
-    num_heads: int = 4
+    num_heads: int = 3
     
     # Internal State
     model: Any = None
