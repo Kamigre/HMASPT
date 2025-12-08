@@ -47,6 +47,8 @@ class EnhancedTGNN(nn.Module):
         nn.init.xavier_uniform_(self.bilinear_W)
         
         self.dropout = dropout
+
+        self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
         # A. Encode
