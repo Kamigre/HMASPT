@@ -159,204 +159,204 @@ class PairTradingEnv(gym.Env):
         
         return self._get_observation(self.idx), {}
 
-       def step(self, action: int):
-            """
-            Execute one trading step with IMPROVED Reward Calculation.
-            """
-            current_idx = self.idx
+    def step(self, action: int):
+        """
+        Execute one trading step with IMPROVED Reward Calculation.
+        """
+        current_idx = self.idx
+        
+        # 1. Determine if this is the last available step
+        is_last_step = (current_idx >= len(self.spread_np) - 1)
+        
+        # 2. Determine Action
+        if is_last_step:
+            target_position = 0 # FORCE EXIT
+        else:
+            base_position = int(action) - 1
+            target_position = base_position * self.position_scale
+
+        # 3. Setup Data
+        current_spread = float(self.spread_np[current_idx])
+        current_zscore = float(self.zscore_short_np[current_idx])
+        
+        if is_last_step:
+            next_spread = current_spread 
+            next_idx = current_idx 
+        else:
+            next_idx = current_idx + 1
+            next_spread = float(self.spread_np[next_idx])
             
-            # 1. Determine if this is the last available step
-            is_last_step = (current_idx >= len(self.spread_np) - 1)
-            
-            # 2. Determine Action
-            if is_last_step:
-                target_position = 0 # FORCE EXIT
-            else:
-                base_position = int(action) - 1
-                target_position = base_position * self.position_scale
-    
-            # 3. Setup Data
-            current_spread = float(self.spread_np[current_idx])
-            current_zscore = float(self.zscore_short_np[current_idx])
-            
-            if is_last_step:
-                next_spread = current_spread 
-                next_idx = current_idx 
-            else:
-                next_idx = current_idx + 1
-                next_spread = float(self.spread_np[next_idx])
-                
-            # 4. Execute Trade & Update Financials
-            position_change = target_position - self.position
-            trade_occurred = (position_change != 0)
-            
-            realized_pnl_this_step = 0.0
-            transaction_costs = 0.0
-            
-            if trade_occurred:
-                # Calculate Realized P&L
-                if self.position != 0:
-                    spread_change = current_spread - self.entry_spread
-                    
-                    # Check if we are closing or flipping
-                    if target_position == 0 or np.sign(target_position) != np.sign(self.position):
-                        closed_size = abs(self.position)
-                    else:
-                        closed_size = abs(position_change)
-                        
-                    # Standard PnL Calculation
-                    realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
-    
-                # Transaction Costs
-                trade_size = abs(position_change)
-                notional = trade_size * abs(current_spread)
-                transaction_costs = notional * self.transaction_cost_rate
-                self.num_trades += 1
-                
-                # Reset/Update Entry Price
-                if target_position != 0 and np.sign(target_position) != np.sign(self.position):
-                    # Flipping or Opening New
-                    self.entry_spread = current_spread
-                    self.days_in_position = 0
-                elif target_position == 0:
-                    # Flat
-                    self.entry_spread = 0.0
-                    self.days_in_position = 0
-                    
-                # Log history
-                if self.position != 0:
-                     self.trade_history.append({
-                        'entry_spread': self.entry_spread,
-                        'exit_spread': current_spread,
-                        'position': self.position,
-                        'pnl': realized_pnl_this_step,
-                        'holding_days': self.days_in_position,
-                        'forced_close': is_last_step
-                    })
-            else:
-                # Holding existing position
-                self.days_in_position += 1
-                
-            # Update State
-            self.position = target_position
-            self.realized_pnl += realized_pnl_this_step - transaction_costs
-            self.cash = self.initial_capital + self.realized_pnl
-            
+        # 4. Execute Trade & Update Financials
+        position_change = target_position - self.position
+        trade_occurred = (position_change != 0)
+        
+        realized_pnl_this_step = 0.0
+        transaction_costs = 0.0
+        
+        if trade_occurred:
+            # Calculate Realized P&L
             if self.position != 0:
-                self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
-            else:
-                self.unrealized_pnl = 0.0
+                spread_change = current_spread - self.entry_spread
                 
-            self.portfolio_value = self.cash + self.unrealized_pnl
+                # Check if we are closing or flipping
+                if target_position == 0 or np.sign(target_position) != np.sign(self.position):
+                    closed_size = abs(self.position)
+                else:
+                    closed_size = abs(position_change)
+                    
+                # Standard PnL Calculation
+                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
+
+            # Transaction Costs
+            trade_size = abs(position_change)
+            notional = trade_size * abs(current_spread)
+            transaction_costs = notional * self.transaction_cost_rate
+            self.num_trades += 1
             
-            # 5. Returns
-            if not hasattr(self, 'prev_portfolio_value'):
-                self.prev_portfolio_value = self.initial_capital
-    
-            # Calculate log returns for better stability, or standard % returns
-            daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
-            self.prev_portfolio_value = self.portfolio_value
-    
-            # 6. Metrics
-            prev_peak = self.peak_value
-            self.peak_value = max(self.peak_value, self.portfolio_value)
-            drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
-            
-            # ==============================================================================
-            # 7. IMPROVED REWARD CALCULATION
-            # ==============================================================================
-            
-            reward = 0.0
-    
-            # A. PnL Reward (Risk-Adjusted)
-            # -------------------------------------------------------------------------
-            # Instead of raw return, we penalize volatility implicitly via the Sortino-style logic.
-            # If return is positive, full reward. If negative, heavier penalty.
-            if daily_return > 0:
-                reward += daily_return * 100.0  # Scale up small % returns
-            else:
-                reward += daily_return * 120.0  # 1.2x penalty for losses (Loss Aversion)
-    
-            # B. Realized PnL Bonus (The "Cookie")
-            # -------------------------------------------------------------------------
-            # We give a significant one-time bonus for locking in a profit.
-            # This encourages the agent to actually CLOSE trades rather than hold forever.
-            if realized_pnl_this_step > 0:
-                # Reward is proportional to the % gain on capital
-                pnl_pct = realized_pnl_this_step / self.initial_capital
-                reward += pnl_pct * 500.0 # Big spike for banking profit
-            
-            # C. Drawdown Delta Penalty (The "Stop Loss")
-            # -------------------------------------------------------------------------
-            # CRITICAL CHANGE: Only penalize if drawdown INCREASES.
-            # This avoids the "Death Spiral" where an agent in drawdown gets punished 
-            # even if it makes a good trade that recovers 1% of the loss.
-            # We check if peak_value didn't update, meaning we are below high water mark.
-            if self.portfolio_value < prev_peak:
-                # Calculate how much deeper the drawdown got this step
-                # If we recovered (daily_return > 0), this adds nothing or is positive.
-                # We want to punish negative returns specifically when already in drawdown.
-                if daily_return < 0:
-                    reward -= abs(daily_return) * 50.0 # Extra penalty for losing money while down
-    
-            # D. Holding Cost (Time Value of Money)
-            # -------------------------------------------------------------------------
-            # Non-linear penalty. Holding for 5 days is fine. Holding for 50 is bad.
-            # Caps at a certain point to prevent explosion.
+            # Reset/Update Entry Price
+            if target_position != 0 and np.sign(target_position) != np.sign(self.position):
+                # Flipping or Opening New
+                self.entry_spread = current_spread
+                self.days_in_position = 0
+            elif target_position == 0:
+                # Flat
+                self.entry_spread = 0.0
+                self.days_in_position = 0
+                
+            # Log history
             if self.position != 0:
-                holding_penalty = min(self.days_in_position, 50) * 0.005
-                reward -= holding_penalty
-    
-            # E. Z-Score Alignment (Guidance / Shaping)
-            # -------------------------------------------------------------------------
-            # Only apply this if the agent is NOT in a trade (to guide entry) 
-            # or if the position opposes the Z-score logic.
-            norm_pos = self.position / self.position_scale
+                  self.trade_history.append({
+                    'entry_spread': self.entry_spread,
+                    'exit_spread': current_spread,
+                    'position': self.position,
+                    'pnl': realized_pnl_this_step,
+                    'holding_days': self.days_in_position,
+                    'forced_close': is_last_step
+                })
+        else:
+            # Holding existing position
+            self.days_in_position += 1
             
-            # "Anti-alignment": If Z > 1 (Expensive) and we are Long (Pos > 0) -> Penalize!
-            if (current_zscore > 1.0 and norm_pos > 0) or (current_zscore < -1.0 and norm_pos < 0):
-                 reward -= 0.1 # Small constant penalty for fighting the mean reversion
-                 
-            # "Pro-alignment": If Z > 1 and we Short, or Z < -1 and we Long -> Small drip feed
-            if (current_zscore > 1.0 and norm_pos < 0) or (current_zscore < -1.0 and norm_pos > 0):
-                 reward += 0.05 
-    
-            # Clip reward to maintain stability for PPO (prevents gradients exploding)
-            reward = np.clip(reward, -10.0, 10.0)
+        # Update State
+        self.position = target_position
+        self.realized_pnl += realized_pnl_this_step - transaction_costs
+        self.cash = self.initial_capital + self.realized_pnl
+        
+        if self.position != 0:
+            self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
+        else:
+            self.unrealized_pnl = 0.0
             
-            # 8. Index
-            if not is_last_step:
-                self.idx = next_idx
-            
-            # 9. Obs
-            obs = self._get_observation(self.idx)
-            
-            # 10. Info
-            info = {
-                'portfolio_value': float(self.portfolio_value),
-                'cash': float(self.cash),
-                'realized_pnl': float(self.realized_pnl),
-                'unrealized_pnl': float(self.unrealized_pnl),
-                'realized_pnl_this_step': float(realized_pnl_this_step),
-                'transaction_costs': float(transaction_costs),
-                'position': int(self.position),
-                'entry_spread': float(self.entry_spread),
-                'current_spread': float(current_spread),
-                'z_score': float(current_zscore), 
-                'days_in_position': int(self.days_in_position),
-                'daily_return': float(daily_return),
-                'drawdown': float(drawdown),
-                'num_trades': int(self.num_trades),
-                'trade_occurred': bool(trade_occurred),
-                'cum_return': float(self.portfolio_value / self.initial_capital - 1),
-                'forced_close': is_last_step and trade_occurred,
-                'price_x': float(self.price_x_np[current_idx]),
-                'price_y': float(self.price_y_np[current_idx])
-            }
-            
-            terminated = is_last_step
-            
-            return obs, float(reward), terminated, False, info
+        self.portfolio_value = self.cash + self.unrealized_pnl
+        
+        # 5. Returns
+        if not hasattr(self, 'prev_portfolio_value'):
+            self.prev_portfolio_value = self.initial_capital
+
+        # Calculate log returns for better stability, or standard % returns
+        daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
+        self.prev_portfolio_value = self.portfolio_value
+
+        # 6. Metrics
+        prev_peak = self.peak_value
+        self.peak_value = max(self.peak_value, self.portfolio_value)
+        drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
+        
+        # ==============================================================================
+        # 7. IMPROVED REWARD CALCULATION
+        # ==============================================================================
+        
+        reward = 0.0
+
+        # A. PnL Reward (Risk-Adjusted)
+        # -------------------------------------------------------------------------
+        # Instead of raw return, we penalize volatility implicitly via the Sortino-style logic.
+        # If return is positive, full reward. If negative, heavier penalty.
+        if daily_return > 0:
+            reward += daily_return * 100.0  # Scale up small % returns
+        else:
+            reward += daily_return * 120.0  # 1.2x penalty for losses (Loss Aversion)
+
+        # B. Realized PnL Bonus (The "Cookie")
+        # -------------------------------------------------------------------------
+        # We give a significant one-time bonus for locking in a profit.
+        # This encourages the agent to actually CLOSE trades rather than hold forever.
+        if realized_pnl_this_step > 0:
+            # Reward is proportional to the % gain on capital
+            pnl_pct = realized_pnl_this_step / self.initial_capital
+            reward += pnl_pct * 500.0 # Big spike for banking profit
+        
+        # C. Drawdown Delta Penalty (The "Stop Loss")
+        # -------------------------------------------------------------------------
+        # CRITICAL CHANGE: Only penalize if drawdown INCREASES.
+        # This avoids the "Death Spiral" where an agent in drawdown gets punished 
+        # even if it makes a good trade that recovers 1% of the loss.
+        # We check if peak_value didn't update, meaning we are below high water mark.
+        if self.portfolio_value < prev_peak:
+            # Calculate how much deeper the drawdown got this step
+            # If we recovered (daily_return > 0), this adds nothing or is positive.
+            # We want to punish negative returns specifically when already in drawdown.
+            if daily_return < 0:
+                reward -= abs(daily_return) * 50.0 # Extra penalty for losing money while down
+
+        # D. Holding Cost (Time Value of Money)
+        # -------------------------------------------------------------------------
+        # Non-linear penalty. Holding for 5 days is fine. Holding for 50 is bad.
+        # Caps at a certain point to prevent explosion.
+        if self.position != 0:
+            holding_penalty = min(self.days_in_position, 50) * 0.005
+            reward -= holding_penalty
+
+        # E. Z-Score Alignment (Guidance / Shaping)
+        # -------------------------------------------------------------------------
+        # Only apply this if the agent is NOT in a trade (to guide entry) 
+        # or if the position opposes the Z-score logic.
+        norm_pos = self.position / self.position_scale
+        
+        # "Anti-alignment": If Z > 1 (Expensive) and we are Long (Pos > 0) -> Penalize!
+        if (current_zscore > 1.0 and norm_pos > 0) or (current_zscore < -1.0 and norm_pos < 0):
+              reward -= 0.1 # Small constant penalty for fighting the mean reversion
+              
+        # "Pro-alignment": If Z > 1 and we Short, or Z < -1 and we Long -> Small drip feed
+        if (current_zscore > 1.0 and norm_pos < 0) or (current_zscore < -1.0 and norm_pos > 0):
+              reward += 0.05 
+
+        # Clip reward to maintain stability for PPO (prevents gradients exploding)
+        reward = np.clip(reward, -10.0, 10.0)
+        
+        # 8. Index
+        if not is_last_step:
+            self.idx = next_idx
+        
+        # 9. Obs
+        obs = self._get_observation(self.idx)
+        
+        # 10. Info
+        info = {
+            'portfolio_value': float(self.portfolio_value),
+            'cash': float(self.cash),
+            'realized_pnl': float(self.realized_pnl),
+            'unrealized_pnl': float(self.unrealized_pnl),
+            'realized_pnl_this_step': float(realized_pnl_this_step),
+            'transaction_costs': float(transaction_costs),
+            'position': int(self.position),
+            'entry_spread': float(self.entry_spread),
+            'current_spread': float(current_spread),
+            'z_score': float(current_zscore), 
+            'days_in_position': int(self.days_in_position),
+            'daily_return': float(daily_return),
+            'drawdown': float(drawdown),
+            'num_trades': int(self.num_trades),
+            'trade_occurred': bool(trade_occurred),
+            'cum_return': float(self.portfolio_value / self.initial_capital - 1),
+            'forced_close': is_last_step and trade_occurred,
+            'price_x': float(self.price_x_np[current_idx]),
+            'price_y': float(self.price_y_np[current_idx])
+        }
+        
+        terminated = is_last_step
+        
+        return obs, float(reward), terminated, False, info
        
 @dataclass
 class OperatorAgent:
