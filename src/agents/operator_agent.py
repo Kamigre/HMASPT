@@ -15,13 +15,9 @@ import sys
 
 # Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-try:
-    from config import CONFIG
-    from agents.message_bus import JSONLogger
-except ImportError:
-    # Fallback if running standalone
-    CONFIG = {"transaction_cost": 0.0005, "rl_lookback": 30, "risk_free_rate": 0.04}
-    JSONLogger = None
+from config import CONFIG
+from agents.message_bus import JSONLogger
+
 
 class PairTradingEnv(gym.Env):
 
@@ -415,12 +411,12 @@ class OperatorAgent:
         model = RecurrentPPO(
             "MlpLstmPolicy",
             env,
-            learning_rate=0.0001,
+            learning_rate=0.001,
             n_steps=4096,
             batch_size=256,
-            n_epochs=20,
+            n_epochs=10,
             gamma=0.99,
-            ent_coef=0.02,
+            ent_coef=0.04,
             verbose=1,
             device="auto",
             seed=seed,
