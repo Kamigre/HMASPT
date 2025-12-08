@@ -9,12 +9,8 @@ from typing import List, Dict, Any, Tuple
 from datetime import datetime
 import textwrap
 
-# --- CONFIG IMPORT ---
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-try:
-    from config import CONFIG
-except ImportError:
-    CONFIG = {"risk_free_rate": 0.04} 
+from config import CONFIG
 
 # --- GLOBAL STYLE SETTINGS ---
 sns.set_theme(style="whitegrid", context="talk", font_scale=0.9)
@@ -34,22 +30,22 @@ class PortfolioVisualizer:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "behavior"), exist_ok=True) # New folder for behavior plots
+        os.makedirs(os.path.join(output_dir, "behavior"), exist_ok=True)
         
         # Institutional Color Palette
         self.colors = {
-            'primary': '#2c3e50',      # Dark Slate (Prices/Equity)
-            'profit': '#27ae60',       # Emerald Green
-            'loss': '#c0392b',         # Pomegranate Red
-            'drawdown': '#e74c3c',     # Soft Red
-            'zscore': '#8e44ad',       # Purple
+            'primary': '#2c3e50',       # Dark Slate (Prices/Equity)
+            'profit': '#27ae60',        # Emerald Green
+            'loss': '#c0392b',          # Pomegranate Red
+            'drawdown': '#e74c3c',      # Soft Red
+            'zscore': '#8e44ad',        # Purple
             'fill_profit': '#2ecc71',
             'fill_loss': '#e74c3c',
             'neutral': '#95a5a6',
-            'accent': '#f39c12',       # Orange (Warnings)
-            'text_bg': '#fdfefe',      # Very light grey for text card
-            'asset_x': '#2980b9',      # Blue for Asset X
-            'asset_y': '#7f8c8d'       # Grey for Asset Y
+            'accent': '#f39c12',        # Orange (Warnings)
+            'text_bg': '#fdfefe',       # Very light grey for text card
+            'asset_x': '#2980b9',       # Blue for Asset X
+            'asset_y': '#7f8c8d'        # Grey for Asset Y
         }
     
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
@@ -74,13 +70,26 @@ class PortfolioVisualizer:
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
-        trades = df[df['trade_occurred'] == True]
+        trades_entry = df[df['trade_occurred'] == True] # Note: This counts entries, not closed cycles
         forced_exit = df[df['forced_close'] == True]
 
-        # Stats
+        # --- Corrected Stats Logic (Win Rate on CLOSED Trades) ---
         total_pnl = df['realized_pnl'].iloc[-1]
         final_ret = df['cum_return'].iloc[-1]
-        win_rate = (df[df['daily_return'] != 0]['daily_return'] > 0).mean() if not df[df['daily_return'] != 0].empty else 0.0
+        
+        # Identify rows where a trade was fully closed/P&L realized (assuming realized_pnl != 0.0 only on closure)
+        closed_trades_df = df[df['realized_pnl'] != 0.0]
+        total_closed_trades = len(closed_trades_df)
+
+        if total_closed_trades > 0:
+            winning_trades = (closed_trades_df['realized_pnl'] > 0).sum()
+            # Win rate is calculated on the count of winning *closed trades* vs. total *closed trades*
+            win_rate = winning_trades / total_closed_trades
+        else:
+            win_rate = 0.0
+        
+        # Use trades_entry count for 'Trades' in the scorecard
+        total_entries = len(trades_entry) 
         
         # --- Plotting ---
         fig = plt.figure(figsize=(20, 14))
@@ -99,13 +108,13 @@ class PortfolioVisualizer:
         
         # Fill
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
+                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
+                          where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
 
         if not forced_exit.empty:
             ax1.scatter(forced_exit['local_step'], 100 * (1 + forced_exit['cum_return']), 
-                        color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
+                         color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
 
         ax1.set_ylabel('Equity (Base 100)')
         ax1.set_title('Equity Curve', loc='left')
@@ -120,9 +129,11 @@ class PortfolioVisualizer:
             ("Total P&L", f"${total_pnl:,.2f}", self.colors['profit'] if total_pnl > 0 else self.colors['loss']),
             ("Return", f"{final_ret*100:+.2f}%", self.colors['profit'] if final_ret > 0 else self.colors['loss']),
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
-            ("Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']),
+            # Use the corrected win_rate
+            ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
             ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
-            ("Trades", f"{len(trades)}", self.colors['primary'])
+            # Use trade entries for total trades executed
+            ("Trades Executed", f"{total_entries}", self.colors['primary']) 
         ]
         
         y_pos = 0.9
@@ -284,7 +295,7 @@ class PortfolioVisualizer:
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
-                         color=self.colors['primary'], alpha=0.1)
+                          color=self.colors['primary'], alpha=0.1)
         ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
         
         # Right Axis (Return %)
@@ -301,8 +312,8 @@ class PortfolioVisualizer:
             ret = val - 100
             color = self.colors['profit'] if ret >= 0 else self.colors['loss']
             ax1.annotate(f"{ret:+.2f}%", xy=(portfolio_equity_curve.index[-1], val),
-                         xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
-                         bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
+                          xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
+                          bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
 
         ax1.set_title(f"Aggregated Performance (Est. Capital: ${total_capital:,.0f})", loc='left')
         ax1.set_ylabel("Equity (Base 100)")
@@ -448,15 +459,15 @@ class PortfolioVisualizer:
 
         # Title
         ax.text(0.05, 0.95, "Risk Manager: Executive Summary", 
-                fontsize=24, weight='bold', color=self.colors['primary'], va='top')
+                 fontsize=24, weight='bold', color=self.colors['primary'], va='top')
         
         # Body
         ax.text(0.05, 0.85, formatted_text, 
-                fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
+                 fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
 
         # Footer
         ax.text(0.5, 0.05, "Generated by AI Supervisor Agent", 
-                fontsize=12, color=self.colors['neutral'], ha='center')
+                 fontsize=12, color=self.colors['neutral'], ha='center')
 
         # Save
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -466,16 +477,18 @@ class PortfolioVisualizer:
         print(f"📄 Saved executive summary: {filepath}")
 
     def _calculate_sharpe(self, returns):
+        """Calculates the Annualized Sharpe Ratio."""
         if len(returns) < 2: return 0.0
-        rf = CONFIG.get("risk_free_rate", 0.04) / 252
+        # Assuming 252 trading days per year
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252 
         exc = np.array(returns) - rf
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
 def generate_all_visualizations(all_traces: List[Dict], 
-                                skipped_pairs: List[Dict],
-                                final_summary: Dict,
-                                output_dir: str = "reports"):
+                                 skipped_pairs: List[Dict],
+                                 final_summary: Dict,
+                                 output_dir: str = "reports"):
     """
     Generate complete visual report for portfolio and all pairs.
     """
