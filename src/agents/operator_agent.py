@@ -94,6 +94,7 @@ class PairTradingEnv(gym.Env):
         self.drawdown_penalty_factor = 1.0 
         self.holding_penalty_factor = 0.005 
         self.profit_bonus = 5.0 
+        self.VOLATILITY_WINDOW = 60 # Window size for volatility calculation (Stabilized Reward)
         
         self._precompute_features()
         
@@ -120,7 +121,7 @@ class PairTradingEnv(gym.Env):
         
         self.zscore_short = (self.spread - rolling_mean) / rolling_std
         self.zscore_long = ((self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
-                           (self.spread.rolling(self.lookback * 2).std() + 1e-8))
+                            (self.spread.rolling(self.lookback * 2).std() + 1e-8))
         self.vol_short = rolling_std
         self.vol_long = self.spread.rolling(self.lookback * 3).std()
         self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
@@ -182,7 +183,9 @@ class PairTradingEnv(gym.Env):
         """Reset environment to initial state"""
         super().reset(seed=seed)
         
-        self.idx = self.lookback if not self.test_mode else 0
+        # When not in test_mode, start after lookback to ensure features are computed.
+        # In test_mode, start at 0, and rely on the calling function to warm up the state.
+        self.idx = self.lookback if not self.test_mode else 0 
         self.position = 0
         self.prev_position = 0.0
         self.entry_spread = 0.0
@@ -198,6 +201,7 @@ class PairTradingEnv(gym.Env):
         self.trade_history = []
         
         self.prev_portfolio_value = self.initial_capital
+        self.daily_returns_history = [] # Store all returns for stable volatility
         
         return self._get_observation(self.idx), {}
 
@@ -311,13 +315,16 @@ class PairTradingEnv(gym.Env):
         # 5. Returns
         daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
         self.prev_portfolio_value = self.portfolio_value
+        self.daily_returns_history.append(daily_return) # Track daily return
         
         # 6. Metrics
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
         # 7. Reward (Sharpe-like and Drawdown-focused)
-        current_return_volatility = np.std([t['daily_return'] for t in self.trade_history[-20:] if 'daily_return' in t], ddof=1) if len(self.trade_history) >= 2 else 1e-4
+        # Use volatility of a smooth window of daily returns
+        returns_window = self.daily_returns_history[-self.VOLATILITY_WINDOW:]
+        current_return_volatility = np.std(returns_window, ddof=1) if len(returns_window) >= 2 else 1e-4
 
         sharpe_term = daily_return / max(current_return_volatility, 1e-4)
         drawdown_penalty = self.drawdown_penalty_factor * drawdown
@@ -398,7 +405,7 @@ class OperatorAgent:
                       use_curriculum: bool = False):
 
         seed = CONFIG.get("random_seed", 42)
-                            
+                                 
         if not self.active: return None
 
         if lookback is None: lookback = CONFIG.get("rl_lookback", 30)
@@ -435,7 +442,7 @@ class OperatorAgent:
 
         # Evaluation
         env_eval = PairTradingEnv(series_x, series_y, lookback, initial_capital=10000,
-                                  transaction_cost_rate=0.0005, test_mode=False)
+                                     transaction_cost_rate=0.0005, test_mode=False)
         
         obs, _ = env_eval.reset()
         done = False
@@ -470,7 +477,7 @@ class OperatorAgent:
 # ===================================================================
 
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
-                          pairs: list, max_workers: int = None):
+                            pairs: list, max_workers: int = None):
 
     if max_workers is None: max_workers = CONFIG.get("max_workers", 2)
     all_traces = []
@@ -501,7 +508,8 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
 
 def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
     """
-    Run holdout testing with supervisor monitoring.
+    Run holdout testing with supervisor monitoring, including a warm-up loop
+    to correctly initialize features and the RecurrentPPO LSTM state.
     """
     if "supervisor_rules" in CONFIG and "holdout" in CONFIG["supervisor_rules"]:
         check_interval = CONFIG["supervisor_rules"]["holdout"].get("check_interval", 20)
@@ -515,6 +523,11 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
     all_traces = []
     skipped_pairs = []
 
+    lookback = CONFIG.get("rl_lookback", 30)
+    
+    # The required warm-up steps align with the history added in the main script (90 days).
+    WARM_UP_STEPS = 90 
+
     for pair in pairs:
         print(f"\n{'='*70}")
         print(f"Testing pair: {pair[0]} - {pair[1]}")
@@ -522,43 +535,75 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
 
         if pair[0] not in holdout_prices.columns or pair[1] not in holdout_prices.columns:
             print(f"⚠️ Warning: Tickers {pair} not found in holdout data - skipping")
+            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Data not found", "severity": "skip"})
             continue
 
         series_x = holdout_prices[pair[0]].dropna()
         series_y = holdout_prices[pair[1]].dropna()
         aligned = pd.concat([series_x, series_y], axis=1).dropna()
 
-        if len(aligned) < 2:
-            print(f"⚠️ Insufficient data - skipping")
+        if len(aligned) < WARM_UP_STEPS + 1:
+            print(f"⚠️ Insufficient data ({len(aligned)} steps total, requires at least {WARM_UP_STEPS + 1}) - skipping")
+            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Insufficient data", "severity": "skip"})
             continue
 
         model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
         if not os.path.exists(model_path):
             print(f"⚠️ Model not found - skipping")
+            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Model not found", "severity": "skip"})
             continue
 
         model = operator.load_model(model_path)
         print(f"  ✓ Model loaded")
-
-        lookback = CONFIG.get("rl_lookback", 30)
 
         # TEST ENVIRONMENT (V3)
         env = PairTradingEnv(
               series_x=aligned.iloc[:, 0], series_y=aligned.iloc[:, 1], 
               lookback=lookback, initial_capital=10000,
               transaction_cost_rate = 0.0005, test_mode=True
-          )
+            )
 
         episode_traces = []
         local_step = 0
-        obs, info = env.reset()
+        obs, info = env.reset() # env.idx = 0 here
+
+        # --- WARM-UP LOOP: Advance the environment index and LSTM state ---
+        print(f"  ✓ Warming up model state on {WARM_UP_STEPS} steps of history...")
+        lstm_states, episode_starts = None, np.ones((1,), dtype=bool)
+        
+        # Run WARM_UP_STEPS through the environment and model
+        for i in range(WARM_UP_STEPS):
+            if env.idx >= len(env.spread_np) - 1:
+                print("  ⚠️ Data ended during warm-up. Skipping pair.")
+                break 
+                
+            action, lstm_states = model.predict(
+                obs, state=lstm_states, episode_start=episode_starts, deterministic=True
+            )
+            # Advance environment state (features, index)
+            obs, _, _, _, _ = env.step(action) 
+            episode_starts = np.array([False]) 
+        
+        # --- CRITICAL CLEAN RESET ---
+        # 1. Store the index pointing to the first day of actual trading.
+        start_idx_for_trading = env.idx 
+        
+        # 2. Reset financial state (Cash, PnL, Position) to initial values.
+        # This preserves the features and the LSTM state.
+        env.reset() 
+        
+        # 3. Restore the index to the position where warm-up ended.
+        env.idx = start_idx_for_trading 
+        print(f"  ✓ Warm-up complete. Financial state reset. Starting live trading loop from index {env.idx}.")
+        # --- END CRITICAL CLEAN RESET ---
+
+
         terminated = False
         skip_to_next_pair = False
-        lstm_states, episode_starts = None, np.ones((1,), dtype=bool)
-
+        
         # Trading loop with supervisor monitoring
         while not terminated and not skip_to_next_pair:
-            # Pass state and episode_start to model
+            # Predict uses the LSTM state carried over from the warm-up
             action, lstm_states = model.predict(
                 obs, state=lstm_states, episode_start=episode_starts, deterministic=True
             )
@@ -566,6 +611,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
             obs, reward, terminated, _, info = env.step(action)
             episode_starts = np.array([terminated])
 
+            # --- Trace logging starts here (after warm-up) ---
             trace = {
                 "pair": f"{pair[0]}-{pair[1]}", "step": global_step, "local_step": local_step, 
                 "reward": float(reward), "portfolio_value": float(info.get("portfolio_value", 0.0)),
@@ -587,6 +633,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
             
             if hasattr(operator, 'save_detailed_trace'): operator.save_detailed_trace(trace)
             if operator.logger: operator.logger.log("operator", "holdout_step", trace)
+            # --- End Trace Logging ---
 
             # SUPERVISOR MONITORING (every N steps)
             if local_step > 0 and local_step % check_interval == 0:
@@ -632,9 +679,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         else:
             print(f"  ✓ Complete: {len(episode_traces)} steps")
         
-        # Extract values for metrics
-        # ... [omitted metric extraction for space, assumes correct function calls below]
-
         # Sharpe and Sortino
         sharpe = calculate_sharpe(episode_traces)
         sortino = calculate_sortino(episode_traces)
@@ -648,7 +692,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
                 "final_cum_return": final_cum_return, "total_pnl": final_pnl,
                 "sharpe": sharpe, "sortino": sortino, "was_skipped": skip_to_next_pair
             })
-        
+            
     print("\n" + "="*70)
     print("HOLDOUT TESTING COMPLETE")
     print("="*70)
