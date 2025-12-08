@@ -47,9 +47,6 @@ class EnhancedTGNN(nn.Module):
         nn.init.xavier_uniform_(self.bilinear_W)
         
         self.dropout = dropout
-        
-        # Binary Loss Function
-        self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
         # A. Encode
@@ -341,9 +338,9 @@ class OptimizedSelectorAgent:
 
                 # Negative Sampling
                 num_pos = target_pos.size(1)
-                # Sample 2x negatives for balance
-                neg_src = torch.randint(0, len(self.tickers), (num_pos * 2,), device=self.device)
-                neg_dst = torch.randint(0, len(self.tickers), (num_pos * 2,), device=self.device)
+                # Sample 1:1 negatives
+                neg_src = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
+                neg_dst = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
                 neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
                 
                 # --- CHANGE: Compute Binary Loss ---
