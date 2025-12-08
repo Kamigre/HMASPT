@@ -21,29 +21,33 @@ from utils import half_life, compute_spread
 from agents.message_bus import JSONLogger
 
 # ===================================================================
-# 1. HELPER FUNCTIONS
+# 1. HELPER FUNCTIONS (FIXED: Uses ALL returns now)
 # ===================================================================
 
 def calculate_sharpe(traces, risk_free_rate=None):
     if risk_free_rate is None: risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
+    # FIXED: Use all returns, do not filter out zeros
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252
+    rf_daily = risk_free_rate / 252.0
     excess_returns = returns - rf_daily
     mean_exc = np.mean(excess_returns)
     std_exc = np.std(excess_returns, ddof=1)
-    if std_exc < 1e-8: return 0.0
+    if std_exc < 1e-9: return 0.0
     return (mean_exc / std_exc) * np.sqrt(252)
 
 def calculate_sortino(traces, risk_free_rate=None):
     if risk_free_rate is None: risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t['daily_return'] for t in traces if t['daily_return'] != 0])
+    # FIXED: Use all returns, do not filter out zeros
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
     if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252
+    rf_daily = risk_free_rate / 252.0
     excess_returns = returns - rf_daily
     mean_exc = np.mean(excess_returns)
+    
+    # Sortino uses downside deviation of excess returns below 0
     downside_deviation = np.sqrt(np.mean(np.minimum(0, excess_returns)**2))
-    if downside_deviation < 1e-8: return 100.0 if mean_exc > 0 else 0.0
+    if downside_deviation < 1e-9: return 0.0
     return (mean_exc / downside_deviation) * np.sqrt(252)
 
 def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
@@ -121,6 +125,7 @@ class PairTradingEnv(gym.Env):
         self.rsi = self._compute_rsi(self.spread, period=14)
 
         # 4. Stationarity/Regime Features (Statsmodels dependency)
+        # Note: This is slow on large datasets. If too slow, consider removing rolling ADF.
         adf_pvalue = self.spread.rolling(self.lookback).apply(lambda s: adfuller(s.dropna())[1], raw=False)
         half_life_series = self.spread.rolling(self.lookback).apply(lambda s: half_life(s.dropna()), raw=False)
 
@@ -233,7 +238,7 @@ class PairTradingEnv(gym.Env):
                 # Logic to handle reversals or closures correctly
                 closed_size = abs(self.position)
                 if abs(target_position) < abs(self.position) and np.sign(target_position) == np.sign(self.position):
-                     closed_size = abs(position_change)
+                      closed_size = abs(position_change)
 
                 realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
                 
@@ -362,7 +367,7 @@ class OperatorAgent:
                       use_curriculum: bool = False):
 
         seed = CONFIG.get("random_seed", 42)
-                                     
+                                      
         if not self.active: return None
 
         if lookback is None: lookback = CONFIG.get("rl_lookback", 30)
@@ -408,26 +413,42 @@ class OperatorAgent:
         obs, _ = env_eval.reset()
         done = False
         daily_returns, positions = [], []
+        # RESTORED: Need detailed traces for evaluation metrics
+        episode_traces = []
         lstm_states, episode_starts = None, np.ones((1,), dtype=bool)
 
         while not done:
             action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
             obs, reward, done, _, info = env_eval.step(action)
             episode_starts = np.array([done])
+            
             daily_returns.append(info.get('daily_return', 0))
             positions.append(info.get('position', 0))
+            episode_traces.append({'daily_return': info.get('daily_return', 0)})
 
-        sharpe = calculate_sharpe(daily_returns)
-        sortino = calculate_sortino(daily_returns)
+        sharpe = calculate_sharpe(episode_traces)
+        sortino = calculate_sortino(episode_traces)
         final_return = (env_eval.portfolio_value / env_eval.initial_capital - 1) * 100
 
-        print(f"\n📈 Training Results: Return={final_return:.2f}%, Sharpe={sharpe:.3f}, Sortino={sortino:.3f}")
+        # --- RESTORED LOGGING: Position Analysis ---
+        unique_positions = np.unique(positions)
+        print(f"\n📈 Training Results:")
+        print(f"  Final Return: {final_return:.2f}%")
+        print(f"  Sharpe Ratio: {sharpe:.3f}")
+        print(f"  Sortino Ratio: {sortino:.3f}")
+        print(f"  Positions used: {unique_positions}")
+
+        for pos in unique_positions:
+            count = np.sum(np.array(positions) == pos)
+            pct = count / len(positions) * 100
+            print(f"    Position {int(pos)}: {pct:.1f}% of time")
+        # -------------------------------------------
 
         trace = {
             "pair": (x, y), "cum_return": final_return, 
             "max_drawdown": (env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value,
             "sharpe": sharpe, "sortino": sortino, "model_path": model_path,
-            "positions_used": np.unique(positions).tolist()
+            "positions_used": unique_positions.tolist()
         }
 
         if self.logger: self.logger.log("operator", "pair_trained", trace)
@@ -609,6 +630,35 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor):
         else:
             print(f"  ✓ Complete: {len(episode_traces)} steps")
         
+        # --- RESTORED LOGGING: Comprehensive Holdout Metrics ---
+        # 1. Trade Detection
+        trades = []
+        last_position = 0
+        for t in episode_traces:
+            pos = t["position"]
+            pnl = t.get("realized_pnl_this_step", 0)
+            if pos != last_position and pnl != 0:
+                trades.append({"position": pos, "realized_pnl": pnl})
+            last_position = pos
+
+        pnls_list = [tr["realized_pnl"] for tr in trades]
+        n_trades = len(pnls_list)
+        wins = [1 for pnl in pnls_list if pnl > 0]
+        win_rate = len(wins) / n_trades if n_trades > 0 else 0.0
+        avg_trade_pnl = np.mean(pnls_list) if n_trades > 0 else 0.0
+
+        # 2. Position Usage
+        positions_arr = np.array([t["position"] for t in episode_traces])
+        unique_positions, pos_counts = np.unique(positions_arr, return_counts=True)
+        pos_usage = {int(p): float(c) / len(positions_arr) for p, c in zip(unique_positions, pos_counts)}
+
+        # 3. Print Logs
+        print(f"  Trades: {n_trades}")
+        print(f"  Win rate: {win_rate*100:.2f}%")
+        print(f"  Avg trade P&L: {avg_trade_pnl:.4f}")
+        print(f"  Position usage: {pos_usage}")
+        # -------------------------------------------------------
+
         sharpe = calculate_sharpe(episode_traces)
         sortino = calculate_sortino(episode_traces)
 
