@@ -20,7 +20,7 @@ def set_global_seed(seed: int):
     # NumPy
     np.random.seed(seed)
     
-    # Python hash seed (must be set before Python starts, but we try anyway)
+    # Python hash seed
     os.environ['PYTHONHASHSEED'] = str(seed)
     
     # PyTorch
@@ -43,7 +43,7 @@ def set_global_seed(seed: int):
     print(f"✅ Global seed set to {seed}")
 
 
-# Updated CONFIG with seed
+# Updated CONFIG with seed and synchronized Supervisor limits
 CONFIG = {
     # ===================================================================
     # GLOBAL SETTINGS
@@ -68,7 +68,7 @@ CONFIG = {
     "risk_free_rate": 0.04,
     
     # ===================================================================
-    # SUPERVISOR RULES
+    # SUPERVISOR RULES (Synchronized with SupervisorAgent Logic)
     # ===================================================================
     "supervisor_rules": {
         "training": {
@@ -95,17 +95,21 @@ CONFIG = {
             }
         },
         "holdout": {
-            "min_observations": 20,
-            "check_interval": 30,
+            "min_observations": 10, # Reduced to match faster burn-in
+            "check_interval": 3,    # Reduced from 30 to match Supervisor frequency
+            
+            # Strike 1 Warning Zone
             "info_tier": {
-                "moderate_drawdown": 0.15,
+                "moderate_drawdown": 0.10, # Matches Strike 1 trigger
                 "low_sharpe": 0.0,
                 "poor_win_rate": 0.40,
                 "high_volatility": 0.05,
                 "action": "warn"
             },
+            
+            # Suggestion Zone
             "adjustment_tier": {
-                "significant_drawdown": 0.25,
+                "significant_drawdown": 0.15,
                 "very_low_sharpe": -0.5,
                 "terrible_win_rate": 0.35,
                 "excessive_turnover": 50,
@@ -117,27 +121,33 @@ CONFIG = {
                     "turnover": "Excessive trading - check for overtrading"
                 }
             },
+            
+            # Hard Stop Zone (Strike 2 / Immediate Kill)
             "stop_tier": {
-                "catastrophic_drawdown": 0.40,
-                "disastrous_sharpe": -1.0,
+                "catastrophic_drawdown": 0.20, # Matches Hard Stop logic
+                "disastrous_sharpe": -1.5,
                 "consistent_failure": 0.25,
                 "runaway_losses": -5000,
                 "action": "stop"
             },
+            
+            # Stalemate Logic
             "position_limits": {
-                "max_days_in_position": 60,
+                "max_days_in_position": 30, # Reduced from 60 to 30
                 "zero_activity_window": 30,
                 "action": "info"
             },
+            
+            # Structural Breaks
             "anomaly_detection": {
                 "reward_spike_threshold": 5.0,
-                "spread_divergence": 3.0,
+                "spread_divergence": 3.0, # Matches Z-Score break
                 "action": "log"
             }
         },
         "portfolio": {
             "check_frequency": 100,
-            "max_portfolio_drawdown": 0.30,
+            "max_portfolio_drawdown": 0.15, # Tighter portfolio limit
             "min_portfolio_sharpe": -0.3,
             "max_correlated_losses": 0.70,
             "actions": {
@@ -156,7 +166,6 @@ CONFIG = {
         }
     }
 }
-
 
 # Initialize seed when module is imported
 set_global_seed(CONFIG["random_seed"])
