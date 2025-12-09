@@ -65,7 +65,7 @@ CONFIG = {
     "shock_scale": 0.4,
     "max_workers": 2,
     "initial_capital": 10000,
-    "risk_free_rate": 0.04,
+    "risk_free_rate": 0.00,
     
     # ===================================================================
     # SUPERVISOR RULES (Synchronized with SupervisorAgent Logic)
