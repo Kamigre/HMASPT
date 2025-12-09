@@ -198,26 +198,13 @@ class SupervisorAgent:
                         'metrics': metrics
                     }
 
-        # 2. Hard Drawdown Kill (> 10%)
+        # 2. Hard Drawdown Kill (> 15%)
         # Explicit kill switch regardless of strikes
-        if metrics['drawdown'] > 0.10:
+        if metrics['drawdown'] > 0.15:
              return {
                 'action': 'stop',
                 'severity': 'critical',
-                'reason': f'Hard Stop: Drawdown {metrics["drawdown"]:.1%} > 10%',
-                'metrics': metrics
-            }
-
-        # 3. Trailing Profit Stop
-        # If we were ever up by > 5%, lock in at least break-even
-        peak_return = max([t['cum_return'] for t in operator_traces])
-        current_return = latest_trace['cum_return']
-
-        if peak_return > 0.05 and current_return < 0.01:
-             return {
-                'action': 'stop',
-                'severity': 'warning',
-                'reason': f'Trailing Stop: Gave back profit (Peak: {peak_return:.1%}, Now: {current_return:.1%})',
+                'reason': f'Hard Stop: Drawdown {metrics["drawdown"]:.1%} > 15%',
                 'metrics': metrics
             }
 
