@@ -268,29 +268,24 @@ class PairTradingEnv(gym.Env):
         
         reward = 0.0
         
-        # --- 1. Return-based reward -----------------------------------
+        # --- Return-based reward -----------------------------------
         # Risk-adjusted return: reward profits, penalize losses slightly more
         if daily_return >= 0:
             reward += daily_return
         else:
             reward += 1.2 * daily_return   # loss aversion
         
-        # --- 2. Realized PnL bonus ------------------------------------
-        # Encourage closing winning trades
-        if realized_pnl_this_step > 0:
-            reward += (realized_pnl_this_step / self.initial_capital)
-        
-        # --- 3. Drawdown penalty ---------------------------------------
+        # --- Drawdown penalty ---------------------------------------
         # Penalize only if drawdown worsens AND daily return is negative
         if self.portfolio_value < prev_peak and daily_return < 0:
             reward -= abs(daily_return)
         
-        # --- 4. Holding penalty ----------------------------------------
+        # --- Holding penalty ----------------------------------------
         # Linear time penalty for holding positions too long (max 50 days)
         if self.position != 0:
             reward -= min(self.days_in_position, 50) * 0.001
         
-        # --- 5. Z-score alignment (tiny shaping) ------------------------
+        # --- Z-score alignment (tiny shaping) ------------------------
         norm_pos = self.position / self.position_scale
         
         # anti-alignment = penalize
@@ -301,8 +296,8 @@ class PairTradingEnv(gym.Env):
         if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
             reward += 0.02
         
-        # --- 6. Clip for stability --------------------------------------
-        reward = float(np.clip(reward, -1.0, 1.0))
+        # --- Clip for stability --------------------------------------
+        reward = float(np.clip(reward, -10.0, 10.0))
         
         # 8. Index
         if not is_last_step:
