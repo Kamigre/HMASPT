@@ -170,7 +170,7 @@ class OptimizedSelectorAgent:
     # Feature Engineering
     # ------------------------------------------------------------------------
     
-    def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
+    def build_node_features(self, windows=[1, 4], train_end_date=None) -> pd.DataFrame:
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
         
