@@ -554,10 +554,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
 def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
     """
     Run holdout testing with supervisor monitoring.
-    Uses 'warmup_steps' at the start of holdout_prices to initialize LSTM
-    and internal indicators without recording PnL.
-    
-    If stopped by supervisor, metrics are calculated on the data generated up to that point.
+    Includes FORCED LIQUIDATION logic when Supervisor intervenes.
     """
     
     # Check supervisor config
@@ -572,8 +569,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
     global_step = 0
     all_traces = []
     skipped_pairs = []
-    
-    # Storage for final summary
     pair_summaries = []
 
     # Ensure lookback matches training
@@ -587,30 +582,25 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         # 1. Data Validation
         if pair[0] not in holdout_prices.columns or pair[1] not in holdout_prices.columns:
             print(f"⚠️ Warning: Tickers {pair} not found in holdout data - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Data not found", "severity": "skip"})
             continue
 
         series_x = holdout_prices[pair[0]].dropna()
         series_y = holdout_prices[pair[1]].dropna()
         aligned = pd.concat([series_x, series_y], axis=1).dropna()
 
-        # Ensure we have enough data for Lookback + Warmup + At least 1 trade step
         if len(aligned) < lookback + warmup_steps + 1:
-            print(f"⚠️ Insufficient data ({len(aligned)} steps total). Needs {lookback + warmup_steps + 1} - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Insufficient data", "severity": "skip"})
+            print(f"⚠️ Insufficient data ({len(aligned)} steps). Needs {lookback + warmup_steps + 1}")
             continue
 
         # 2. Model Loading
         model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
         if not os.path.exists(model_path):
             print(f"⚠️ Model not found - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Model not found", "severity": "skip"})
             continue
 
         model = operator.load_model(model_path)
-        print(f"  ✓ Model loaded")
 
-        # 3. Environment Setup (Test Mode)
+        # 3. Environment Setup
         env = PairTradingEnv(
             series_x=aligned.iloc[:, 0], 
             series_y=aligned.iloc[:, 1], 
@@ -624,44 +614,24 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         local_step = 0
         obs, info = env.reset() 
 
-        # ==============================================================================
-        # WARM-UP PHASE
-        # ==============================================================================
-        print(f"  ⏳ Warming up model state on {warmup_steps} steps of history...")
-        
-        # Initialize LSTM states
+        # --- WARM-UP PHASE ---
+        print(f" ⏳ Warming up model state on {warmup_steps} steps...")
         lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
-        
         warmup_completed = True
         
-        # Run the model to update states, BUT ignore results/pnl
         for i in range(warmup_steps):
             if env.idx >= len(env.spread_np) - 1:
-                print("  ⚠️ Data ended during warm-up. Skipping pair.")
                 warmup_completed = False
                 break 
-                
-            action, lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
-            )
-            
+            action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
             obs, _, done, _, _ = env.step(action)
             episode_starts = np.array([done])
-            
-            if done:
-                warmup_completed = False
-                break
+            if done: warmup_completed = False; break
         
-        if not warmup_completed:
-            continue
+        if not warmup_completed: continue
 
-        # ==============================================================================
-        # FINANCIAL RESET (Prepare for Real Trading)
-        # ==============================================================================
+        # --- FINANCIAL RESET ---
         env.cash = env.initial_capital
         env.portfolio_value = env.initial_capital
         env.realized_pnl = 0.0 
@@ -669,90 +639,90 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         env.num_trades = 0
         env.trade_history = []
         env.peak_value = env.initial_capital
-        
-        # Force Flat Position to ensure clean start
         if env.position != 0:
             env.position = 0
             env.entry_spread = 0.0
             env.days_in_position = 0
 
-        print(f"  ✓ Warm-up complete. Financials reset. Trading starts at Index {env.idx}.")
-
-        # ==============================================================================
-        # MAIN TRADING LOOP
-        # ==============================================================================
+        # --- MAIN TRADING LOOP ---
         terminated = False
         stop_triggered = False
         
         while not terminated:
             
-            # Predict using the warmed-up lstm_states
-            action, lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
-            )
-            
+            action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
             obs, reward, terminated, _, info = env.step(action)
             episode_starts = np.array([terminated])
 
-            # --- Trace Logging ---
+            # Trace Logging
             trace = {
                 "pair": f"{pair[0]}-{pair[1]}",
                 "step": global_step,
                 "local_step": local_step,
-                "reward": float(reward),
                 "portfolio_value": float(info.get("portfolio_value", 0.0)),
                 "cum_return": float(info.get("cum_return", 0.0)),
                 "position": float(info.get("position", 0)),
                 "max_drawdown": float(info.get("drawdown", 0)),
-                "cash": float(info.get("cash", 0.0)),
-                "realized_pnl": float(info.get("realized_pnl", 0.0)),
-                "unrealized_pnl": float(info.get("unrealized_pnl", 0.0)),
                 "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
                 "transaction_costs": float(info.get("transaction_costs", 0.0)),
-                "entry_spread": float(info.get("entry_spread", 0.0)),
+                "daily_return": float(info.get("daily_return", 0.0)),
                 "current_spread": float(info.get("current_spread", 0.0)),
                 "z_score": float(info.get("z_score", 0.0)), 
-                "days_in_position": int(info.get("days_in_position", 0)),
-                "daily_return": float(info.get("daily_return", 0.0)),
-                "num_trades": int(info.get("num_trades", 0)),
-                "trade_occurred": bool(info.get("trade_occurred", False)),
-                "risk_exit": bool(info.get("risk_exit", False)),
-                "price_x": float(info.get("price_x", 0.0)),
-                "price_y": float(info.get("price_y", 0.0))
+                "days_in_position": int(info.get("days_in_position", 0))
             }
 
             episode_traces.append(trace)
             all_traces.append(trace)
             operator.add_trace(trace)
-            
-            if hasattr(operator, 'save_detailed_trace'):
-                operator.save_detailed_trace(trace)
-                
-            if operator.logger:
-                operator.logger.log("operator", "holdout_step", trace)
 
-            # --- Supervisor Monitoring ---
+            # --- SUPERVISOR MONITORING ---
             if local_step > 0 and local_step % check_interval == 0:
-                decision = supervisor.check_operator_performance(
-                    episode_traces, 
-                    pair, 
-                    phase="holdout"
-                )
+                decision = supervisor.check_operator_performance(episode_traces, pair, phase="holdout")
                 
                 if decision["action"] == "stop":
                     severity = decision.get("severity", "critical")
                     print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Stopping pair early")
                     print(f"    Reason: {decision['reason']}")
-                    
+
+                    # ========================================================
+                    # NEW: FORCED LIQUIDATION LOGIC
+                    # ========================================================
+                    if env.position != 0:
+                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
+                        
+                        # Action 1 corresponds to FLAT in your environment logic (0=Short, 1=Flat, 2=Long)
+                        # We force the environment to step one last time with action=1
+                        obs, reward, terminated, _, info = env.step(1)
+                        
+                        # Capture the PnL of this forced close
+                        forced_pnl = info.get('realized_pnl_this_step', 0.0)
+                        forced_cost = info.get('transaction_costs', 0.0)
+                        
+                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
+                        
+                        # Add this final trace so metrics calculation sees the close
+                        final_trace = trace.copy()
+                        final_trace['step'] += 1
+                        final_trace['local_step'] += 1
+                        final_trace['position'] = 0 # Now flat
+                        final_trace['realized_pnl_this_step'] = forced_pnl
+                        final_trace['transaction_costs'] = forced_cost
+                        final_trace['portfolio_value'] = info.get("portfolio_value", trace['portfolio_value'])
+                        final_trace['cum_return'] = info.get("cum_return", trace['cum_return'])
+                        final_trace['max_drawdown'] = info.get("drawdown", trace['max_drawdown'])
+                        
+                        episode_traces.append(final_trace)
+                        all_traces.append(final_trace)
+                        operator.add_trace(final_trace)
+
+                    # ========================================================
+
                     skip_info = {
                         "pair": f"{pair[0]}-{pair[1]}",
                         "reason": decision['reason'],
                         "severity": severity,
                         "step_stopped": global_step,
-                        "metrics": decision['metrics']
+                        "final_return": episode_traces[-1]['cum_return'] # Use the post-liquidation return
                     }
                     skipped_pairs.append(skip_info)
                     
@@ -760,7 +730,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         operator.logger.log("supervisor", "intervention", skip_info)
                     
                     stop_triggered = True
-                    break # Break out of the WHILE loop, proceed to metrics calculation below
+                    break # Break the WHILE loop
                 
                 elif decision["action"] == "adjust":
                     print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
@@ -769,95 +739,41 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             global_step += 1
             operator.current_step = global_step
 
-        # End of Pair Loop - Reporting Phase
-        if stop_triggered:
-            print(f"⏭️  Pair stopped early at step {local_step} due to Supervisor Intervention.")
-        else:
-            print(f"  ✓ Complete: {len(episode_traces)} steps")
-        
-        # ==============================================================================
-        # DETAILED METRICS REPORTING
-        # ==============================================================================
+        # --- Reporting Phase ---
         if len(episode_traces) > 0:
-            # 1. Calculate Metrics (works for partial or full episodes)
             sharpe = calculate_sharpe(episode_traces)
-            sortino = calculate_sortino(episode_traces)
             final_return = episode_traces[-1]['cum_return'] * 100
             max_dd = episode_traces[-1]['max_drawdown']
             
-            # 2. Position Analysis
-            positions = [t['position'] for t in episode_traces]
-            
-            # 3. Print Results
+            # PnL Events (Wins/Losses) - Now includes the forced close
+            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
+            win_rate = (len([p for p in pnl_events if p > 0]) / len(pnl_events) * 100) if pnl_events else 0.0
+
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
+            print(f"  Status: {'⛔ STOPPED' if stop_triggered else '✅ COMPLETE'}")
             print(f"  Final Return: {final_return:.2f}%")
             print(f"  Max Drawdown: {max_dd:.2%}")
-            print(f"  Sharpe Ratio: {sharpe:.3f}")
-            print(f"  Sortino Ratio: {sortino:.3f}")
-            
-            # Win Rate (Bonus Metric)
-            # Filter steps where a PnL was actually realized (trade closed or flipped)
-            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
-            if len(pnl_events) > 0:
-                wins = len([p for p in pnl_events if p > 0])
-                win_rate = (wins / len(pnl_events)) * 100
-                print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} realized trades)")
-            else:
-                win_rate = 0.0
-                print(f"  Win Rate: N/A (0 trades)")
+            print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} trades)")
 
-            # Position Distribution
-            print(f"  Position Distribution:")
-            for pos in [-100, 0, 100]:
-                count = np.sum(np.array(positions) == pos)
-                pct = count / len(positions) * 100
-                # Map value to readable name
-                name = "Flat"
-                if pos > 0: name = "Long"
-                elif pos < 0: name = "Short"
-                print(f"    {name} ({int(pos)}): {pct:.1f}% of time")
-
-            # Store for final summary - Includes stopped pairs
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
                 "return": final_return,
                 "sharpe": sharpe,
                 "drawdown": max_dd,
-                "trades": env.num_trades,
-                "win_rate": win_rate if len(pnl_events) > 0 else 0.0,
+                "win_rate": win_rate,
                 "status": "STOPPED" if stop_triggered else "COMPLETE"
             })
-
-            # Logging
-            if operator.logger:
-                final_pnl = episode_traces[-1].get('realized_pnl', 0)
-                operator.logger.log("operator", "episode_complete", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "total_steps": len(episode_traces),
-                    "final_cum_return": final_return,
-                    "total_pnl": final_pnl,
-                    "sharpe": sharpe,
-                    "sortino": sortino,
-                    "was_stopped": stop_triggered
-                })
             
+    # Final Summary Table...
     print("\n" + "="*80)
     print("HOLDOUT TESTING COMPLETE: SUMMARY")
     print("="*80)
     print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Max DD':<8} | {'Win Rate':<8}")
     print("-" * 80)
-    
-    total_ret = 0
     for s in pair_summaries:
         status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
         print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
-        total_ret += s['return']
-        
-    avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
-    print("-" * 80)
-    print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
     print("="*80)
-    print(f"Total steps simulated: {global_step}")
     
     return all_traces, skipped_pairs
 
