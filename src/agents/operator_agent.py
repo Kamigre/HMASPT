@@ -275,16 +275,6 @@ class PairTradingEnv(gym.Env):
         else:
             reward += 1.2 * daily_return   # loss aversion
         
-        # --- Drawdown penalty ---------------------------------------
-        # Penalize only if drawdown worsens AND daily return is negative
-        if self.portfolio_value < prev_peak and daily_return < 0:
-            reward -= abs(daily_return)
-        
-        # --- Holding penalty ----------------------------------------
-        # Linear time penalty for holding positions too long (max 50 days)
-        if self.position != 0:
-            reward -= min(self.days_in_position, 50) * 0.001
-        
         # --- Z-score alignment (tiny shaping) ------------------------
         norm_pos = self.position / self.position_scale
         
@@ -297,7 +287,7 @@ class PairTradingEnv(gym.Env):
             reward += 0.02
         
         # --- Clip for stability --------------------------------------
-        reward = float(np.clip(reward, -10.0, 10.0))
+        reward = float(np.clip(reward, -1.0, 1.0))
         
         # 8. Index
         if not is_last_step:
