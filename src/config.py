@@ -58,7 +58,7 @@ CONFIG = {
     "transaction_cost": 0.0005,
     "rl_policy": "MlpLstmPolicy",
     "windows": [1, 2, 4],
-    "rl_timesteps": 200000,
+    "rl_timesteps": 100000,
     "half_life_max": 40,
     "rl_lookback": 30,
     "shock_prob": 0.01,
