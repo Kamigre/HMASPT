@@ -262,67 +262,47 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-        # ==============================================================================
-        # 7. IMPROVED REWARD CALCULATION
-        # ==============================================================================
+        # ===============================
+        # 7. SIMPLIFIED REWARD FUNCTION
+        # ===============================
         
         reward = 0.0
-
-        # A. PnL Reward (Risk-Adjusted)
-        # -------------------------------------------------------------------------
-        # Instead of raw return, we penalize volatility implicitly via the Sortino-style logic.
-        # If return is positive, full reward. If negative, heavier penalty.
-        if daily_return > 0:
-            reward += daily_return * 100.0  # Scale up small % returns
-        else:
-            reward += daily_return * 120.0  # 1.2x penalty for losses (Loss Aversion)
-
-        # B. Realized PnL Bonus (The "Cookie")
-        # -------------------------------------------------------------------------
-        # We give a significant one-time bonus for locking in a profit.
-        # This encourages the agent to actually CLOSE trades rather than hold forever.
-        if realized_pnl_this_step > 0:
-            # Reward is proportional to the % gain on capital
-            pnl_pct = realized_pnl_this_step / self.initial_capital
-            reward += pnl_pct * 500.0 # Big spike for banking profit
         
-        # C. Drawdown Delta Penalty (The "Stop Loss")
-        # -------------------------------------------------------------------------
-        # CRITICAL CHANGE: Only penalize if drawdown INCREASES.
-        # This avoids the "Death Spiral" where an agent in drawdown gets punished 
-        # even if it makes a good trade that recovers 1% of the loss.
-        # We check if peak_value didn't update, meaning we are below high water mark.
-        if self.portfolio_value < prev_peak:
-            # Calculate how much deeper the drawdown got this step
-            # If we recovered (daily_return > 0), this adds nothing or is positive.
-            # We want to punish negative returns specifically when already in drawdown.
-            if daily_return < 0:
-                reward -= abs(daily_return) * 50.0 # Extra penalty for losing money while down
-
-        # D. Holding Cost (Time Value of Money)
-        # -------------------------------------------------------------------------
-        # Non-linear penalty. Holding for 5 days is fine. Holding for 50 is bad.
-        # Caps at a certain point to prevent explosion.
+        # --- 1. Return-based reward -----------------------------------
+        # Risk-adjusted return: reward profits, penalize losses slightly more
+        if daily_return >= 0:
+            reward += daily_return
+        else:
+            reward += 1.2 * daily_return   # loss aversion
+        
+        # --- 2. Realized PnL bonus ------------------------------------
+        # Encourage closing winning trades
+        if realized_pnl_this_step > 0:
+            reward += (realized_pnl_this_step / self.initial_capital)
+        
+        # --- 3. Drawdown penalty ---------------------------------------
+        # Penalize only if drawdown worsens AND daily return is negative
+        if self.portfolio_value < prev_peak and daily_return < 0:
+            reward -= abs(daily_return)
+        
+        # --- 4. Holding penalty ----------------------------------------
+        # Linear time penalty for holding positions too long (max 50 days)
         if self.position != 0:
-            holding_penalty = min(self.days_in_position, 50) * 0.005
-            reward -= holding_penalty
-
-        # E. Z-Score Alignment (Guidance / Shaping)
-        # -------------------------------------------------------------------------
-        # Only apply this if the agent is NOT in a trade (to guide entry) 
-        # or if the position opposes the Z-score logic.
+            reward -= min(self.days_in_position, 50) * 0.001
+        
+        # --- 5. Z-score alignment (tiny shaping) ------------------------
         norm_pos = self.position / self.position_scale
         
-        # "Anti-alignment": If Z > 1 (Expensive) and we are Long (Pos > 0) -> Penalize!
-        if (current_zscore > 1.0 and norm_pos > 0) or (current_zscore < -1.0 and norm_pos < 0):
-              reward -= 0.1 # Small constant penalty for fighting the mean reversion
-              
-        # "Pro-alignment": If Z > 1 and we Short, or Z < -1 and we Long -> Small drip feed
-        if (current_zscore > 1.0 and norm_pos < 0) or (current_zscore < -1.0 and norm_pos > 0):
-              reward += 0.05 
-
-        # Clip reward to maintain stability for PPO (prevents gradients exploding)
-        reward = np.clip(reward, -10.0, 10.0)
+        # anti-alignment = penalize
+        if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
+            reward -= 0.02
+        
+        # pro-alignment = encourage
+        if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
+            reward += 0.02
+        
+        # --- 6. Clip for stability --------------------------------------
+        reward = float(np.clip(reward, -1.0, 1.0))
         
         # 8. Index
         if not is_last_step:
