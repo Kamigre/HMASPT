@@ -56,7 +56,89 @@ class SupervisorAgent:
         if self.logger:
             self.logger.log("supervisor", event, details)
 
-    # ... (validate_pairs remains unchanged) ...
+    # ===================================================================
+    # 1. PAIR VALIDATION (Pre-Trading Check)
+    # ===================================================================
+    
+    def validate_pairs(
+        self, 
+        df_pairs: pd.DataFrame, 
+        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
+        half_life_max: float = 60,
+        min_crossings_per_year: int = 12
+    ) -> pd.DataFrame:
+        
+        start, end = validation_window
+        validated = []
+
+        # Pivot price data for fast access
+        if self.df is None or self.df.empty:
+            print("⚠️ Supervisor has no data for validation.")
+            return df_pairs
+
+        prices = self.df.pivot(
+            index="date",
+            columns="ticker",
+            values="adj_close"
+        ).sort_index()
+
+        print(f"\n🔍 Validating {len(df_pairs)} pairs...")
+        
+        for idx, row in df_pairs.iterrows():
+            x, y = row["x"], row["y"]
+
+            if x not in prices.columns or y not in prices.columns:
+                continue
+
+            series_x = prices[x].loc[start:end].dropna()
+            series_y = prices[y].loc[start:end].dropna()
+
+            if min(len(series_x), len(series_y)) < 60:
+                continue
+
+            spread = compute_spread(series_x, series_y)
+            if spread is None or len(spread) == 0:
+                continue
+
+            # Check stationarity (ADF Test)
+            try:
+                adf_res = adfuller(spread.dropna())
+                adf_p = adf_res[1]
+            except:
+                adf_p = 1.0
+
+            # Check mean reversion speed (Half-Life)
+            hl = compute_half_life(spread.values)
+            
+            # Check Crossing Frequency
+            centered = spread - spread.mean()
+            crossings = (centered.shift(1) * centered < 0).sum()
+            days = (series_x.index[-1] - series_x.index[0]).days
+            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
+
+            # Decision Logic
+            pass_criteria = (adf_p < 0.05) and (float(hl) < half_life_max) and (crossings_per_year >= min_crossings_per_year)
+
+            validated.append({
+                "x": x, "y": y,
+                "score": float(row.get("score", np.nan)),
+                "adf_p": float(adf_p),
+                "half_life": float(hl),
+                "crossings_per_year": crossings_per_year,
+                "pass": bool(pass_criteria)
+            })
+
+        result_df = pd.DataFrame(validated)
+        n_passed = result_df["pass"].sum() if len(result_df) > 0 else 0
+        
+        self._log("pairs_validated", {
+            "n_total": len(df_pairs),
+            "n_validated": len(result_df),
+            "n_passed": int(n_passed)
+        })
+        
+        print(f"✅ Validation complete: {n_passed}/{len(result_df)} pairs passed")
+        return result_df
 
     # ===================================================================
     # 2. OPERATOR MONITORING
@@ -211,7 +293,122 @@ class SupervisorAgent:
             'total_steps': len(traces)
         }
 
-    # ... (evaluate_portfolio and helpers remain unchanged) ...
+    # ===================================================================
+    # 3. FINAL EVALUATION (Post-Trading Aggregation)
+    # ===================================================================
+    
+    def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Evaluate complete portfolio performance."""
+        
+        # Group traces by pair
+        traces_by_pair = {}
+        for t in operator_traces:
+            traces_by_pair.setdefault(t['pair'], []).append(t)
+
+        all_returns = []
+        all_pnls = []
+        pair_summaries = []
+
+        # Process each pair
+        for pair, traces in traces_by_pair.items():
+            pair_returns = []
+            pair_pnls = []
+            
+            # Sort traces by step just in case they are out of order
+            traces = sorted(traces, key=lambda x: x['step'])
+
+            for i in range(1, len(traces)):
+                pnl = traces[i].get("realized_pnl_this_step", 0)
+                
+                pv_curr = traces[i].get("portfolio_value", 0)
+                pv_prev = traces[i-1].get("portfolio_value", 0)
+                
+                if pv_prev > 0:
+                    ret = (pv_curr - pv_prev) / pv_prev
+                else:
+                    ret = 0.0
+                
+                pair_returns.append(ret)
+                all_returns.append(ret)
+                
+                pair_pnls.append(pnl)
+                all_pnls.append(pnl)
+
+            # Pair stats
+            initial = traces[0]['portfolio_value']
+            final = traces[-1]['portfolio_value']
+            cum_ret = (final - initial) / initial if initial > 0 else 0
+            
+            pair_summaries.append({
+                "pair": pair,
+                "total_pnl": sum(pair_pnls),
+                "cum_return": cum_ret,
+                "sharpe": self._calculate_sharpe(pair_returns),
+                "sortino": self._calculate_sortino(pair_returns),
+                "max_drawdown": max([t.get("max_drawdown", 0) for t in traces] + [0]),
+                "steps": len(traces)
+            })
+
+        # Global stats
+        metrics = {
+            "total_pnl": sum(all_pnls),
+            "sharpe_ratio": self._calculate_sharpe(all_returns),
+            "sortino_ratio": self._calculate_sortino(all_returns),
+            "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
+            "avg_return": float(np.mean(all_returns)) if all_returns else 0,
+            "total_steps": len(operator_traces),
+            "n_pairs": len(traces_by_pair),
+            "pair_summaries": pair_summaries
+        }
+        
+        # --- CORRECT WIN RATE CALCULATION (Matching Visualizer) ---
+        # Filter for steps where a trade was explicitly closed/adjusted
+        closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
+        if closed_trades:
+            # A win is defined as Positive PnL AFTER transaction costs
+            wins = sum(1 for t in closed_trades if (t.get("realized_pnl_this_step", 0) - t.get("transaction_costs", 0)) > 0)
+            metrics["win_rate"] = wins / len(closed_trades)
+        else:
+            metrics["win_rate"] = 0.0
+        
+        # Calculate Risk Metrics (VaR/CVaR)
+        if all_returns:
+            metrics["var_95"] = float(np.percentile(all_returns, 5))
+            tail_losses = [r for r in all_returns if r <= metrics["var_95"]]
+            metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
+        else:
+            metrics["var_95"] = 0.0
+            metrics["cvar_95"] = 0.0
+
+        # Additional activity metrics
+        metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
+        metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
+        metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
+        metrics["std_return"] = float(np.std(all_returns)) if all_returns else 0.0
+        metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
+        
+        # Store cumulative return properly
+        if operator_traces:
+            sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
+            start_pv = sorted_traces[0].get("portfolio_value", 0)
+            end_pv = sorted_traces[-1].get("portfolio_value", 0)
+            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0
+        else:
+            metrics["cum_return"] = 0.0
+
+        actions = self._generate_portfolio_actions(metrics)
+        explanation = self._generate_explanation(metrics, actions)
+        
+        return {"metrics": metrics, "actions": actions, "explanation": explanation}
+
+    def _generate_portfolio_actions(self, metrics: Dict) -> List[Dict]:
+        actions = []
+        if metrics['max_drawdown'] > 0.30:
+            actions.append({"action": "reduce_risk", "reason": "Portfolio drawdown > 30%", "severity": "high"})
+        if metrics['sharpe_ratio'] < 0:
+            actions.append({"action": "halt_trading", "reason": "Negative Sharpe Ratio", "severity": "high"})
+        return actions
+        
     def _calculate_sharpe(self, returns: List[float]) -> float:
         if len(returns) < 2: return 0.0
         rf = CONFIG.get("risk_free_rate", 0.04) / 252
