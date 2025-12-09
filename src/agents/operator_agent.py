@@ -585,6 +585,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
     Run holdout testing with supervisor monitoring.
     Uses 'warmup_steps' at the start of holdout_prices to initialize LSTM
     and internal indicators without recording PnL.
+    
+    If stopped by supervisor, metrics are calculated on the data generated up to that point.
     """
     
     # Check supervisor config
@@ -709,9 +711,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         # MAIN TRADING LOOP
         # ==============================================================================
         terminated = False
-        skip_to_next_pair = False
+        stop_triggered = False
         
-        while not terminated and not skip_to_next_pair:
+        while not terminated:
             
             # Predict using the warmed-up lstm_states
             action, lstm_states = model.predict(
@@ -771,7 +773,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 
                 if decision["action"] == "stop":
                     severity = decision.get("severity", "critical")
-                    print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Skipping to next pair")
+                    print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Stopping pair early")
                     print(f"    Reason: {decision['reason']}")
                     
                     skip_info = {
@@ -782,11 +784,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         "metrics": decision['metrics']
                     }
                     skipped_pairs.append(skip_info)
-                    skip_to_next_pair = True
                     
                     if operator.logger:
                         operator.logger.log("supervisor", "intervention", skip_info)
-                    continue
+                    
+                    stop_triggered = True
+                    break # Break out of the WHILE loop, proceed to metrics calculation below
                 
                 elif decision["action"] == "adjust":
                     print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
@@ -795,17 +798,17 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             global_step += 1
             operator.current_step = global_step
 
-        # End of Pair Loop
-        if skip_to_next_pair:
-            print(f"⏭️  Pair skipped early at step {local_step}")
+        # End of Pair Loop - Reporting Phase
+        if stop_triggered:
+            print(f"⏭️  Pair stopped early at step {local_step} due to Supervisor Intervention.")
         else:
             print(f"  ✓ Complete: {len(episode_traces)} steps")
         
         # ==============================================================================
-        # DETAILED METRICS REPORTING (Same as Training)
+        # DETAILED METRICS REPORTING
         # ==============================================================================
         if len(episode_traces) > 0:
-            # 1. Calculate Metrics
+            # 1. Calculate Metrics (works for partial or full episodes)
             sharpe = calculate_sharpe(episode_traces)
             sortino = calculate_sortino(episode_traces)
             final_return = episode_traces[-1]['cum_return'] * 100
@@ -813,7 +816,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             
             # 2. Position Analysis
             positions = [t['position'] for t in episode_traces]
-            unique_positions = np.unique(positions)
             
             # 3. Print Results
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
@@ -830,6 +832,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 win_rate = (wins / len(pnl_events)) * 100
                 print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} realized trades)")
             else:
+                win_rate = 0.0
                 print(f"  Win Rate: N/A (0 trades)")
 
             # Position Distribution
@@ -843,13 +846,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 elif pos < 0: name = "Short"
                 print(f"    {name} ({int(pos)}): {pct:.1f}% of time")
 
-            # Store for final summary
+            # Store for final summary - Includes stopped pairs
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
                 "return": final_return,
                 "sharpe": sharpe,
                 "drawdown": max_dd,
-                "trades": env.num_trades
+                "trades": env.num_trades,
+                "win_rate": win_rate if len(pnl_events) > 0 else 0.0,
+                "status": "STOPPED" if stop_triggered else "COMPLETE"
             })
 
             # Logging
@@ -862,24 +867,25 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     "total_pnl": final_pnl,
                     "sharpe": sharpe,
                     "sortino": sortino,
-                    "was_skipped": skip_to_next_pair
+                    "was_stopped": stop_triggered
                 })
             
-    print("\n" + "="*70)
+    print("\n" + "="*80)
     print("HOLDOUT TESTING COMPLETE: SUMMARY")
-    print("="*70)
-    print(f"{'Pair':<15} | {'Return':<10} | {'Sharpe':<8} | {'Max DD':<10} | {'Trades':<6}")
-    print("-" * 60)
+    print("="*80)
+    print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Max DD':<8} | {'Win Rate':<8}")
+    print("-" * 80)
     
     total_ret = 0
     for s in pair_summaries:
-        print(f"{s['pair']:<15} | {s['return']:>8.2f}% | {s['sharpe']:>8.2f} | {s['drawdown']:>9.1%} | {s['trades']:>6}")
+        status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
+        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
         total_ret += s['return']
         
     avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
-    print("-" * 60)
+    print("-" * 80)
     print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
-    print("="*70)
+    print("="*80)
     print(f"Total steps simulated: {global_step}")
     
     return all_traces, skipped_pairs
