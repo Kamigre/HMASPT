@@ -12,7 +12,6 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 
-# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 
@@ -48,7 +47,8 @@ class EnhancedTGNN(nn.Module):
         
         self.dropout = dropout
 
-        # We use BCEWithLogitsLoss for stability
+        # --- FIX: Initialize the Loss Function ---
+        # We use BCEWithLogitsLoss because _score_vectors returns raw values, not probabilities.
         self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
@@ -136,7 +136,6 @@ class OptimizedSelectorAgent:
     holdout_months: int = 18
     hidden_dim: int = 64
     num_heads: int = 3
-    accumulation_steps: int = 4  # New: Gradient Accumulation Steps
     
     # Internal State
     model: Any = None
@@ -236,7 +235,7 @@ class OptimizedSelectorAgent:
         return self.train_df, self.val_df, self.test_df
 
     # ------------------------------------------------------------------------
-    # Graph Construction
+    # Graph Construction (Shifted Targets)
     # ------------------------------------------------------------------------
 
     def build_shifted_snapshots(self, df: pd.DataFrame, window_days: int = 20, mode='train'):
@@ -296,7 +295,7 @@ class OptimizedSelectorAgent:
         return torch.tensor(node_features.values, dtype=torch.float)
 
     # ------------------------------------------------------------------------
-    # Training Loop (Hard Negatives + Grad Accumulation + BPTT)
+    # Training Loop
     # ------------------------------------------------------------------------
 
     def train(self, epochs: int = 20, lr: float = 0.001):
@@ -328,57 +327,32 @@ class OptimizedSelectorAgent:
             self.model.train()
             train_loss = 0.0
             hidden_state = None 
-            optimizer.zero_grad()
             
-            # --- Training with Gradient Accumulation ---
-            for i, snap in enumerate(train_snapshots):
+            for snap in train_snapshots:
                 x = self.create_snapshot_features(self.train_df, snap['date']).to(self.device)
                 edge_index = snap['edge_index'].to(self.device)
                 edge_weights = snap['edge_weights'].to(self.device)
                 target_pos = snap['target_pos_pairs'].to(self.device)
                 
-                # Detach hidden state IF it exists, but we want gradients to flow through accumulation_steps.
-                # Standard Truncated BPTT: Detach at the start of a new "chunk"
-                if i % self.accumulation_steps == 0 and hidden_state is not None:
-                     hidden_state = hidden_state.detach()
-
-                embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, hidden_state)
+                h_in = hidden_state.detach() if hidden_state is not None else None
+                embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, h_in)
                 
                 if target_pos.size(1) == 0: continue
 
-                # --- 1. HARD NEGATIVE MINING ---
+                # Negative Sampling
                 num_pos = target_pos.size(1)
+                # Sample 1:1 negatives
+                neg_src = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
+                neg_dst = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
+                neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
                 
-                # A. Easy Negatives (Random)
-                num_easy = max(1, num_pos // 2)
-                neg_src_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
-                neg_dst_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
-                easy_neg_pairs = torch.stack([neg_src_easy, neg_dst_easy], dim=0)
-
-                # B. Hard Negatives (Existing input edges)
-                # Sample from edges that look correlated in input but are NOT in target
-                existing_edges = snap['edge_index'] # [2, E]
-                if existing_edges.size(1) > 0:
-                    # Probabilistic approach: Randomly sample existing edges.
-                    # Statistically, most won't be in target_pos if we sample enough.
-                    num_hard = max(1, num_pos - num_easy)
-                    perm = torch.randperm(existing_edges.size(1))[:num_hard]
-                    hard_candidates = existing_edges[:, perm].to(self.device)
-                    neg_pairs = torch.cat([easy_neg_pairs, hard_candidates], dim=1)
-                else:
-                    neg_pairs = torch.cat([easy_neg_pairs, easy_neg_pairs], dim=1)
-                
-                # Compute Loss
+                # --- CHANGE: Compute Binary Loss ---
                 loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
                 
-                # --- 2. GRADIENT ACCUMULATION ---
-                # Normalize loss to keep magnitude consistent
-                (loss / self.accumulation_steps).backward()
-                
-                if (i + 1) % self.accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
                 
                 train_loss += loss.item()
 
@@ -400,7 +374,6 @@ class OptimizedSelectorAgent:
                     
                     if target_pos.size(1) == 0: continue
                     
-                    # Validation can just use random negatives for speed/stability
                     neg_src = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_dst = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
@@ -475,6 +448,7 @@ class OptimizedSelectorAgent:
             mask = torch.triu(torch.ones_like(prob_matrix), diagonal=1).bool()
             
             # We want specific values, not just top K relative.
+            # But to keep output manageable, we take top K sorted by probability.
             prob_matrix[~mask] = -1.0 # Filter out invalid
             
             top_vals, top_flat_indices = torch.topk(prob_matrix.flatten(), k=top_k)
