@@ -263,30 +263,52 @@ class PairTradingEnv(gym.Env):
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
         # ===============================
-        # 7. SIMPLIFIED REWARD FUNCTION
+        # 7. ROBUST REWARD FUNCTION (VOLATILITY ADJUSTED)
         # ===============================
         
         reward = 0.0
         
-        # --- Return-based reward -----------------------------------
-        # Risk-adjusted return: reward profits, penalize losses slightly more
-        if daily_return >= 0:
-            reward += daily_return
-        else:
-            reward += 1.2 * daily_return   # loss aversion
+        # A) Scale Factors (Calibrated to ~1% Daily Volatility)
+        # ------------------------------------------------------------------
+        # Scale = 50 maps a 1% return (0.01) to 0.50.
+        # This keeps typical returns in the "sweet spot" of the tanh function.
+        RETURN_SCALE = 50.0 
         
-        # --- Z-score alignment (tiny shaping) ------------------------
+        # Shaping stays small (0.05) to be roughly 10% of a typical scaled return.
+        SHAPING_MAGNITUDE = 0.05
+
+        # B) Financial Reward (The Main Driver)
+        # ------------------------------------------------------------------
+        scaled_return = daily_return * RETURN_SCALE
+
+        if scaled_return >= 0:
+            reward += scaled_return
+        else:
+            # Loss aversion: penalize losses 1.5x more than gains
+            reward += 1.5 * scaled_return 
+        
+        # C) Z-Score Alignment (The "Nudge")
+        # ------------------------------------------------------------------
         norm_pos = self.position / self.position_scale
         
-        # anti-alignment = penalize
-        if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
-            reward -= 0.1
+        # Threshold: 1.5 (Only enforce rules when signal is strong)
         
-        # pro-alignment = encourage
-        if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
-            reward += 0.1
+        # 1. Anti-Alignment Penalty (Stop fighting the trend)
+        # Holding Long when expensive (> 1.5) OR Holding Short when cheap (< -1.5)
+        if (current_zscore > 1.5 and norm_pos > 0) or \
+           (current_zscore < -1.5 and norm_pos < 0):
+            reward -= SHAPING_MAGNITUDE
+
+        # 2. Pro-Alignment Bonus (Reward capturing the reversion)
+        # Holding Short when expensive (> 1.5) OR Holding Long when cheap (< -1.5)
+        if (current_zscore > 1.5 and norm_pos < 0) or \
+           (current_zscore < -1.5 and norm_pos > 0):
+            reward += SHAPING_MAGNITUDE
         
-        # --- Clip for stability --------------------------------------
+        # D) Clip for Stability (Crucial for outliers like 0.33)
+        # ------------------------------------------------------------------
+        # tanh compresses the massive 33% return (Value 16.5) to 1.0
+        # while keeping the 1% return (Value 0.5) at ~0.46 (linear).
         reward = float(np.tanh(reward))
         
         # 8. Index
