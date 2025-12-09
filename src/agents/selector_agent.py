@@ -42,11 +42,13 @@ class EnhancedTGNN(nn.Module):
         self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn2 = BatchNorm(hidden_dim)
         
-        # 4. REMOVED: Bilinear Parameters (No longer needed for Dot Product)
+        # 4. Pair Scorer Parameters (Bilinear Matrix)
+        self.bilinear_W = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.bilinear_W)
         
         self.dropout = dropout
 
-        # We use BCEWithLogitsLoss (Dot product output acts as Logits)
+        # We use BCEWithLogitsLoss for stability
         self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
@@ -74,10 +76,7 @@ class EnhancedTGNN(nn.Module):
             h = F.relu(h)
             h = h + h_in
 
-        # D. Normalize 
-        # Note: L2 Normalization + Dot Product == Cosine Similarity
-        # If you want pure Dot Product based on magnitude, remove this line.
-        # Keeping it makes training significantly more stable.
+        # D. Normalize
         h_out = F.normalize(h, p=2, dim=1)
         
         return h_out, new_hidden_state
@@ -85,6 +84,7 @@ class EnhancedTGNN(nn.Module):
     def compute_binary_loss(self, embeddings, pos_pairs, neg_pairs):
         """
         Computes Binary Cross Entropy Loss.
+        Forces positive pairs -> 1.0 and negative pairs -> 0.0
         """
         # Score Positive Pairs (Target = 1)
         pos_src = embeddings[pos_pairs[0]]
@@ -106,18 +106,17 @@ class EnhancedTGNN(nn.Module):
         return self.criterion(all_scores, all_labels)
 
     def _score_vectors(self, src, dst):
-        """ 
-        REPLACED: Simple Dot Product
-        Computes <src, dst> 
-        """
-        return torch.sum(src * dst, dim=1)
+        """ Computes x_src * W * x_dst + Cosine(x_src, x_dst) """
+        bilinear = torch.sum((src @ self.bilinear_W) * dst, dim=1)
+        cosine = F.cosine_similarity(src, dst)
+        return bilinear + cosine
 
     def get_all_scores_matrix(self, embeddings):
-        """ 
-        REPLACED: Matrix Multiplication (Dot Product)
-        Returns [N, N] matrix where entry (i,j) is score between node i and j
-        """
-        return embeddings @ embeddings.T
+        """ Vectorized Inference (Bilinear + Cosine) """
+        weighted_emb = embeddings @ self.bilinear_W
+        bilinear_scores = weighted_emb @ embeddings.T
+        cosine_scores = embeddings @ embeddings.T
+        return bilinear_scores + cosine_scores
 
 # ==============================================================================
 # 2. OPTIMIZED AGENT (Forecasting + Binary Selection)
@@ -327,41 +326,35 @@ class OptimizedSelectorAgent:
         
         for epoch in range(epochs):
             self.model.train()
-            train_loss = 0.0
-            hidden_state = None 
+            total_train_loss = 0.0
             optimizer.zero_grad()
             
-            # --- Training with Gradient Accumulation ---
+            # Helper for Gradient Accumulation
+            accumulated_loss = 0 
+            hidden_state = None 
+            
             for i, snap in enumerate(train_snapshots):
                 x = self.create_snapshot_features(self.train_df, snap['date']).to(self.device)
                 edge_index = snap['edge_index'].to(self.device)
                 edge_weights = snap['edge_weights'].to(self.device)
                 target_pos = snap['target_pos_pairs'].to(self.device)
                 
-                # Detach hidden state IF it exists, but we want gradients to flow through accumulation_steps.
-                # Standard Truncated BPTT: Detach at the start of a new "chunk"
-                if i % self.accumulation_steps == 0 and hidden_state is not None:
-                     hidden_state = hidden_state.detach()
-
+                # 1. Forward Pass
+                # Note: We do NOT detach hidden_state here inside the chunk. 
+                # We want gradients to flow through the chunk.
                 embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, hidden_state)
                 
                 if target_pos.size(1) == 0: continue
 
-                # --- 1. HARD NEGATIVE MINING ---
+                # 2. Hard Negative Mining
                 num_pos = target_pos.size(1)
-                
-                # A. Easy Negatives (Random)
                 num_easy = max(1, num_pos // 2)
                 neg_src_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
                 neg_dst_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
                 easy_neg_pairs = torch.stack([neg_src_easy, neg_dst_easy], dim=0)
 
-                # B. Hard Negatives (Existing input edges)
-                # Sample from edges that look correlated in input but are NOT in target
-                existing_edges = snap['edge_index'] # [2, E]
+                existing_edges = snap['edge_index']
                 if existing_edges.size(1) > 0:
-                    # Probabilistic approach: Randomly sample existing edges.
-                    # Statistically, most won't be in target_pos if we sample enough.
                     num_hard = max(1, num_pos - num_easy)
                     perm = torch.randperm(existing_edges.size(1))[:num_hard]
                     hard_candidates = existing_edges[:, perm].to(self.device)
@@ -369,21 +362,37 @@ class OptimizedSelectorAgent:
                 else:
                     neg_pairs = torch.cat([easy_neg_pairs, easy_neg_pairs], dim=1)
                 
-                # Compute Loss
+                # 3. Compute Loss
                 loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
                 
-                # --- 2. GRADIENT ACCUMULATION ---
-                # Normalize loss to keep magnitude consistent
-                (loss / self.accumulation_steps).backward()
-                
-                if (i + 1) % self.accumulation_steps == 0:
+                # 4. Accumulate Loss (Do NOT backward yet)
+                # We divide by accumulation_steps so the magnitude of the gradient 
+                # is roughly the same as if we updated every step.
+                loss_chunk = loss / self.accumulation_steps
+                accumulated_loss += loss_chunk
+                total_train_loss += loss.item() # For logging, we want the real loss
+
+                # 5. Backward & Step (At the end of the chunk)
+                is_end_of_chunk = (i + 1) % self.accumulation_steps == 0
+                is_last_step = (i + 1) == len(train_snapshots)
+
+                if is_end_of_chunk or is_last_step:
+                    # NOW we compute gradients. This backprops through the last N steps.
+                    accumulated_loss.backward()
+                    
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
-                
-                train_loss += loss.item()
+                    
+                    # CRITICAL: Detach hidden state here.
+                    # This prevents the NEXT chunk from trying to backprop into THIS chunk
+                    # (which is about to be freed).
+                    if hidden_state is not None:
+                        hidden_state = hidden_state.detach()
+                    
+                    accumulated_loss = 0
 
-            avg_train_loss = train_loss / len(train_snapshots)
+            avg_train_loss = total_train_loss / len(train_snapshots)
             
             # --- VALIDATE ---
             self.model.eval()
@@ -401,7 +410,6 @@ class OptimizedSelectorAgent:
                     
                     if target_pos.size(1) == 0: continue
                     
-                    # Validation can just use random negatives for speed/stability
                     neg_src = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_dst = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
