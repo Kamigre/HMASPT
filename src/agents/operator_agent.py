@@ -554,7 +554,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
 def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
     """
     Run holdout testing with supervisor monitoring.
-    Includes FORCED LIQUIDATION logic when Supervisor intervenes.
+    Features FORCE LIQUIDATION on stop, ensuring metrics reflect the exit costs.
     """
     
     # Check supervisor config
@@ -571,7 +571,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
     skipped_pairs = []
     pair_summaries = []
 
-    # Ensure lookback matches training
     lookback = CONFIG.get("rl_lookback", 30)
     
     for pair in pairs:
@@ -647,6 +646,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         # --- MAIN TRADING LOOP ---
         terminated = False
         stop_triggered = False
+        intervention_reason = ""
+        intervention_severity = ""
         
         while not terminated:
             
@@ -654,7 +655,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             obs, reward, terminated, _, info = env.step(action)
             episode_starts = np.array([terminated])
 
-            # Trace Logging
+            # Standard Trace
             trace = {
                 "pair": f"{pair[0]}-{pair[1]}",
                 "step": global_step,
@@ -680,57 +681,45 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 decision = supervisor.check_operator_performance(episode_traces, pair, phase="holdout")
                 
                 if decision["action"] == "stop":
-                    severity = decision.get("severity", "critical")
-                    print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Stopping pair early")
-                    print(f"    Reason: {decision['reason']}")
+                    intervention_severity = decision.get("severity", "critical")
+                    intervention_reason = decision['reason']
+                    print(f"\n⛔ SUPERVISOR INTERVENTION [{intervention_severity.upper()}]: Stopping pair early")
+                    print(f"    Reason: {intervention_reason}")
 
                     # ========================================================
-                    # NEW: FORCED LIQUIDATION LOGIC
+                    # FORCE LIQUIDATION: REALIZE THE LOSS/PROFIT
                     # ========================================================
                     if env.position != 0:
                         print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
                         
-                        # Action 1 corresponds to FLAT in your environment logic (0=Short, 1=Flat, 2=Long)
-                        # We force the environment to step one last time with action=1
+                        # Step environment with Action 1 (Flat)
+                        # We must update the env state so the final portfolio value reflects the close
                         obs, reward, terminated, _, info = env.step(1)
                         
-                        # Capture the PnL of this forced close
                         forced_pnl = info.get('realized_pnl_this_step', 0.0)
                         forced_cost = info.get('transaction_costs', 0.0)
                         
                         print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
                         
-                        # Add this final trace so metrics calculation sees the close
+                        # Create final trace reflecting the close
                         final_trace = trace.copy()
                         final_trace['step'] += 1
                         final_trace['local_step'] += 1
-                        final_trace['position'] = 0 # Now flat
+                        final_trace['position'] = 0 # Flat
                         final_trace['realized_pnl_this_step'] = forced_pnl
                         final_trace['transaction_costs'] = forced_cost
-                        final_trace['portfolio_value'] = info.get("portfolio_value", trace['portfolio_value'])
-                        final_trace['cum_return'] = info.get("cum_return", trace['cum_return'])
-                        final_trace['max_drawdown'] = info.get("drawdown", trace['max_drawdown'])
+                        final_trace['portfolio_value'] = float(info.get("portfolio_value", trace['portfolio_value']))
+                        final_trace['cum_return'] = float(info.get("cum_return", trace['cum_return']))
+                        final_trace['max_drawdown'] = float(info.get("drawdown", trace['max_drawdown']))
+                        final_trace['daily_return'] = float(info.get("daily_return", 0.0))
                         
+                        # Append this trace so metrics include the forced close
                         episode_traces.append(final_trace)
                         all_traces.append(final_trace)
                         operator.add_trace(final_trace)
 
-                    # ========================================================
-
-                    skip_info = {
-                        "pair": f"{pair[0]}-{pair[1]}",
-                        "reason": decision['reason'],
-                        "severity": severity,
-                        "step_stopped": global_step,
-                        "final_return": episode_traces[-1]['cum_return'] # Use the post-liquidation return
-                    }
-                    skipped_pairs.append(skip_info)
-                    
-                    if operator.logger:
-                        operator.logger.log("supervisor", "intervention", skip_info)
-                    
                     stop_triggered = True
-                    break # Break the WHILE loop
+                    break # Exit loop
                 
                 elif decision["action"] == "adjust":
                     print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
@@ -739,21 +728,54 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             global_step += 1
             operator.current_step = global_step
 
-        # --- Reporting Phase ---
+        # --- METRICS REPORTING (Including Forced Close) ---
         if len(episode_traces) > 0:
+            # 1. Recalculate metrics on the FULL trace history (including liquidation)
             sharpe = calculate_sharpe(episode_traces)
+            sortino = calculate_sortino(episode_traces)
             final_return = episode_traces[-1]['cum_return'] * 100
             max_dd = episode_traces[-1]['max_drawdown']
             
-            # PnL Events (Wins/Losses) - Now includes the forced close
             pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
-            win_rate = (len([p for p in pnl_events if p > 0]) / len(pnl_events) * 100) if pnl_events else 0.0
+            if len(pnl_events) > 0:
+                wins = len([p for p in pnl_events if p > 0])
+                win_rate = (wins / len(pnl_events)) * 100
+            else:
+                win_rate = 0.0
 
+            # 2. Log skipped pair info with the FINAL metrics
+            if stop_triggered:
+                skip_info = {
+                    "pair": f"{pair[0]}-{pair[1]}",
+                    "reason": intervention_reason,
+                    "severity": intervention_severity,
+                    "step_stopped": global_step,
+                    "final_return": final_return,
+                    "sharpe": sharpe,
+                    "drawdown": max_dd
+                }
+                skipped_pairs.append(skip_info)
+                if operator.logger:
+                    operator.logger.log("supervisor", "intervention", skip_info)
+
+            # 3. Print Detailed Results
+            status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
+            
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Status: {'⛔ STOPPED' if stop_triggered else '✅ COMPLETE'}")
-            print(f"  Final Return: {final_return:.2f}%")
-            print(f"  Max Drawdown: {max_dd:.2%}")
-            print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} trades)")
+            print(f"  Status:        {status_str}")
+            print(f"  Final Return:  {final_return:.2f}%")
+            print(f"  Max Drawdown:  {max_dd:.2%}")
+            print(f"  Sharpe Ratio:  {sharpe:.3f}")
+            print(f"  Sortino Ratio: {sortino:.3f}")
+            print(f"  Win Rate:      {win_rate:.1f}% ({len(pnl_events)} trades)")
+            
+            # Position Distribution
+            positions = [t['position'] for t in episode_traces]
+            print(f"  Position Distribution:")
+            for pos, name in [(100, "Long"), (-100, "Short"), (0, "Flat")]:
+                count = np.sum(np.array(positions) == pos)
+                pct = count / len(positions) * 100
+                print(f"    {name:<5}: {pct:.1f}%")
 
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
@@ -764,16 +786,23 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "status": "STOPPED" if stop_triggered else "COMPLETE"
             })
             
-    # Final Summary Table...
-    print("\n" + "="*80)
+    # Final Summary Table
+    print("\n" + "="*90)
     print("HOLDOUT TESTING COMPLETE: SUMMARY")
-    print("="*80)
-    print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Max DD':<8} | {'Win Rate':<8}")
-    print("-" * 80)
+    print("="*90)
+    print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Sortino':<7} | {'Max DD':<8} | {'Win Rate':<8}")
+    print("-" * 90)
+    
+    total_ret = 0
     for s in pair_summaries:
         status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
-        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
-    print("="*80)
+        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['sharpe']:>7.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
+        total_ret += s['return']
+        
+    avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
+    print("-" * 90)
+    print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
+    print("="*90)
     
     return all_traces, skipped_pairs
 
