@@ -41,7 +41,7 @@ CONFIG = {
     "half_life_min": 1,
     "transaction_cost": 0.0005,
     "rl_policy": "MlpLstmPolicy",
-    "windows": [1, 4],
+    "windows": [1, 2, 4],
     "rl_timesteps": 50000,
     "half_life_max": 40,
     "rl_lookback": 30,
