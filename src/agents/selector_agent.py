@@ -42,13 +42,11 @@ class EnhancedTGNN(nn.Module):
         self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn2 = BatchNorm(hidden_dim)
         
-        # 4. Pair Scorer Parameters (Bilinear Matrix)
-        self.bilinear_W = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.bilinear_W)
+        # 4. REMOVED: Bilinear Parameters (No longer needed for Dot Product)
         
         self.dropout = dropout
 
-        # We use BCEWithLogitsLoss for stability
+        # We use BCEWithLogitsLoss (Dot product output acts as Logits)
         self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
@@ -76,7 +74,10 @@ class EnhancedTGNN(nn.Module):
             h = F.relu(h)
             h = h + h_in
 
-        # D. Normalize
+        # D. Normalize 
+        # Note: L2 Normalization + Dot Product == Cosine Similarity
+        # If you want pure Dot Product based on magnitude, remove this line.
+        # Keeping it makes training significantly more stable.
         h_out = F.normalize(h, p=2, dim=1)
         
         return h_out, new_hidden_state
@@ -84,7 +85,6 @@ class EnhancedTGNN(nn.Module):
     def compute_binary_loss(self, embeddings, pos_pairs, neg_pairs):
         """
         Computes Binary Cross Entropy Loss.
-        Forces positive pairs -> 1.0 and negative pairs -> 0.0
         """
         # Score Positive Pairs (Target = 1)
         pos_src = embeddings[pos_pairs[0]]
@@ -106,17 +106,18 @@ class EnhancedTGNN(nn.Module):
         return self.criterion(all_scores, all_labels)
 
     def _score_vectors(self, src, dst):
-        """ Computes x_src * W * x_dst + Cosine(x_src, x_dst) """
-        bilinear = torch.sum((src @ self.bilinear_W) * dst, dim=1)
-        cosine = F.cosine_similarity(src, dst)
-        return bilinear + cosine
+        """ 
+        REPLACED: Simple Dot Product
+        Computes <src, dst> 
+        """
+        return torch.sum(src * dst, dim=1)
 
     def get_all_scores_matrix(self, embeddings):
-        """ Vectorized Inference (Bilinear + Cosine) """
-        weighted_emb = embeddings @ self.bilinear_W
-        bilinear_scores = weighted_emb @ embeddings.T
-        cosine_scores = embeddings @ embeddings.T
-        return bilinear_scores + cosine_scores
+        """ 
+        REPLACED: Matrix Multiplication (Dot Product)
+        Returns [N, N] matrix where entry (i,j) is score between node i and j
+        """
+        return embeddings @ embeddings.T
 
 # ==============================================================================
 # 2. OPTIMIZED AGENT (Forecasting + Binary Selection)
@@ -136,10 +137,11 @@ class OptimizedSelectorAgent:
     holdout_months: int = 18
     hidden_dim: int = 64
     num_heads: int = 3
-    accumulation_steps: int = 4 
+    accumulation_steps: int = 4  # New: Gradient Accumulation Steps
     
     # Internal State
     model: Any = None
+    scaler: Optional[StandardScaler] = None
     industry_encoder: Optional[OneHotEncoder] = None
     tickers: Optional[List[str]] = None
     ticker_to_idx: Optional[Dict[str, int]] = None
@@ -177,16 +179,13 @@ class OptimizedSelectorAgent:
         
         for window in windows:
             days = window * 5
-            # Rolling volatility
             df[f"volatility_{window}w"] = df.groupby("ticker")["returns"].transform(
                 lambda x: x.rolling(days, min_periods=max(1, days//2)).std()
             )
-            # Rolling momentum
             df[f"momentum_{window}w"] = df.groupby("ticker")["adj_close"].transform(
                 lambda x: x.pct_change(days)
             )
 
-        # Sector Encoding
         if "sector" in df.columns:
             if self.industry_encoder is None:
                 self.industry_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
@@ -200,6 +199,19 @@ class OptimizedSelectorAgent:
             df.drop(columns=["sector"], inplace=True, errors="ignore")
         
         df.fillna(0.0, inplace=True)
+        
+        exclude = ["date", "ticker", "close", "adj_factor", "split_factor", "volume", "adj_close"]
+        numeric_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+        
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+            if train_end_date:
+                train_mask = df["date"] < pd.to_datetime(train_end_date)
+                self.scaler.fit(df.loc[train_mask, numeric_cols])
+            else:
+                self.scaler.fit(df[numeric_cols])
+        
+        df[numeric_cols] = self.scaler.transform(df[numeric_cols])
         self.node_features = df
         return df
 
@@ -246,9 +258,8 @@ class OptimizedSelectorAgent:
             past_returns = returns_pivot.iloc[start_idx : i+1]
             corr_matrix = np.nan_to_num(past_returns.corr().values)
             
-            # Filter low correlations to create sparse graph
             input_edges = np.argwhere(np.abs(corr_matrix) >= 0.5)
-            input_edges = input_edges[input_edges[:, 0] < input_edges[:, 1]] # Upper triangle only
+            input_edges = input_edges[input_edges[:, 0] < input_edges[:, 1]]
             
             if len(input_edges) == 0:
                  edge_index = torch.empty((2, 0), dtype=torch.long)
@@ -278,31 +289,18 @@ class OptimizedSelectorAgent:
         return snapshots
 
     def create_snapshot_features(self, df: pd.DataFrame, snapshot_date):
-        """
-        Extracts features for a specific date and performs CROSS-SECTIONAL NORMALIZATION.
-        """
         exclude = ["date", "ticker", "close", "adj_factor", "split_factor", "volume", "adj_close", "div_amount"]
         feature_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
         
-        # Get latest data for all tickers up to this date
         snapshot_df = df[df['date'] <= snapshot_date].groupby('ticker').tail(1)
-        
-        # Reindex to ensure fixed order of tickers
-        snapshot_df = snapshot_df.set_index('ticker')[feature_cols].reindex(self.tickers).fillna(0.0)
-        
-        # --- Cross-Sectional Normalization (Z-Score) ---
-        values = snapshot_df.values
-        mean = np.mean(values, axis=0)
-        std = np.std(values, axis=0) + 1e-6 # Avoid div by zero
-        normalized_values = (values - mean) / std
-        
-        return torch.tensor(normalized_values, dtype=torch.float)
+        node_features = snapshot_df.set_index('ticker')[feature_cols].reindex(self.tickers).fillna(0.0)
+        return torch.tensor(node_features.values, dtype=torch.float)
 
     # ------------------------------------------------------------------------
-    # Training Loop (Fixed: No verbose=True)
+    # Training Loop (Hard Negatives + Grad Accumulation + BPTT)
     # ------------------------------------------------------------------------
 
-    def train(self, epochs: int = 50, lr: float = 0.001):
+    def train(self, epochs: int = 20, lr: float = 0.001):
         seed = CONFIG.get("random_seed", 42)
         torch.manual_seed(seed)
         
@@ -316,12 +314,7 @@ class OptimizedSelectorAgent:
             num_heads=self.num_heads
         ).to(self.device)
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
-        
-        # FIXED: Removed 'verbose=True' to prevent TypeError in PyTorch 2.2+
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3
-        )
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
         
         print("Building temporal snapshots...")
         train_snapshots = self.build_shifted_snapshots(self.train_df, self.lookback_weeks * 5, mode='train')
@@ -330,63 +323,65 @@ class OptimizedSelectorAgent:
         print(f"Training on {len(train_snapshots)} snapshots, Validating on {len(val_snapshots)}")
         
         best_val_loss = float('inf')
-        patience = 10 
+        patience = 6
         
         for epoch in range(epochs):
             self.model.train()
             train_loss = 0.0
-            chunk_loss = 0.0
-            current_chunk_steps = 0
-            
             hidden_state = None 
             optimizer.zero_grad()
             
+            # --- Training with Gradient Accumulation ---
             for i, snap in enumerate(train_snapshots):
                 x = self.create_snapshot_features(self.train_df, snap['date']).to(self.device)
                 edge_index = snap['edge_index'].to(self.device)
                 edge_weights = snap['edge_weights'].to(self.device)
                 target_pos = snap['target_pos_pairs'].to(self.device)
                 
+                # Detach hidden state IF it exists, but we want gradients to flow through accumulation_steps.
+                # Standard Truncated BPTT: Detach at the start of a new "chunk"
+                if i % self.accumulation_steps == 0 and hidden_state is not None:
+                     hidden_state = hidden_state.detach()
+
                 embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, hidden_state)
                 
-                if target_pos.size(1) == 0: 
-                    current_chunk_steps += 1
+                if target_pos.size(1) == 0: continue
+
+                # --- 1. HARD NEGATIVE MINING ---
+                num_pos = target_pos.size(1)
+                
+                # A. Easy Negatives (Random)
+                num_easy = max(1, num_pos // 2)
+                neg_src_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
+                neg_dst_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
+                easy_neg_pairs = torch.stack([neg_src_easy, neg_dst_easy], dim=0)
+
+                # B. Hard Negatives (Existing input edges)
+                # Sample from edges that look correlated in input but are NOT in target
+                existing_edges = snap['edge_index'] # [2, E]
+                if existing_edges.size(1) > 0:
+                    # Probabilistic approach: Randomly sample existing edges.
+                    # Statistically, most won't be in target_pos if we sample enough.
+                    num_hard = max(1, num_pos - num_easy)
+                    perm = torch.randperm(existing_edges.size(1))[:num_hard]
+                    hard_candidates = existing_edges[:, perm].to(self.device)
+                    neg_pairs = torch.cat([easy_neg_pairs, hard_candidates], dim=1)
                 else:
-                    # Hard Negative Mining
-                    num_pos = target_pos.size(1)
-                    num_easy = max(1, num_pos // 2)
-                    
-                    neg_src_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
-                    neg_dst_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
-                    easy_neg_pairs = torch.stack([neg_src_easy, neg_dst_easy], dim=0)
-
-                    existing_edges = snap['edge_index'] 
-                    if existing_edges.size(1) > 0:
-                        num_hard = max(1, num_pos - num_easy)
-                        perm = torch.randperm(existing_edges.size(1))[:num_hard]
-                        hard_candidates = existing_edges[:, perm].to(self.device)
-                        neg_pairs = torch.cat([easy_neg_pairs, hard_candidates], dim=1)
-                    else:
-                        neg_pairs = torch.cat([easy_neg_pairs, easy_neg_pairs], dim=1)
-                    
-                    loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
-                    chunk_loss += loss
-                    current_chunk_steps += 1
-                    train_loss += loss.item()
-
-                # Truncated BPTT
-                if (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(train_snapshots):
-                    if current_chunk_steps > 0:
-                        (chunk_loss / current_chunk_steps).backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        
-                        if hidden_state is not None:
-                            hidden_state = hidden_state.detach()
-                    
-                    chunk_loss = 0.0
-                    current_chunk_steps = 0
+                    neg_pairs = torch.cat([easy_neg_pairs, easy_neg_pairs], dim=1)
+                
+                # Compute Loss
+                loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
+                
+                # --- 2. GRADIENT ACCUMULATION ---
+                # Normalize loss to keep magnitude consistent
+                (loss / self.accumulation_steps).backward()
+                
+                if (i + 1) % self.accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                train_loss += loss.item()
 
             avg_train_loss = train_loss / len(train_snapshots)
             
@@ -406,6 +401,7 @@ class OptimizedSelectorAgent:
                     
                     if target_pos.size(1) == 0: continue
                     
+                    # Validation can just use random negatives for speed/stability
                     neg_src = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_dst = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
                     neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
@@ -415,31 +411,34 @@ class OptimizedSelectorAgent:
             
             avg_val_loss = val_loss / len(val_snapshots)
             
-            # Step the scheduler
-            scheduler.step(avg_val_loss)
-            
             status = "no_improvement"
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 status = "improved"
-                patience = 10
+                patience = 6
             else:
                 patience -= 1
                 
             print(f"Epoch {epoch+1} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | {status}")
+            
+            self._log_event("training_status", {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "status": status,
+                "best_loss": best_val_loss,
+                "patience_left": patience
+            })
             
             if patience <= 0:
                 print("Early stopping triggered.")
                 break
 
     # ------------------------------------------------------------------------
-    # Inference (With Diversity Filter)
+    # Inference (Vectorized + Probability)
     # ------------------------------------------------------------------------
 
-    def score_pairs(self, use_validation: bool = True, top_k: int = 100, max_pairs_per_ticker: int = 3):
-        """
-        Scoring with Diversity Filter to prevent one stock (e.g., CVS) from dominating.
-        """
+    def score_pairs(self, use_validation: bool = True, top_k: int = 100):
         if self.model is None: raise ValueError("Model not trained")
         
         df = self.val_df if use_validation else self.test_df
@@ -452,7 +451,7 @@ class OptimizedSelectorAgent:
         
         hidden_state = None
         
-        # 1. Forward Pass to get scores
+        # Run history to build memory
         with torch.no_grad():
             for snap in snapshots[:-1]:
                 x = self.create_snapshot_features(df, snap['date']).to(self.device)
@@ -467,58 +466,33 @@ class OptimizedSelectorAgent:
             
             embeddings, _ = self.model.forward_snapshot(x, idx, w, hidden_state)
             
-            # Raw scores -> Probability
+            # Raw scores (Logits)
             logit_matrix = self.model.get_all_scores_matrix(embeddings)
+            
+            # Convert to Probability (Sigmoid) for "Real Pair" confidence
             prob_matrix = torch.sigmoid(logit_matrix)
             
-            # Mask diagonal & lower triangle to avoid duplicates (A-B vs B-A)
+            # Mask diagonal/duplicates
             mask = torch.triu(torch.ones_like(prob_matrix), diagonal=1).bool()
             
-            # Flatten and Sort
-            valid_scores = prob_matrix[mask]
-            # Get ALL indices (not just top_k yet) because we might filter many out
-            sorted_scores, sorted_indices = torch.sort(valid_scores, descending=True)
+            # We want specific values, not just top K relative.
+            prob_matrix[~mask] = -1.0 # Filter out invalid
             
-            # Map flat indices back to (row, col)
-            # We need the full coordinate map for the masked elements
-            rows_grid, cols_grid = torch.nonzero(mask, as_tuple=True)
+            top_vals, top_flat_indices = torch.topk(prob_matrix.flatten(), k=top_k)
             
-            # 2. Diversity Selection Loop
-            selected_results = []
-            ticker_counts = {t: 0 for t in self.tickers}
+            rows = top_flat_indices // prob_matrix.size(1)
+            cols = top_flat_indices % prob_matrix.size(1)
             
-            # Iterate through sorted candidates
-            for idx, score in zip(sorted_indices.cpu().numpy(), sorted_scores.cpu().numpy()):
-                if len(selected_results) >= top_k:
-                    break
+            results = []
+            for r, c, score in zip(rows.cpu().numpy(), cols.cpu().numpy(), top_vals.cpu().numpy()):
+                if score > 0.0: # Only keep positive probabilities
+                    results.append({
+                        'x': self.tickers[r],
+                        'y': self.tickers[c],
+                        'score': float(score), # This is now a probability (0.0 - 1.0)
+                        'date': last_snap['date']
+                    })
                 
-                if score < 0.5: # Optional: Hard cutoff for low probability
-                    break
-                    
-                r = rows_grid[idx].item()
-                c = cols_grid[idx].item()
-                
-                ticker_x = self.tickers[r]
-                ticker_y = self.tickers[c]
-                
-                # --- THE FIX: FREQUENCY CAP ---
-                # Skip if either ticker has already been picked 'max_pairs_per_ticker' times
-                if ticker_counts[ticker_x] >= max_pairs_per_ticker or \
-                   ticker_counts[ticker_y] >= max_pairs_per_ticker:
-                    continue
-                
-                # Add to selection
-                selected_results.append({
-                    'x': ticker_x,
-                    'y': ticker_y,
-                    'score': float(score),
-                    'date': last_snap['date']
-                })
-                
-                # Increment counts
-                ticker_counts[ticker_x] += 1
-                ticker_counts[ticker_y] += 1
-                
-        results_df = pd.DataFrame(selected_results)
-        print(f"✅ Scored {len(results_df)} diverse pairs.")
+        results_df = pd.DataFrame(results)
+        print(f"✅ Scored {len(results_df)} pairs.")
         return results_df
