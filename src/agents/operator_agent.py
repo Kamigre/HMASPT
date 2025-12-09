@@ -599,6 +599,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
     global_step = 0
     all_traces = []
     skipped_pairs = []
+    
+    # Storage for final summary
+    pair_summaries = []
 
     # Ensure lookback matches training
     lookback = CONFIG.get("rl_lookback", 30)
@@ -635,7 +638,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         print(f"  ✓ Model loaded")
 
         # 3. Environment Setup (Test Mode)
-        # Note: In test_mode=True, env.idx usually starts at 0 or lookback.
         env = PairTradingEnv(
             series_x=aligned.iloc[:, 0], 
             series_y=aligned.iloc[:, 1], 
@@ -687,9 +689,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         # ==============================================================================
         # FINANCIAL RESET (Prepare for Real Trading)
         # ==============================================================================
-        # The agent has "seen" the market for 90 days (updated LSTM), 
-        # but now we must reset the PnL counters so testing starts at $0.
-        
         env.cash = env.initial_capital
         env.portfolio_value = env.initial_capital
         env.realized_pnl = 0.0 
@@ -796,34 +795,93 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             global_step += 1
             operator.current_step = global_step
 
-        # End of Pair Summary
+        # End of Pair Loop
         if skip_to_next_pair:
             print(f"⏭️  Pair skipped early at step {local_step}")
         else:
             print(f"  ✓ Complete: {len(episode_traces)} steps")
         
-        # Calculate final metrics for logging
-        sharpe = calculate_sharpe(episode_traces)
-        sortino = calculate_sortino(episode_traces)
-
-        if operator.logger and len(episode_traces) > 0:
-            final_cum_return = episode_traces[-1].get('cum_return', 0)
-            final_pnl = episode_traces[-1].get('realized_pnl', 0)
+        # ==============================================================================
+        # DETAILED METRICS REPORTING (Same as Training)
+        # ==============================================================================
+        if len(episode_traces) > 0:
+            # 1. Calculate Metrics
+            sharpe = calculate_sharpe(episode_traces)
+            sortino = calculate_sortino(episode_traces)
+            final_return = episode_traces[-1]['cum_return'] * 100
+            max_dd = episode_traces[-1]['max_drawdown']
             
-            operator.logger.log("operator", "episode_complete", {
+            # 2. Position Analysis
+            positions = [t['position'] for t in episode_traces]
+            unique_positions = np.unique(positions)
+            
+            # 3. Print Results
+            print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
+            print(f"  Final Return: {final_return:.2f}%")
+            print(f"  Max Drawdown: {max_dd:.2%}")
+            print(f"  Sharpe Ratio: {sharpe:.3f}")
+            print(f"  Sortino Ratio: {sortino:.3f}")
+            
+            # Win Rate (Bonus Metric)
+            # Filter steps where a PnL was actually realized (trade closed or flipped)
+            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
+            if len(pnl_events) > 0:
+                wins = len([p for p in pnl_events if p > 0])
+                win_rate = (wins / len(pnl_events)) * 100
+                print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} realized trades)")
+            else:
+                print(f"  Win Rate: N/A (0 trades)")
+
+            # Position Distribution
+            print(f"  Position Distribution:")
+            for pos in [-100, 0, 100]:
+                count = np.sum(np.array(positions) == pos)
+                pct = count / len(positions) * 100
+                # Map value to readable name
+                name = "Flat"
+                if pos > 0: name = "Long"
+                elif pos < 0: name = "Short"
+                print(f"    {name} ({int(pos)}): {pct:.1f}% of time")
+
+            # Store for final summary
+            pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
-                "total_steps": len(episode_traces),
-                "final_cum_return": final_cum_return,
-                "total_pnl": final_pnl,
+                "return": final_return,
                 "sharpe": sharpe,
-                "sortino": sortino,
-                "was_skipped": skip_to_next_pair
+                "drawdown": max_dd,
+                "trades": env.num_trades
             })
+
+            # Logging
+            if operator.logger:
+                final_pnl = episode_traces[-1].get('realized_pnl', 0)
+                operator.logger.log("operator", "episode_complete", {
+                    "pair": f"{pair[0]}-{pair[1]}",
+                    "total_steps": len(episode_traces),
+                    "final_cum_return": final_return,
+                    "total_pnl": final_pnl,
+                    "sharpe": sharpe,
+                    "sortino": sortino,
+                    "was_skipped": skip_to_next_pair
+                })
             
     print("\n" + "="*70)
-    print("HOLDOUT TESTING COMPLETE")
+    print("HOLDOUT TESTING COMPLETE: SUMMARY")
     print("="*70)
-    print(f"Total steps: {global_step}")
+    print(f"{'Pair':<15} | {'Return':<10} | {'Sharpe':<8} | {'Max DD':<10} | {'Trades':<6}")
+    print("-" * 60)
+    
+    total_ret = 0
+    for s in pair_summaries:
+        print(f"{s['pair']:<15} | {s['return']:>8.2f}% | {s['sharpe']:>8.2f} | {s['drawdown']:>9.1%} | {s['trades']:>6}")
+        total_ret += s['return']
+        
+    avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
+    print("-" * 60)
+    print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
+    print("="*70)
+    print(f"Total steps simulated: {global_step}")
+    
     return all_traces, skipped_pairs
 
 def calculate_sharpe(traces, risk_free_rate=None):
