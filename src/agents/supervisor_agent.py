@@ -415,3 +415,59 @@ class SupervisorAgent:
         exc = np.array(returns) - rf
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
+
+    def _calculate_sortino(self, returns: List[float]) -> float:
+        if len(returns) < 2: return 0.0
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252
+        exc = np.array(returns) - rf
+        down = exc[exc < 0]
+        std = np.sqrt(np.mean(down**2)) if len(down) > 0 else 0.0
+        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
+
+    def _generate_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
+        if not self.use_gemini:
+            return self._fallback_explanation(metrics, actions)
+        
+        prompt = f"""
+                You are the Chief Risk Officer (CRO) at a Quantitative Hedge Fund. 
+                Your mandate is capital preservation and risk-adjusted growth.
+                
+                Analyze the following Pairs Trading Portfolio results:
+                
+                --- METRICS ---
+                {json.dumps(metrics, indent=2, default=str)}
+                
+                --- AUTOMATED ACTIONS TRIGGERED ---
+                {json.dumps(actions, indent=2)}
+                
+                Produce a strict, institutional-grade Executive Risk Memo. 
+                Avoid generic pleasantries. Focus on data interpretation.
+                
+                Structure your response into these three specific sections:
+                
+                ### 1. Performance Attribution
+                - Evaluate the quality of returns (Sharpe > 2.0 is target).
+                - Analyze the "Quality of Earnings": Compare Win Rate vs. Total PnL. (e.g., If Win Rate is high but PnL is low/negative, are we taking small profits and large losses?)
+                - Comment on the disparity between Average Return and Median Return (skewness).
+                
+                ### 2. Risk Decomposition
+                - Analyze Tail Risk: specific comment on Max Drawdown vs. VaR/CVaR (95%).
+                - Assess "Stalemate Risk": Look at 'avg_steps_per_pair'. Are we holding positions too long for a mean-reversion strategy?
+                - Identify if specific pairs are dragging down the aggregate (Concentration of loss).
+                
+                ### 3. CRO Verdict & Adjustments
+                - Review the AUTOMATED ACTIONS above. Do you concur, or do you recommend a manual override?
+                - Provide a final "Traffic Light" signal: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
+                """
+        
+        try:
+            response = self.client.generate_content(prompt)
+            return response.text
+        except Exception:
+            return self._fallback_explanation(metrics, actions)
+
+    def _fallback_explanation(self, metrics, actions):
+        return f"Portfolio Sharpe: {metrics['sharpe_ratio']:.2f}. Drawdown: {metrics['max_drawdown']:.2%}. Win Rate: {metrics['win_rate']:.1%}."
+
+    def _basic_check(self, operator_traces, pair):
+        return {"action": "continue", "reason": "basic_check_pass", "metrics": {}}
