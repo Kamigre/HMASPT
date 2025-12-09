@@ -1,902 +1,471 @@
 import os
+import sys
 import json
-import time
 import datetime
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
-import gymnasium as gym
-from gymnasium import spaces
-from sb3_contrib import RecurrentPPO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATv2Conv, BatchNorm
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
 
-# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
-from agents.message_bus import JSONLogger
 
+# ==============================================================================
+# 1. ENHANCED MODEL ARCHITECTURE (BCE Loss + Vectorization)
+# ==============================================================================
 
-class PairTradingEnv(gym.Env):
-
-    def __init__(self, series_x: pd.Series, series_y: pd.Series, 
-                 lookback: int = 30,
-                 initial_capital: float = 10000,
-                 position_scale: int = 100,
-                 transaction_cost_rate: float = 0.0005,
-                 test_mode: bool = False):
-        
+class EnhancedTGNN(nn.Module):
+    def __init__(self, node_dim, hidden_dim=64, num_heads=4, dropout=0.2):
         super().__init__()
         
-        # Align series
-        self.data = pd.concat([series_x, series_y], axis=1).dropna()
-        self.lookback = lookback
-        self.test_mode = test_mode
-        self.initial_capital = initial_capital
-        self.position_scale = position_scale
-        self.transaction_cost_rate = transaction_cost_rate
-        
-        # Action: 3 discrete actions (short, flat, long)
-        self.action_space = spaces.Discrete(3)
-        
-        # Observation space: 14 features
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
+        # 1. Input Encoder
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
         )
         
-        # Precompute spread and features
-        self._precompute_features()
+        # 2. Memory Gate (GRU Cell)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         
-        self.reset()
+        # 3. Graph Attention Layers
+        self.gat1 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
+        self.bn1 = BatchNorm(hidden_dim)
+        
+        self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
+        self.bn2 = BatchNorm(hidden_dim)
+        
+        # 4. Pair Scorer Parameters (Bilinear Matrix)
+        self.bilinear_W = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.bilinear_W)
+        
+        self.dropout = dropout
 
-    def _compute_rsi(self, series, period=14):
-        """Helper to calculate RSI of the spread"""
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / (loss + 1e-8)
-        return 100 - (100 / (1 + rs))
+        # --- FIX: Initialize the Loss Function ---
+        # We use BCEWithLogitsLoss because _score_vectors returns raw values, not probabilities.
+        self.criterion = nn.BCEWithLogitsLoss()
+    
+    def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
+        # A. Encode
+        h = self.node_encoder(x)
+        
+        # B. Memory Update
+        if hidden_state is not None:
+            h = self.gru(h, hidden_state)
+        
+        new_hidden_state = h.clone()
 
-    def _precompute_features(self):
-        """Compute spread and advanced features"""
-        x = self.data.iloc[:, 0]
-        y = self.data.iloc[:, 1]
-        
-        # Raw spread
-        self.spread = x - y
-        
-        # 1. Z-scores (Mean Reversion Signals)
-        self.zscore_short = (
-            (self.spread - self.spread.rolling(self.lookback).mean()) / 
-            (self.spread.rolling(self.lookback).std() + 1e-8)
-        )
-        
-        self.zscore_long = (
-            (self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
-            (self.spread.rolling(self.lookback * 2).std() + 1e-8)
-        )
-        
-        # 2. Volatility Features (Risk Detection)
-        self.vol_short = self.spread.rolling(self.lookback).std()
-        self.vol_long = self.spread.rolling(self.lookback * 3).std()
-        
-        # Volatility Ratio
-        self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
-        
-        # 3. Momentum Features (Trend Detection)
-        self.rsi = self._compute_rsi(self.spread, period=14)
-        
-        # Convert to numpy and fill NaNs
-        self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0)
-        self.zscore_short_np = np.nan_to_num(self.zscore_short.to_numpy(), nan=0.0)
-        self.zscore_long_np = np.nan_to_num(self.zscore_long.to_numpy(), nan=0.0)
-        self.vol_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0)
-        self.vol_ratio_np = np.nan_to_num(self.vol_ratio.to_numpy(), nan=1.0)
-        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0)
-        
-        # Store prices for logging
-        self.price_x_np = x.to_numpy()
-        self.price_y_np = y.to_numpy()
+        # C. Message Passing
+        if edge_index.numel() > 0:
+            h_in = h
+            h = self.gat1(h, edge_index, edge_attr=edge_weight)
+            h = self.bn1(h)
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            h = h + h_in
+            
+            h_in = h
+            h = self.gat2(h, edge_index, edge_attr=edge_weight)
+            h = self.bn2(h)
+            h = F.relu(h)
+            h = h + h_in
 
-    def _get_observation(self, idx: int) -> np.ndarray:
-        """Build NORMALIZED observation vector"""
-        if idx < 0 or idx >= len(self.spread_np):
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        # D. Normalize
+        h_out = F.normalize(h, p=2, dim=1)
         
-        norm_unrealized = self.unrealized_pnl / self.initial_capital
-        norm_realized = self.realized_pnl / self.initial_capital
-        
-        obs = np.array([
-            self.zscore_short_np[idx],
-            self.zscore_long_np[idx],
-            self.vol_np[idx],
-            self.spread_np[idx],
-            
-            # NEW FEATURES
-            self.rsi_np[idx] / 100.0,
-            self.vol_ratio_np[idx],
-            
-            float(self.position / self.position_scale),  
-            float(self.entry_spread) if self.position != 0 else 0.0,
-            
-            # NORMALIZED FINANCIALS
-            float(norm_unrealized),
-            float(norm_realized),
-            
-            float(self.cash / self.initial_capital - 1),  
-            float(self.portfolio_value / self.initial_capital - 1),  
-            
-            float(self.days_in_position) / 252.0,
-            float(self.num_trades) / 100.0,
-        ], dtype=np.float32)
-        
-        return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
+        return h_out, new_hidden_state
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        """Reset environment to initial state"""
-        super().reset(seed=seed)
-        
-        self.idx = self.lookback if not self.test_mode else 0
-        self.position = 0
-        self.entry_spread = 0.0 
-        self.days_in_position = 0
-        
-        # Financial tracking
-        self.cash = self.initial_capital
-        self.realized_pnl = 0.0 
-        self.unrealized_pnl = 0.0 
-        self.portfolio_value = self.initial_capital
-        
-        # Performance tracking
-        self.peak_value = self.initial_capital
-        self.num_trades = 0
-        self.trade_history = []
-        
-        # For return calculation
-        self.prev_portfolio_value = self.initial_capital
-        
-        return self._get_observation(self.idx), {}
-
-    def step(self, action: int):
+    def compute_binary_loss(self, embeddings, pos_pairs, neg_pairs):
         """
-        Execute one trading step with IMPROVED Reward Calculation.
+        Computes Binary Cross Entropy Loss.
+        Forces positive pairs -> 1.0 and negative pairs -> 0.0
         """
-        current_idx = self.idx
+        # Score Positive Pairs (Target = 1)
+        pos_src = embeddings[pos_pairs[0]]
+        pos_dst = embeddings[pos_pairs[1]]
+        pos_scores = self._score_vectors(pos_src, pos_dst)
         
-        # 1. Determine if this is the last available step
-        is_last_step = (current_idx >= len(self.spread_np) - 1)
+        # Score Negative Pairs (Target = 0)
+        neg_src = embeddings[neg_pairs[0]]
+        neg_dst = embeddings[neg_pairs[1]]
+        neg_scores = self._score_vectors(neg_src, neg_dst)
         
-        # 2. Determine Action
-        if is_last_step:
-            target_position = 0 # FORCE EXIT
-        else:
-            base_position = int(action) - 1
-            target_position = base_position * self.position_scale
+        # Combine
+        all_scores = torch.cat([pos_scores, neg_scores])
+        all_labels = torch.cat([
+            torch.ones_like(pos_scores), 
+            torch.zeros_like(neg_scores)
+        ])
+        
+        return self.criterion(all_scores, all_labels)
 
-        # 3. Setup Data
-        current_spread = float(self.spread_np[current_idx])
-        current_zscore = float(self.zscore_short_np[current_idx])
-        
-        if is_last_step:
-            next_spread = current_spread 
-            next_idx = current_idx 
-        else:
-            next_idx = current_idx + 1
-            next_spread = float(self.spread_np[next_idx])
-            
-        # 4. Execute Trade & Update Financials
-        position_change = target_position - self.position
-        trade_occurred = (position_change != 0)
-        
-        realized_pnl_this_step = 0.0
-        transaction_costs = 0.0
-        
-        if trade_occurred:
-            # Calculate Realized P&L
-            if self.position != 0:
-                spread_change = current_spread - self.entry_spread
-                
-                # Check if we are closing or flipping
-                if target_position == 0 or np.sign(target_position) != np.sign(self.position):
-                    closed_size = abs(self.position)
-                else:
-                    closed_size = abs(position_change)
-                    
-                # Standard PnL Calculation
-                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
+    def _score_vectors(self, src, dst):
+        """ Computes x_src * W * x_dst + Cosine(x_src, x_dst) """
+        bilinear = torch.sum((src @ self.bilinear_W) * dst, dim=1)
+        cosine = F.cosine_similarity(src, dst)
+        return bilinear + cosine
 
-            # Transaction Costs
-            trade_size = abs(position_change)
-            notional = trade_size * abs(current_spread)
-            transaction_costs = notional * self.transaction_cost_rate
-            self.num_trades += 1
-            
-            # Reset/Update Entry Price
-            if target_position != 0 and np.sign(target_position) != np.sign(self.position):
-                # Flipping or Opening New
-                self.entry_spread = current_spread
-                self.days_in_position = 0
-            elif target_position == 0:
-                # Flat
-                self.entry_spread = 0.0
-                self.days_in_position = 0
-                
-            # Log history
-            if self.position != 0:
-                  self.trade_history.append({
-                    'entry_spread': self.entry_spread,
-                    'exit_spread': current_spread,
-                    'position': self.position,
-                    'pnl': realized_pnl_this_step,
-                    'holding_days': self.days_in_position,
-                    'forced_close': is_last_step
-                })
-        else:
-            # Holding existing position
-            self.days_in_position += 1
-            
-        # Update State
-        self.position = target_position
-        self.realized_pnl += realized_pnl_this_step - transaction_costs
-        self.cash = self.initial_capital + self.realized_pnl
-        
-        if self.position != 0:
-            self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
-        else:
-            self.unrealized_pnl = 0.0
-            
-        self.portfolio_value = self.cash + self.unrealized_pnl
-        
-        # 5. Returns
-        if not hasattr(self, 'prev_portfolio_value'):
-            self.prev_portfolio_value = self.initial_capital
+    def get_all_scores_matrix(self, embeddings):
+        """ Vectorized Inference (Bilinear + Cosine) """
+        weighted_emb = embeddings @ self.bilinear_W
+        bilinear_scores = weighted_emb @ embeddings.T
+        cosine_scores = embeddings @ embeddings.T
+        return bilinear_scores + cosine_scores
 
-        # Calculate log returns for better stability, or standard % returns
-        daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
-        self.prev_portfolio_value = self.portfolio_value
+# ==============================================================================
+# 2. OPTIMIZED AGENT (Forecasting + Binary Selection)
+# ==============================================================================
 
-        # 6. Metrics
-        prev_peak = self.peak_value
-        self.peak_value = max(self.peak_value, self.portfolio_value)
-        drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
-        
-        # ===============================
-        # 7. SIMPLIFIED REWARD FUNCTION
-        # ===============================
-        
-        reward = 0.0
-        
-        # --- 1. Return-based reward -----------------------------------
-        # Risk-adjusted return: reward profits, penalize losses slightly more
-        if daily_return >= 0:
-            reward += daily_return
-        else:
-            reward += 1.2 * daily_return   # loss aversion
-        
-        # --- 2. Realized PnL bonus ------------------------------------
-        # Encourage closing winning trades
-        if realized_pnl_this_step > 0:
-            reward += (realized_pnl_this_step / self.initial_capital)
-        
-        # --- 3. Drawdown penalty ---------------------------------------
-        # Penalize only if drawdown worsens AND daily return is negative
-        if self.portfolio_value < prev_peak and daily_return < 0:
-            reward -= abs(daily_return)
-        
-        # --- 4. Holding penalty ----------------------------------------
-        # Linear time penalty for holding positions too long (max 50 days)
-        if self.position != 0:
-            reward -= min(self.days_in_position, 50) * 0.001
-        
-        # --- 5. Z-score alignment (tiny shaping) ------------------------
-        norm_pos = self.position / self.position_scale
-        
-        # anti-alignment = penalize
-        if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
-            reward -= 0.02
-        
-        # pro-alignment = encourage
-        if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
-            reward += 0.02
-        
-        # --- 6. Clip for stability --------------------------------------
-        reward = float(np.clip(reward, -1.0, 1.0))
-        
-        # 8. Index
-        if not is_last_step:
-            self.idx = next_idx
-        
-        # 9. Obs
-        obs = self._get_observation(self.idx)
-        
-        # 10. Info
-        info = {
-            'portfolio_value': float(self.portfolio_value),
-            'cash': float(self.cash),
-            'realized_pnl': float(self.realized_pnl),
-            'unrealized_pnl': float(self.unrealized_pnl),
-            'realized_pnl_this_step': float(realized_pnl_this_step),
-            'transaction_costs': float(transaction_costs),
-            'position': int(self.position),
-            'entry_spread': float(self.entry_spread),
-            'current_spread': float(current_spread),
-            'z_score': float(current_zscore), 
-            'days_in_position': int(self.days_in_position),
-            'daily_return': float(daily_return),
-            'drawdown': float(drawdown),
-            'num_trades': int(self.num_trades),
-            'trade_occurred': bool(trade_occurred),
-            'cum_return': float(self.portfolio_value / self.initial_capital - 1),
-            'forced_close': is_last_step and trade_occurred,
-            'price_x': float(self.price_x_np[current_idx]),
-            'price_y': float(self.price_y_np[current_idx])
-        }
-        
-        terminated = is_last_step
-        
-        return obs, float(reward), terminated, False, info
-       
 @dataclass
-class OperatorAgent:
-    
-    logger: Optional[JSONLogger] = None
-    storage_dir: str = "models/"
+class OptimizedSelectorAgent:
 
+    df: pd.DataFrame
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    trace_path: str = "traces/selector.jsonl"
+    
+    # Hyperparameters
+    corr_threshold: float = 0.60
+    lookback_weeks: int = 4
+    forecast_horizon: int = 1
+    holdout_months: int = 18
+    hidden_dim: int = 64
+    num_heads: int = 3
+    
+    # Internal State
+    model: Any = None
+    scaler: Optional[StandardScaler] = None
+    industry_encoder: Optional[OneHotEncoder] = None
+    tickers: Optional[List[str]] = None
+    ticker_to_idx: Optional[Dict[str, int]] = None
+    
+    # Data Containers
+    train_df: Optional[pd.DataFrame] = None
+    val_df: Optional[pd.DataFrame] = None
+    test_df: Optional[pd.DataFrame] = None
+    node_features: Optional[pd.DataFrame] = None
+    
     def __post_init__(self):
-        os.makedirs(self.storage_dir, exist_ok=True)
-        self.active = True
-        self.transaction_cost = CONFIG.get("transaction_cost", 0.0005)
-        self.current_step = 0
-        self.traces_buffer = []
-        self.max_buffer_size = 1000
-
-    def get_current_step(self):
-        return self.current_step
-
-    def get_traces_since_step(self, start_step):
-        return [t for t in self.traces_buffer if t.get('step', 0) >= start_step]
-
-    def add_trace(self, trace):
-        self.traces_buffer.append(trace)
-        if len(self.traces_buffer) > self.max_buffer_size:
-            self.traces_buffer = self.traces_buffer[-self.max_buffer_size:]
-
-    def clear_traces_before_step(self, step):
-        self.traces_buffer = [t for t in self.traces_buffer if t.get('step', 0) >= step]
-
-    def apply_command(self, command):
-        cmd_type = command.get("command")
-        if cmd_type == "pause":
-            self.active = False
-            if self.logger:
-                self.logger.log("operator", "paused", {})
-        elif cmd_type == "resume":
-            self.active = True
-            if self.logger:
-                self.logger.log("operator", "resumed", {})
-
-    def load_model(self, model_path):
-        return RecurrentPPO.load(model_path)
-
-    def train_on_pair(self, prices: pd.DataFrame, x: str, y: str, 
-                      lookback: int = None, timesteps: int = None, 
-                      shock_prob: float = None, shock_scale: float = None,
-                      use_curriculum: bool = False):
-
-        # Get seed from CONFIG
-        seed = CONFIG.get("random_seed", 42)
-                            
-        if not self.active:
-            return None
-
-        if lookback is None:
-            lookback = CONFIG.get("rl_lookback", 30) 
-            
-        if timesteps is None:
-            timesteps = CONFIG.get("rl_timesteps", 500000)
-
-        series_x = prices[x]
-        series_y = prices[y]
-
-        print(f"\n{'='*70}")
-        print(f"Training pair: {x} - {y} (LSTM POLICY)")
-        print(f"  Data length: {len(series_x)} days")
-        print(f"  Timesteps: {timesteps:,}")
-        print(f"  Time Window (Lookback): {lookback} (Paper optimal: 30)")
-        print(f"  LSTM Hidden Size: 512 (Paper optimal)")
-        print(f"{'='*70}")
-
-        print("\n🚀 Training with Recurrent PPO (LSTM)...")
-        env = PairTradingEnv(
-            series_x, series_y, lookback, position_scale=100, 
-            transaction_cost_rate=0.0005, test_mode=False
-        )
-        
-        # Seed the environment
-        env.reset(seed=seed)
-
-        policy_kwargs = dict(
-            lstm_hidden_size=512,
-            n_lstm_layers=1
-        )
-
-        model = RecurrentPPO(
-            "MlpLstmPolicy",
-            env,
-            learning_rate=0.001,
-            n_steps=4096,
-            batch_size=256,
-            n_epochs=10,
-            gamma=0.99,
-            ent_coef=0.04,
-            verbose=1,
-            device="auto",
-            seed=seed,
-            policy_kwargs=policy_kwargs 
-        )
-
-        model.learn(total_timesteps=timesteps)
-
-        # Save model
-        model_path = os.path.join(self.storage_dir, f"operator_model_{x}_{y}.zip")
-        model.save(model_path)
-        print(f"\n✅ Model saved to {model_path}")
-
-        # Evaluate on training data
-        print("\n📊 Evaluating on training data...")
-        env_eval = PairTradingEnv(
-              series_x, series_y, lookback, position_scale=100,
-              transaction_cost_rate = 0.0005, test_mode=False
-        )
-        
-        obs, _ = env_eval.reset()
-        done = False
-        daily_returns = []
-        positions = []
-
-        # Initialize LSTM states
-        lstm_states = None
-        episode_starts = np.ones((1,), dtype=bool)
-
-        while not done:
-            action, lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts,
-                deterministic=True
-            )
-            obs, reward, done, _, info = env_eval.step(action)
-            episode_starts = np.array([done])
-            
-            daily_returns.append(info.get('daily_return', 0))
-            positions.append(info.get('position', 0))
-
-        # Calculate metrics
-        rets = np.array(daily_returns)
-        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
-        excess_rets = rets - rf_daily
-
-        sharpe = 0.0
-        if len(excess_rets) > 1 and np.std(excess_rets, ddof=1) > 1e-8:
-            sharpe = np.mean(excess_rets) / np.std(excess_rets, ddof=1) * np.sqrt(252)
-        
-        downside = excess_rets[excess_rets < 0]
-        sortino = 0.0
-        if len(downside) > 1 and np.std(downside, ddof=1) > 1e-8:
-            sortino = np.mean(excess_rets) / np.std(downside, ddof=1) * np.sqrt(252)
-
-        final_return = (env_eval.portfolio_value / env_eval.initial_capital - 1) * 100
-
-        # Position analysis
-        unique_positions = np.unique(positions)
-        print(f"\n📈 Training Results:")
-        print(f"  Final Return: {final_return:.2f}%")
-        print(f"  Sharpe Ratio: {sharpe:.3f}")
-        print(f"  Sortino Ratio: {sortino:.3f}")
-        print(f"  Positions used: {unique_positions}")
-
-        for pos in unique_positions:
-            count = np.sum(np.array(positions) == pos)
-            pct = count / len(positions) * 100
-            print(f"    Position {int(pos)}: {pct:.1f}% of time")
-
-        trace = {
-            "pair": (x, y),
-            "cum_return": final_return,
-            "max_drawdown": (env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value,
-            "sharpe": sharpe,
-            "sortino": sortino,
-            "model_path": model_path,
-            "positions_used": unique_positions.tolist()
+        os.makedirs(os.path.dirname(self.trace_path) or ".", exist_ok=True)
+        self._log_event("init", {"device": self.device})
+    
+    def _log_event(self, event: str, details: Dict[str, Any]):
+        entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "agent": "selector",
+            "event": event,
+            "details": details,
         }
-
-        if self.logger:
-            self.logger.log("operator", "pair_trained", trace)
-
-        return trace
-
-    def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "a") as f:
-            f.write(json.dumps(trace, default=str) + "\n")
-
-
-def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
-                        pairs: list, max_workers: int = None):
-
-    if max_workers is None:
-        max_workers = CONFIG.get("max_workers", 2)
-
-    all_traces = []
-
-    def train(pair):
-        x, y = pair
-        return operator.train_on_pair(prices, x, y)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(train, pair) for pair in pairs]
-        for f in tqdm(as_completed(futures), total=len(futures), desc="Operator Training"):
-            result = f.result()
-            if result:
-                all_traces.append(result)
-
-    save_path = os.path.join(operator.storage_dir, "all_operator_traces.json")
-    with open(save_path, "w") as f:
-        json.dump(all_traces, f, indent=2, default=str)
-
-    if operator.logger:
-        operator.logger.log("operator", "batch_training_complete", {"n_pairs": len(all_traces)})
+        with open(self.trace_path, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
     
-    print("\n" + "="*70)
-    print("TRAINING SUMMARY")
-    print("="*70)
-    for trace in all_traces:
-        print(f"{trace['pair'][0]}-{trace['pair'][1]}: "
-              f"Return={trace['cum_return']:.2f}%, Sharpe={trace['sharpe']:.2f}")
-    print("="*70)
+    # ------------------------------------------------------------------------
+    # Feature Engineering
+    # ------------------------------------------------------------------------
     
-    return all_traces
-
-
-def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
-    """
-    Run holdout testing with supervisor monitoring.
-    Uses 'warmup_steps' at the start of holdout_prices to initialize LSTM
-    and internal indicators without recording PnL.
-    
-    If stopped by supervisor, metrics are calculated on the data generated up to that point.
-    """
-    
-    # Check supervisor config
-    if "supervisor_rules" in CONFIG and "holdout" in CONFIG["supervisor_rules"]:
-        check_interval = CONFIG["supervisor_rules"]["holdout"].get("check_interval", 20)
-    else:
-        check_interval = 20
+    def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
+        df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
+        df["date"] = pd.to_datetime(df["date"])
         
-    operator.traces_buffer = []
-    operator.current_step = 0
-
-    global_step = 0
-    all_traces = []
-    skipped_pairs = []
-    
-    # Storage for final summary
-    pair_summaries = []
-
-    # Ensure lookback matches training
-    lookback = CONFIG.get("rl_lookback", 30)
-    
-    for pair in pairs:
-        print(f"\n{'='*70}")
-        print(f"Testing pair: {pair[0]} - {pair[1]}")
-        print(f"{'='*70}")
-
-        # 1. Data Validation
-        if pair[0] not in holdout_prices.columns or pair[1] not in holdout_prices.columns:
-            print(f"⚠️ Warning: Tickers {pair} not found in holdout data - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Data not found", "severity": "skip"})
-            continue
-
-        series_x = holdout_prices[pair[0]].dropna()
-        series_y = holdout_prices[pair[1]].dropna()
-        aligned = pd.concat([series_x, series_y], axis=1).dropna()
-
-        # Ensure we have enough data for Lookback + Warmup + At least 1 trade step
-        if len(aligned) < lookback + warmup_steps + 1:
-            print(f"⚠️ Insufficient data ({len(aligned)} steps total). Needs {lookback + warmup_steps + 1} - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Insufficient data", "severity": "skip"})
-            continue
-
-        # 2. Model Loading
-        model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
-        if not os.path.exists(model_path):
-            print(f"⚠️ Model not found - skipping")
-            skipped_pairs.append({"pair": f"{pair[0]}-{pair[1]}", "reason": "Model not found", "severity": "skip"})
-            continue
-
-        model = operator.load_model(model_path)
-        print(f"  ✓ Model loaded")
-
-        # 3. Environment Setup (Test Mode)
-        env = PairTradingEnv(
-            series_x=aligned.iloc[:, 0], 
-            series_y=aligned.iloc[:, 1], 
-            lookback=lookback, 
-            initial_capital=10000,
-            transaction_cost_rate=0.0005, 
-            test_mode=True
-        )
-
-        episode_traces = []
-        local_step = 0
-        obs, info = env.reset() 
-
-        # ==============================================================================
-        # WARM-UP PHASE
-        # ==============================================================================
-        print(f"  ⏳ Warming up model state on {warmup_steps} steps of history...")
+        df["returns"] = df.groupby("ticker")["adj_close"].pct_change()
+        df["log_returns"] = np.log1p(df["returns"])
         
-        # Initialize LSTM states
-        lstm_states = None
-        episode_starts = np.ones((1,), dtype=bool)
-        
-        warmup_completed = True
-        
-        # Run the model to update states, BUT ignore results/pnl
-        for i in range(warmup_steps):
-            if env.idx >= len(env.spread_np) - 1:
-                print("  ⚠️ Data ended during warm-up. Skipping pair.")
-                warmup_completed = False
-                break 
-                
-            action, lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
+        for window in windows:
+            days = window * 5
+            df[f"volatility_{window}w"] = df.groupby("ticker")["returns"].transform(
+                lambda x: x.rolling(days, min_periods=max(1, days//2)).std()
             )
-            
-            obs, _, done, _, _ = env.step(action)
-            episode_starts = np.array([done])
-            
-            if done:
-                warmup_completed = False
-                break
-        
-        if not warmup_completed:
-            continue
-
-        # ==============================================================================
-        # FINANCIAL RESET (Prepare for Real Trading)
-        # ==============================================================================
-        env.cash = env.initial_capital
-        env.portfolio_value = env.initial_capital
-        env.realized_pnl = 0.0 
-        env.unrealized_pnl = 0.0 
-        env.num_trades = 0
-        env.trade_history = []
-        env.peak_value = env.initial_capital
-        
-        # Force Flat Position to ensure clean start
-        if env.position != 0:
-            env.position = 0
-            env.entry_spread = 0.0
-            env.days_in_position = 0
-
-        print(f"  ✓ Warm-up complete. Financials reset. Trading starts at Index {env.idx}.")
-
-        # ==============================================================================
-        # MAIN TRADING LOOP
-        # ==============================================================================
-        terminated = False
-        stop_triggered = False
-        
-        while not terminated:
-            
-            # Predict using the warmed-up lstm_states
-            action, lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
+            df[f"momentum_{window}w"] = df.groupby("ticker")["adj_close"].transform(
+                lambda x: x.pct_change(days)
             )
-            
-            obs, reward, terminated, _, info = env.step(action)
-            episode_starts = np.array([terminated])
 
-            # --- Trace Logging ---
-            trace = {
-                "pair": f"{pair[0]}-{pair[1]}",
-                "step": global_step,
-                "local_step": local_step,
-                "reward": float(reward),
-                "portfolio_value": float(info.get("portfolio_value", 0.0)),
-                "cum_return": float(info.get("cum_return", 0.0)),
-                "position": float(info.get("position", 0)),
-                "max_drawdown": float(info.get("drawdown", 0)),
-                "cash": float(info.get("cash", 0.0)),
-                "realized_pnl": float(info.get("realized_pnl", 0.0)),
-                "unrealized_pnl": float(info.get("unrealized_pnl", 0.0)),
-                "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
-                "transaction_costs": float(info.get("transaction_costs", 0.0)),
-                "entry_spread": float(info.get("entry_spread", 0.0)),
-                "current_spread": float(info.get("current_spread", 0.0)),
-                "z_score": float(info.get("z_score", 0.0)), 
-                "days_in_position": int(info.get("days_in_position", 0)),
-                "daily_return": float(info.get("daily_return", 0.0)),
-                "num_trades": int(info.get("num_trades", 0)),
-                "trade_occurred": bool(info.get("trade_occurred", False)),
-                "risk_exit": bool(info.get("risk_exit", False)),
-                "price_x": float(info.get("price_x", 0.0)),
-                "price_y": float(info.get("price_y", 0.0))
-            }
-
-            episode_traces.append(trace)
-            all_traces.append(trace)
-            operator.add_trace(trace)
-            
-            if hasattr(operator, 'save_detailed_trace'):
-                operator.save_detailed_trace(trace)
-                
-            if operator.logger:
-                operator.logger.log("operator", "holdout_step", trace)
-
-            # --- Supervisor Monitoring ---
-            if local_step > 0 and local_step % check_interval == 0:
-                decision = supervisor.check_operator_performance(
-                    episode_traces, 
-                    pair, 
-                    phase="holdout"
-                )
-                
-                if decision["action"] == "stop":
-                    severity = decision.get("severity", "critical")
-                    print(f"\n⛔ SUPERVISOR INTERVENTION [{severity.upper()}]: Stopping pair early")
-                    print(f"    Reason: {decision['reason']}")
-                    
-                    skip_info = {
-                        "pair": f"{pair[0]}-{pair[1]}",
-                        "reason": decision['reason'],
-                        "severity": severity,
-                        "step_stopped": global_step,
-                        "metrics": decision['metrics']
-                    }
-                    skipped_pairs.append(skip_info)
-                    
-                    if operator.logger:
-                        operator.logger.log("supervisor", "intervention", skip_info)
-                    
-                    stop_triggered = True
-                    break # Break out of the WHILE loop, proceed to metrics calculation below
-                
-                elif decision["action"] == "adjust":
-                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
-
-            local_step += 1
-            global_step += 1
-            operator.current_step = global_step
-
-        # End of Pair Loop - Reporting Phase
-        if stop_triggered:
-            print(f"⏭️  Pair stopped early at step {local_step} due to Supervisor Intervention.")
-        else:
-            print(f"  ✓ Complete: {len(episode_traces)} steps")
-        
-        # ==============================================================================
-        # DETAILED METRICS REPORTING
-        # ==============================================================================
-        if len(episode_traces) > 0:
-            # 1. Calculate Metrics (works for partial or full episodes)
-            sharpe = calculate_sharpe(episode_traces)
-            sortino = calculate_sortino(episode_traces)
-            final_return = episode_traces[-1]['cum_return'] * 100
-            max_dd = episode_traces[-1]['max_drawdown']
-            
-            # 2. Position Analysis
-            positions = [t['position'] for t in episode_traces]
-            
-            # 3. Print Results
-            print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Final Return: {final_return:.2f}%")
-            print(f"  Max Drawdown: {max_dd:.2%}")
-            print(f"  Sharpe Ratio: {sharpe:.3f}")
-            print(f"  Sortino Ratio: {sortino:.3f}")
-            
-            # Win Rate (Bonus Metric)
-            # Filter steps where a PnL was actually realized (trade closed or flipped)
-            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
-            if len(pnl_events) > 0:
-                wins = len([p for p in pnl_events if p > 0])
-                win_rate = (wins / len(pnl_events)) * 100
-                print(f"  Win Rate: {win_rate:.1f}% ({len(pnl_events)} realized trades)")
+        if "sector" in df.columns:
+            if self.industry_encoder is None:
+                self.industry_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                industry_encoded = self.industry_encoder.fit_transform(df[["sector"]])
             else:
-                win_rate = 0.0
-                print(f"  Win Rate: N/A (0 trades)")
+                industry_encoded = self.industry_encoder.transform(df[["sector"]])
+                
+            ind_cols = [f"ind_{i}" for i in range(industry_encoded.shape[1])]
+            ind_df = pd.DataFrame(industry_encoded, columns=ind_cols, index=df.index)
+            df = pd.concat([df, ind_df], axis=1)
+            df.drop(columns=["sector"], inplace=True, errors="ignore")
+        
+        df.fillna(0.0, inplace=True)
+        
+        exclude = ["date", "ticker", "close", "adj_factor", "split_factor", "volume", "adj_close"]
+        numeric_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+        
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+            if train_end_date:
+                train_mask = df["date"] < pd.to_datetime(train_end_date)
+                self.scaler.fit(df.loc[train_mask, numeric_cols])
+            else:
+                self.scaler.fit(df[numeric_cols])
+        
+        df[numeric_cols] = self.scaler.transform(df[numeric_cols])
+        self.node_features = df
+        return df
 
-            # Position Distribution
-            print(f"  Position Distribution:")
-            for pos in [-100, 0, 100]:
-                count = np.sum(np.array(positions) == pos)
-                pct = count / len(positions) * 100
-                # Map value to readable name
-                name = "Flat"
-                if pos > 0: name = "Long"
-                elif pos < 0: name = "Short"
-                print(f"    {name} ({int(pos)}): {pct:.1f}% of time")
+    def prepare_data(self, train_end_date: str = None):
+        if train_end_date is None:
+            last_date = self.df["date"].max()
+            train_end_date = last_date - pd.DateOffset(months=self.holdout_months)
+        
+        train_end = pd.to_datetime(train_end_date)
+        self.build_node_features(train_end_date=train_end)
+        
+        df = self.node_features.copy()
+        self.tickers = sorted(df["ticker"].unique())
+        self.ticker_to_idx = {t: i for i, t in enumerate(self.tickers)}
+        
+        last_date = df["date"].max()
+        mid_point = train_end + (last_date - train_end) / 2
+        
+        self.train_df = df[df["date"] < train_end].copy()
+        self.val_df = df[(df["date"] >= train_end) & (df["date"] < mid_point)].copy()
+        self.test_df = df[df["date"] >= mid_point].copy()
+        
+        return self.train_df, self.val_df, self.test_df
 
-            # Store for final summary - Includes stopped pairs
-            pair_summaries.append({
-                "pair": f"{pair[0]}-{pair[1]}",
-                "return": final_return,
-                "sharpe": sharpe,
-                "drawdown": max_dd,
-                "trades": env.num_trades,
-                "win_rate": win_rate if len(pnl_events) > 0 else 0.0,
-                "status": "STOPPED" if stop_triggered else "COMPLETE"
-            })
+    # ------------------------------------------------------------------------
+    # Graph Construction (Shifted Targets)
+    # ------------------------------------------------------------------------
 
-            # Logging
-            if operator.logger:
-                final_pnl = episode_traces[-1].get('realized_pnl', 0)
-                operator.logger.log("operator", "episode_complete", {
-                    "pair": f"{pair[0]}-{pair[1]}",
-                    "total_steps": len(episode_traces),
-                    "final_cum_return": final_return,
-                    "total_pnl": final_pnl,
-                    "sharpe": sharpe,
-                    "sortino": sortino,
-                    "was_stopped": stop_triggered
-                })
+    def build_shifted_snapshots(self, df: pd.DataFrame, window_days: int = 20, mode='train'):
+        df = df.sort_values('date')
+        returns_pivot = df.pivot(index='date', columns='ticker', values='log_returns').fillna(0)
+        returns_pivot = returns_pivot.reindex(columns=self.tickers, fill_value=0)
+        
+        dates = returns_pivot.index
+        snapshots = []
+        step = 5 if mode == 'train' else 10
+        forecast_days = self.forecast_horizon * 5
+        
+        for i in range(window_days, len(dates) - forecast_days, step):
+            current_date = dates[i]
             
-    print("\n" + "="*80)
-    print("HOLDOUT TESTING COMPLETE: SUMMARY")
-    print("="*80)
-    print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Max DD':<8} | {'Win Rate':<8}")
-    print("-" * 80)
-    
-    total_ret = 0
-    for s in pair_summaries:
-        status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
-        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
-        total_ret += s['return']
-        
-    avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
-    print("-" * 80)
-    print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
-    print("="*80)
-    print(f"Total steps simulated: {global_step}")
-    
-    return all_traces, skipped_pairs
+            # 1. Input Graph (Past)
+            start_idx = i - window_days
+            past_returns = returns_pivot.iloc[start_idx : i+1]
+            corr_matrix = np.nan_to_num(past_returns.corr().values)
+            
+            input_edges = np.argwhere(np.abs(corr_matrix) >= 0.5)
+            input_edges = input_edges[input_edges[:, 0] < input_edges[:, 1]]
+            
+            if len(input_edges) == 0:
+                 edge_index = torch.empty((2, 0), dtype=torch.long)
+                 edge_weights = torch.empty(0, dtype=torch.float)
+            else:
+                 edge_index = torch.tensor(input_edges.T, dtype=torch.long)
+                 edge_weights = torch.tensor([corr_matrix[u,v] for u,v in input_edges], dtype=torch.float)
 
-def calculate_sharpe(traces, risk_free_rate=None):
-    if risk_free_rate is None:
-        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t.get('daily_return', 0.0) for t in traces])
-    if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252.0
-    excess_returns = returns - rf_daily
-    mean_excess = np.mean(excess_returns)
-    std_excess = np.std(excess_returns, ddof=1)
-    if std_excess < 1e-9: return 0.0
-    return (mean_excess / std_excess) * np.sqrt(252)
+            # 2. Target Graph (Future)
+            target_start = i + 1
+            target_end = i + 1 + forecast_days
+            future_returns = returns_pivot.iloc[target_start : target_end]
+            
+            if len(future_returns) < 2: continue
+            
+            future_corr = np.nan_to_num(future_returns.corr().values)
+            pos_edges = np.argwhere(np.abs(future_corr) >= self.corr_threshold)
+            pos_edges = pos_edges[pos_edges[:, 0] < pos_edges[:, 1]]
+            
+            snapshots.append({
+                'date': current_date,
+                'edge_index': edge_index,
+                'edge_weights': edge_weights,
+                'target_pos_pairs': torch.tensor(pos_edges.T, dtype=torch.long)
+            })
+            
+        return snapshots
 
-def calculate_sortino(traces, risk_free_rate=None):
-    if risk_free_rate is None:
-        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
-    returns = np.array([t.get('daily_return', 0.0) for t in traces])
-    if len(returns) < 2: return 0.0
-    rf_daily = risk_free_rate / 252.0
-    excess_returns = returns - rf_daily
-    mean_excess = np.mean(excess_returns)
-    
-    # Sortino uses downside deviation of excess returns below 0
-    downside_returns = excess_returns[excess_returns < 0]
-    
-    if len(downside_returns) == 0:
-        return 0.0
+    def create_snapshot_features(self, df: pd.DataFrame, snapshot_date):
+        exclude = ["date", "ticker", "close", "adj_factor", "split_factor", "volume", "adj_close", "div_amount"]
+        feature_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
         
-    downside_deviation = np.sqrt(np.mean(downside_returns**2))
-    if downside_deviation < 1e-9: return 0.0    
-    return (mean_excess / downside_deviation) * np.sqrt(252)
+        snapshot_df = df[df['date'] <= snapshot_date].groupby('ticker').tail(1)
+        node_features = snapshot_df.set_index('ticker')[feature_cols].reindex(self.tickers).fillna(0.0)
+        return torch.tensor(node_features.values, dtype=torch.float)
+
+    # ------------------------------------------------------------------------
+    # Training Loop
+    # ------------------------------------------------------------------------
+
+    def train(self, epochs: int = 20, lr: float = 0.001):
+        seed = CONFIG.get("random_seed", 42)
+        torch.manual_seed(seed)
+        
+        if self.train_df is None: raise ValueError("Call prepare_data() first")
+
+        # Initialize Model
+        sample_feat = self.create_snapshot_features(self.train_df, self.train_df['date'].iloc[0])
+        self.model = EnhancedTGNN(
+            node_dim=sample_feat.shape[1],
+            hidden_dim=self.hidden_dim,
+            num_heads=self.num_heads
+        ).to(self.device)
+        
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        
+        print("Building temporal snapshots...")
+        train_snapshots = self.build_shifted_snapshots(self.train_df, self.lookback_weeks * 5, mode='train')
+        val_snapshots = self.build_shifted_snapshots(self.val_df, self.lookback_weeks * 5, mode='val')
+        
+        print(f"Training on {len(train_snapshots)} snapshots, Validating on {len(val_snapshots)}")
+        
+        best_val_loss = float('inf')
+        patience = 6
+        
+        for epoch in range(epochs):
+            self.model.train()
+            train_loss = 0.0
+            hidden_state = None 
+            
+            for snap in train_snapshots:
+                x = self.create_snapshot_features(self.train_df, snap['date']).to(self.device)
+                edge_index = snap['edge_index'].to(self.device)
+                edge_weights = snap['edge_weights'].to(self.device)
+                target_pos = snap['target_pos_pairs'].to(self.device)
+                
+                h_in = hidden_state.detach() if hidden_state is not None else None
+                embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, h_in)
+                
+                if target_pos.size(1) == 0: continue
+
+                # Negative Sampling
+                num_pos = target_pos.size(1)
+                # Sample 1:1 negatives
+                neg_src = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
+                neg_dst = torch.randint(0, len(self.tickers), (num_pos,), device=self.device)
+                neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
+                
+                # --- CHANGE: Compute Binary Loss ---
+                loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                
+                train_loss += loss.item()
+
+            avg_train_loss = train_loss / len(train_snapshots)
+            
+            # --- VALIDATE ---
+            self.model.eval()
+            val_loss = 0.0
+            hidden_state = None
+            
+            with torch.no_grad():
+                for snap in val_snapshots:
+                    x = self.create_snapshot_features(self.val_df, snap['date']).to(self.device)
+                    edge_index = snap['edge_index'].to(self.device)
+                    edge_weights = snap['edge_weights'].to(self.device)
+                    target_pos = snap['target_pos_pairs'].to(self.device)
+                    
+                    embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, hidden_state)
+                    
+                    if target_pos.size(1) == 0: continue
+                    
+                    neg_src = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
+                    neg_dst = torch.randint(0, len(self.tickers), (target_pos.size(1) * 2,), device=self.device)
+                    neg_pairs = torch.stack([neg_src, neg_dst], dim=0)
+                    
+                    loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
+                    val_loss += loss.item()
+            
+            avg_val_loss = val_loss / len(val_snapshots)
+            
+            status = "no_improvement"
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                status = "improved"
+                patience = 6
+            else:
+                patience -= 1
+                
+            print(f"Epoch {epoch+1} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | {status}")
+            
+            self._log_event("training_status", {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "status": status,
+                "best_loss": best_val_loss,
+                "patience_left": patience
+            })
+            
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+
+    # ------------------------------------------------------------------------
+    # Inference (Vectorized + Probability)
+    # ------------------------------------------------------------------------
+
+    def score_pairs(self, use_validation: bool = True, top_k: int = 100):
+        if self.model is None: raise ValueError("Model not trained")
+        
+        df = self.val_df if use_validation else self.test_df
+        
+        self.model.eval()
+        print(f"\nScoring pairs...")
+        
+        snapshots = self.build_shifted_snapshots(df, self.lookback_weeks * 5, mode='val')
+        if not snapshots: return pd.DataFrame()
+        
+        hidden_state = None
+        
+        # Run history to build memory
+        with torch.no_grad():
+            for snap in snapshots[:-1]:
+                x = self.create_snapshot_features(df, snap['date']).to(self.device)
+                idx = snap['edge_index'].to(self.device)
+                w = snap['edge_weights'].to(self.device)
+                _, hidden_state = self.model.forward_snapshot(x, idx, w, hidden_state)
+            
+            last_snap = snapshots[-1]
+            x = self.create_snapshot_features(df, last_snap['date']).to(self.device)
+            idx = last_snap['edge_index'].to(self.device)
+            w = last_snap['edge_weights'].to(self.device)
+            
+            embeddings, _ = self.model.forward_snapshot(x, idx, w, hidden_state)
+            
+            # Raw scores (Logits)
+            logit_matrix = self.model.get_all_scores_matrix(embeddings)
+            
+            # Convert to Probability (Sigmoid) for "Real Pair" confidence
+            prob_matrix = torch.sigmoid(logit_matrix)
+            
+            # Mask diagonal/duplicates
+            mask = torch.triu(torch.ones_like(prob_matrix), diagonal=1).bool()
+            
+            # We want specific values, not just top K relative.
+            # But to keep output manageable, we take top K sorted by probability.
+            prob_matrix[~mask] = -1.0 # Filter out invalid
+            
+            top_vals, top_flat_indices = torch.topk(prob_matrix.flatten(), k=top_k)
+            
+            rows = top_flat_indices // prob_matrix.size(1)
+            cols = top_flat_indices % prob_matrix.size(1)
+            
+            results = []
+            for r, c, score in zip(rows.cpu().numpy(), cols.cpu().numpy(), top_vals.cpu().numpy()):
+                if score > 0.0: # Only keep positive probabilities
+                    results.append({
+                        'x': self.tickers[r],
+                        'y': self.tickers[c],
+                        'score': float(score), # This is now a probability (0.0 - 1.0)
+                        'date': last_snap['date']
+                    })
+                
+        results_df = pd.DataFrame(results)
+        print(f"✅ Scored {len(results_df)} pairs.")
+        return results_df
