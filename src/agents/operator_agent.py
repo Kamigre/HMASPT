@@ -280,14 +280,14 @@ class PairTradingEnv(gym.Env):
         
         # anti-alignment = penalize
         if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
-            reward -= 0.02
+            reward -= 0.1
         
         # pro-alignment = encourage
         if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
-            reward += 0.02
+            reward += 0.1
         
         # --- Clip for stability --------------------------------------
-        reward = float(np.clip(reward, -1.0, 1.0))
+        reward = float(np.tanh(reward))
         
         # 8. Index
         if not is_last_step:
