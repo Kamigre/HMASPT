@@ -59,7 +59,7 @@ CONFIG = {
     "rl_policy": "MlpLstmPolicy",
     "windows": [1, 2, 4],
     "rl_timesteps": 100000,
-    "half_life_max": 40,
+    "half_life_max": 30,
     "rl_lookback": 30,
     "shock_prob": 0.01,
     "shock_scale": 0.4,
