@@ -680,6 +680,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         # ==============================================================================
         env.cash = env.initial_capital
         env.portfolio_value = env.initial_capital
+        env.prev_portfolio_value = env.initial_capital
         env.realized_pnl = 0.0 
         env.unrealized_pnl = 0.0 
         env.num_trades = 0
