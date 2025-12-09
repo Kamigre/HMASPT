@@ -9,7 +9,7 @@ import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
-from concurrent.futures import ProcessPoolExecutor, as_completed # <--- CHANGED IMPORT
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
 
@@ -357,7 +357,7 @@ class PairTradingEnv(gym.Env):
         terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
-        
+       
 @dataclass
 class OperatorAgent:
     
@@ -404,10 +404,7 @@ class OperatorAgent:
                       lookback: int = None, timesteps: int = None, 
                       shock_prob: float = None, shock_scale: float = None,
                       use_curriculum: bool = False):
-        """
-        Original serial training method. Kept for backward compatibility or single-pair debugging.
-        For batch training, use `train_operator_on_pairs` below.
-        """
+
         # Get seed from CONFIG
         seed = CONFIG.get("random_seed", 42)
                             
@@ -455,7 +452,7 @@ class OperatorAgent:
             gamma=0.99,
             ent_coef=0.04,
             verbose=1,
-            device="auto", # OK for single serial run, but use "cpu" for parallel
+            device="auto",
             seed=seed,
             policy_kwargs=policy_kwargs 
         )
@@ -546,164 +543,38 @@ class OperatorAgent:
             f.write(json.dumps(trace, default=str) + "\n")
 
 
-# ==============================================================================
-# SAFE MULTIPROCESSING WORKER FUNCTION
-# ==============================================================================
-def train_pair_worker(pair, prices_df, storage_dir, config_overrides):
-    """
-    Standalone worker function for ProcessPoolExecutor.
-    Forces CPU usage to prevent GPU OOM crashes in Colab during parallel training.
-    """
-    # Imports must be local to avoid pickling issues in some environments
-    import os
-    import torch
-    from sb3_contrib import RecurrentPPO
-    
-    # 1. Unpack args
-    x, y = pair
-    lookback = config_overrides.get("rl_lookback", 30)
-    timesteps = config_overrides.get("rl_timesteps", 100000)
-    seed = config_overrides.get("random_seed", 42)
-    
-    # 2. Check Data
-    if x not in prices_df.columns or y not in prices_df.columns:
-        return {"status": "skipped", "pair": pair, "reason": "Missing data"}
-
-    series_x = prices_df[x]
-    series_y = prices_df[y]
-
-    # 3. SAFETY CRITICAL: Force CPU
-    # In Colab, multiple processes sharing one GPU will crash immediately.
-    device = "cpu" 
-
-    # 4. Setup Environment
-    # Ensure PairTradingEnv is available here (it is, because it's in the same file)
-    try:
-        env = PairTradingEnv(
-            series_x, series_y, lookback, 
-            position_scale=100, 
-            transaction_cost_rate=0.0005, 
-            test_mode=False
-        )
-        env.reset(seed=seed)
-
-        # 5. Define Model
-        policy_kwargs = dict(lstm_hidden_size=512, n_lstm_layers=1)
-        
-        # verbose=0 keeps the console clean during parallel runs
-        model = RecurrentPPO(
-            "MlpLstmPolicy",
-            env,
-            learning_rate=0.001,
-            n_steps=4096,
-            batch_size=256,
-            n_epochs=10,
-            gamma=0.99,
-            ent_coef=0.04,
-            verbose=0, 
-            device=device, # <--- SAFETY LOCK
-            seed=seed,
-            policy_kwargs=policy_kwargs 
-        )
-
-        # 6. Train
-        model.learn(total_timesteps=timesteps)
-        
-        # 7. Save
-        save_path = os.path.join(storage_dir, f"operator_model_{x}_{y}.zip")
-        model.save(save_path)
-        
-        # 8. Calculate Final Return for Reporting
-        final_return = (env.portfolio_value / env.initial_capital - 1) * 100
-        
-        return {
-            "pair": (x, y),
-            "cum_return": final_return,
-            "status": "success",
-            "model_path": save_path
-        }
-        
-    except Exception as e:
-        return {
-            "pair": (x, y),
-            "status": "failed",
-            "error": str(e)
-        }
-
-
 def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
-                          pairs: list, max_workers: int = None):
+                        pairs: list, max_workers: int = None):
 
-    # In Colab, typically 2 vCPUs are available. Using ProcessPool uses them fully.
     if max_workers is None:
-        max_workers = os.cpu_count()
-
-    print(f"\n{'='*70}")
-    print(f"PARALLEL TRAINING STARTED")
-    print(f"Mode: Multiprocessing (ProcessPoolExecutor)")
-    print(f"Workers: {max_workers}")
-    print(f"Device: CPU (Forced for safety)")
-    print(f"{'='*70}")
+        max_workers = CONFIG.get("max_workers", 2)
 
     all_traces = []
-    
-    # Create a config dict (Pickle-safe)
-    rl_config = {
-        "rl_lookback": CONFIG.get("rl_lookback", 30),
-        "rl_timesteps": CONFIG.get("rl_timesteps", 500000),
-        "random_seed": CONFIG.get("random_seed", 42)
-    }
 
-    # Start the Process Pool
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        
-        # Submit all tasks
-        futures = {
-            executor.submit(
-                train_pair_worker, 
-                pair, 
-                prices, 
-                operator.storage_dir, 
-                rl_config
-            ): pair for pair in pairs
-        }
+    def train(pair):
+        x, y = pair
+        return operator.train_on_pair(prices, x, y)
 
-        # Monitor progress
-        for f in tqdm(as_completed(futures), total=len(pairs), desc="Training Pairs"):
-            pair = futures[f]
-            try:
-                result = f.result()
-                
-                if result['status'] == 'success':
-                    all_traces.append(result)
-                    
-                    # Log to the main logger (which lives in the main process)
-                    if operator.logger:
-                        operator.logger.log("operator", "pair_trained", result)
-                        
-                    # Print brief status
-                    print(f"  ✅ {pair[0]}-{pair[1]}: {result['cum_return']:.2f}%")
-                    
-                elif result['status'] == 'skipped':
-                    print(f"  ⚠️ {pair[0]}-{pair[1]}: Skipped ({result.get('reason')})")
-                    
-                else:
-                    print(f"  ❌ {pair[0]}-{pair[1]}: Failed ({result.get('error')})")
-                    
-            except Exception as e:
-                print(f"  ❌ CRITICAL SYSTEM ERROR on {pair}: {e}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(train, pair) for pair in pairs]
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Operator Training"):
+            result = f.result()
+            if result:
+                all_traces.append(result)
 
-    # Save summary
     save_path = os.path.join(operator.storage_dir, "all_operator_traces.json")
     with open(save_path, "w") as f:
         json.dump(all_traces, f, indent=2, default=str)
 
+    if operator.logger:
+        operator.logger.log("operator", "batch_training_complete", {"n_pairs": len(all_traces)})
+    
     print("\n" + "="*70)
     print("TRAINING SUMMARY")
     print("="*70)
     for trace in all_traces:
         print(f"{trace['pair'][0]}-{trace['pair'][1]}: "
-              f"Return={trace['cum_return']:.2f}%")
+              f"Return={trace['cum_return']:.2f}%, Sharpe={trace['sharpe']:.2f}")
     print("="*70)
     
     return all_traces
