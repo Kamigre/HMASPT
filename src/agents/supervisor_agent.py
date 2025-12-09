@@ -198,13 +198,26 @@ class SupervisorAgent:
                         'metrics': metrics
                     }
 
-        # 2. Hard Drawdown Kill (> 20%)
+        # 2. Hard Drawdown Kill (> 10%)
         # Explicit kill switch regardless of strikes
-        if metrics['drawdown'] > 0.20:
+        if metrics['drawdown'] > 0.10:
              return {
                 'action': 'stop',
                 'severity': 'critical',
-                'reason': f'Hard Stop: Drawdown {metrics["drawdown"]:.1%} > 20%',
+                'reason': f'Hard Stop: Drawdown {metrics["drawdown"]:.1%} > 10%',
+                'metrics': metrics
+            }
+
+        # 3. Trailing Profit Stop
+        # If we were ever up by > 5%, lock in at least break-even
+        peak_return = max([t['cum_return'] for t in operator_traces])
+        current_return = latest_trace['cum_return']
+
+        if peak_return > 0.05 and current_return < 0.01:
+             return {
+                'action': 'stop',
+                'severity': 'warning',
+                'reason': f'Trailing Stop: Gave back profit (Peak: {peak_return:.1%}, Now: {current_return:.1%})',
                 'metrics': metrics
             }
 
@@ -232,10 +245,10 @@ class SupervisorAgent:
         violation = False
         violation_reason = ""
         
-        # Warning Threshold: 10% Drawdown
-        if metrics['drawdown'] > 0.10: 
+        # Warning Threshold: 5% Drawdown
+        if metrics['drawdown'] > 0.05: 
             violation = True
-            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 10%"
+            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 5%"
         
         # Efficiency Threshold: Bad Sharpe after 15 days
         elif metrics['sharpe'] < -1.5 and days_in_pos > 15: 
@@ -267,8 +280,8 @@ class SupervisorAgent:
                     'metrics': metrics
                 }
         else:
-            # Heal strikes if performance recovers (drawdown < 5%)
-            if self.monitoring_state[pair_key]['strikes'] > 0 and metrics['drawdown'] < 0.05:
+            # Heal strikes if performance recovers (drawdown < 2.5% - half of warning)
+            if self.monitoring_state[pair_key]['strikes'] > 0 and metrics['drawdown'] < 0.025:
                 self.monitoring_state[pair_key]['strikes'] -= 1
                 
         return {
