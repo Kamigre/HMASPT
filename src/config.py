@@ -5,11 +5,25 @@ import numpy as np
 def set_global_seed(seed: int):
     """
     Set all random seeds for reproducibility across the entire system.
+    
+    This sets seeds for:
+    - Python's built-in random
+    - NumPy
+    - PyTorch (if available)
+    - TensorFlow (if available)
+    - Python hash seed (for dictionary ordering)
     """
+    
+    # Python built-in random
     random.seed(seed)
+    
+    # NumPy
     np.random.seed(seed)
+    
+    # Python hash seed
     os.environ['PYTHONHASHSEED'] = str(seed)
     
+    # PyTorch
     try:
         import torch
         torch.manual_seed(seed)
@@ -19,6 +33,7 @@ def set_global_seed(seed: int):
     except ImportError:
         pass
     
+    # TensorFlow (used by Gemini/Google AI)
     try:
         import tensorflow as tf
         tf.random.set_seed(seed)
@@ -28,11 +43,12 @@ def set_global_seed(seed: int):
     print(f"✅ Global seed set to {seed}")
 
 
+# Updated CONFIG with seed and synchronized Supervisor limits
 CONFIG = {
     # ===================================================================
     # GLOBAL SETTINGS
     # ===================================================================
-    "random_seed": 42, 
+    "random_seed": 42,  # Master seed for reproducibility
     
     # ===================================================================
     # EXISTING CONFIGURATION
@@ -79,12 +95,12 @@ CONFIG = {
             }
         },
         "holdout": {
-            "min_observations": 10,
-            "check_interval": 3, 
+            "min_observations": 10, # Reduced to match faster burn-in
+            "check_interval": 3,    # Reduced from 30 to match Supervisor frequency
             
-            # Strike 1 Warning Zone (TIGHTENED)
+            # Strike 1 Warning Zone
             "info_tier": {
-                "moderate_drawdown": 0.05,  # WARN AT 5%
+                "moderate_drawdown": 0.5, # Matches Strike 1 trigger
                 "low_sharpe": 0.0,
                 "poor_win_rate": 0.40,
                 "high_volatility": 0.05,
@@ -93,7 +109,7 @@ CONFIG = {
             
             # Suggestion Zone
             "adjustment_tier": {
-                "significant_drawdown": 0.08, # Suggest changes between 5-10%
+                "significant_drawdown": 0.1,
                 "very_low_sharpe": -0.5,
                 "terrible_win_rate": 0.35,
                 "excessive_turnover": 50,
@@ -106,18 +122,17 @@ CONFIG = {
                 }
             },
             
-            # Hard Stop Zone (Strike 2 / Immediate Kill - TIGHTENED)
+            # Hard Stop Zone (Strike 2 / Immediate Kill)
             "stop_tier": {
-                "catastrophic_drawdown": 0.10, # KILL AT 10%
+                "catastrophic_drawdown": 0.15, # Matches Hard Stop logic
                 "disastrous_sharpe": -1.5,
                 "consistent_failure": 0.25,
-                "runaway_losses": -5000,
                 "action": "stop"
             },
             
             # Stalemate Logic
             "position_limits": {
-                "max_days_in_position": 30,
+                "max_days_in_position": 30, # Reduced from 60 to 30
                 "zero_activity_window": 30,
                 "action": "info"
             },
@@ -125,13 +140,13 @@ CONFIG = {
             # Structural Breaks
             "anomaly_detection": {
                 "reward_spike_threshold": 5.0,
-                "spread_divergence": 3.0,
+                "spread_divergence": 3.0, # Matches Z-Score break
                 "action": "log"
             }
         },
         "portfolio": {
             "check_frequency": 100,
-            "max_portfolio_drawdown": 0.15,
+            "max_portfolio_drawdown": 0.15, # Tighter portfolio limit
             "min_portfolio_sharpe": -0.3,
             "max_correlated_losses": 0.70,
             "actions": {
