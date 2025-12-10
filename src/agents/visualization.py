@@ -28,7 +28,6 @@ class PortfolioVisualizer:
     """
     Creates institutional-grade visual reports for pairs trading performance.
     Features homogenized styling, intelligent data summarization, and AI Text Reports.
-    Handles both flat and nested (message-bus style) trace logs.
     """
     
     def __init__(self, output_dir: str = "reports"):
@@ -53,67 +52,36 @@ class PortfolioVisualizer:
             'asset_y': '#7f8c8d'        # Grey for Asset Y
         }
     
-    def _normalize_traces(self, traces: List[Dict]) -> List[Dict]:
-        """
-        Helper to flatten traces if they are nested inside a 'details' key 
-        (common in message bus logs).
-        """
-        normalized = []
-        for t in traces:
-            # Check if this is a nested log entry (has 'details')
-            if 'details' in t and isinstance(t['details'], dict):
-                # Flatten: merge top-level keys (like timestamp) with inner details
-                base = {k: v for k, v in t.items() if k != 'details'}
-                flat_trace = {**base, **t['details']}
-                normalized.append(flat_trace)
-            else:
-                normalized.append(t)
-        return normalized
-
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
+        """
+        Create detailed visualization for a single pair including Z-Score and Drawdown analysis.
+        """
         if len(traces) == 0:
             return
         
-        # 1. Flatten Data
-        flat_traces = self._normalize_traces(traces)
+        # --- Data Prep ---
+        df = pd.DataFrame(traces)
         
-        # 2. Filter for relevant step data only
-        # We only want traces that actually have price/pnl data
-        valid_traces = [t for t in flat_traces if 'cum_return' in t or 'portfolio_value' in t]
-        
-        if not valid_traces:
-            print(f"⚠️ No valid trading steps found for {pair_name}")
-            return
-
-        df = pd.DataFrame(valid_traces)
-        
-        # 3. Fill missing columns for robustness
+        # Fill missing columns for robustness
         required_cols = {
             'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
             'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
-            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'local_step': 0
+            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0
         }
         for col, val in required_cols.items():
             if col not in df.columns: df[col] = val
 
-        # Ensure local_step is sorted
-        if 'local_step' in df.columns:
-            df = df.sort_values('local_step')
-        
         steps = df['local_step']
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
-        # Recalculate cumulative PnL if missing/zero but steps exist
-        if df['realized_pnl'].sum() == 0 and df['realized_pnl_this_step'].abs().sum() > 0:
-             df['realized_pnl'] = df['realized_pnl_this_step'].cumsum()
-
         trades_entry = df[df['trade_occurred'] == True] 
         forced_exit = df[df['forced_close'] == True]
 
-        # Win Rate Logic
+        # --- Win Rate Logic (Per Pair) ---
         closed_trades_mask = df['realized_pnl_this_step'] != 0
         closed_trades_df = df[closed_trades_mask].copy()
+        
         closed_trades_df['net_trade_pnl'] = closed_trades_df['realized_pnl_this_step'] - closed_trades_df['transaction_costs']
         
         total_closed_trades = len(closed_trades_df)
@@ -131,17 +99,18 @@ class PortfolioVisualizer:
         fig = plt.figure(figsize=(20, 14))
         gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.4, wspace=0.3)
         
+        # Title
         status_color = self.colors['loss'] if was_skipped else self.colors['primary']
-        reason_str = skip_info.get('reason', 'Unknown') if skip_info else ""
-        status_text = f" | STOPPED: {reason_str}" if was_skipped else ""
-        
+        status_text = f" | STOPPED: {skip_info['reason']}" if was_skipped and skip_info else ""
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
                      fontsize=22, weight='bold', color=status_color, y=0.96)
 
-        # Equity Curve 
+        # 1. Equity Curve
         ax1 = fig.add_subplot(gs[0, :3])
         ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
+        
+        # Fill
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
@@ -156,11 +125,11 @@ class PortfolioVisualizer:
         ax1.legend(loc='upper left', frameon=True)
         ax1.grid(True, alpha=0.3)
 
-        # Scorecard
+        # 2. Scorecard
         ax2 = fig.add_subplot(gs[0, 3])
         ax2.axis('off')
         
-        metrics_list = [
+        metrics = [
             ("Total P&L", f"${total_pnl:,.2f}", self.colors['profit'] if total_pnl > 0 else self.colors['loss']),
             ("Return", f"{final_ret*100:+.2f}%", self.colors['profit'] if final_ret > 0 else self.colors['loss']),
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
@@ -172,18 +141,23 @@ class PortfolioVisualizer:
         y_pos = 0.9
         ax2.text(0.5, 1.0, "Key Metrics", ha='center', fontsize=18, weight='bold', color=self.colors['primary'])
         
-        for label, value, color in metrics_list:
+        for label, value, color in metrics:
             ax2.text(0.1, y_pos, label, ha='left', fontsize=14, color=self.colors['neutral'])
             ax2.text(0.9, y_pos, value, ha='right', fontsize=15, weight='bold', color=color)
             ax2.plot([0.1, 0.9], [y_pos-0.05, y_pos-0.05], color='#ecf0f1', lw=1.5)
             y_pos -= 0.15
 
-        # Z-Score & Position
+        # 3. Z-Score & Position
         ax3 = fig.add_subplot(gs[1, :])
+        
         if 'z_score' in df.columns:
             zscore = df['z_score']
             ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score')
-        
+        elif 'current_spread' in df.columns:
+            spread = df['current_spread']
+            zscore = (spread - spread.rolling(30).mean()) / (spread.rolling(30).std() + 1e-8)
+            ax3.plot(steps, zscore, color=self.colors['zscore'], alpha=0.8, lw=1.5, label='Spread Z-Score (Est)')
+
         ax3.axhline(2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         ax3.axhline(-2.0, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         ax3.axhline(0, color=self.colors['primary'], lw=1)
@@ -195,7 +169,7 @@ class PortfolioVisualizer:
         ax3b.grid(False)
         ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
 
-        # Drawdown
+        # 4. Drawdown
         ax4 = fig.add_subplot(gs[2, :2])
         ax4.fill_between(steps, 0, -df['drawdown_pct'], color=self.colors['drawdown'], alpha=0.3)
         ax4.plot(steps, -df['drawdown_pct'], color=self.colors['drawdown'], lw=1.5)
@@ -203,7 +177,7 @@ class PortfolioVisualizer:
         ax4.set_ylabel('Drawdown %')
         ax4.grid(True, alpha=0.3)
 
-        # Daily Returns
+        # 5. Daily Returns
         ax5 = fig.add_subplot(gs[2, 2:])
         if not df[df['daily_return'] != 0].empty:
             sns.histplot(df[df['daily_return'] != 0]['daily_return'], kde=True, ax=ax5, color=self.colors['primary'], alpha=0.6)
@@ -211,7 +185,7 @@ class PortfolioVisualizer:
         ax5.set_title('Daily Returns Distribution', loc='left')
         ax5.set_xlabel('Return')
 
-        # Cumulative P&L
+        # 6. Cumulative P&L
         ax6 = fig.add_subplot(gs[3, :])
         cum_pnl = df['realized_pnl']
         ax6.plot(steps, cum_pnl, color=self.colors['primary'], lw=2)
@@ -220,6 +194,7 @@ class PortfolioVisualizer:
         ax6.set_title('Cumulative Realized P&L ($)', loc='left')
         ax6.grid(True, alpha=0.3)
 
+        # Save
         filename = f"{pair_name.replace('-', '_')}_analysis.png"
         filepath = os.path.join(self.output_dir, "pairs", filename)
         plt.savefig(filepath)
@@ -227,18 +202,15 @@ class PortfolioVisualizer:
         print(f"    📊 Saved pair analysis: {filepath}")
 
     def visualize_pair_behavior(self, traces: List[Dict], pair_name: str):
+        """
+        Creates a 'Behavior Analysis' report comparing Price Action vs Strategy Returns.
+        """
         if not traces: return
-        
-        # 1. Flatten
-        flat_traces = self._normalize_traces(traces)
-        df = pd.DataFrame(flat_traces)
+        df = pd.DataFrame(traces)
         
         if 'price_x' not in df.columns or 'price_y' not in df.columns:
-            return # Skip if no price data found
-
-        # Ensure local_step is sorted
-        if 'local_step' in df.columns:
-            df = df.sort_values('local_step')
+            print(f"⚠️ Cannot generate behavior report for {pair_name}: Missing raw price data.")
+            return
 
         df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
         df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
@@ -259,8 +231,6 @@ class PortfolioVisualizer:
         plt.setp(ax1.get_xticklabels(), visible=False)
 
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        if 'cum_return' not in df.columns: df['cum_return'] = 0.0
-        
         cum_ret_pct = df['cum_return'] * 100
         ax2.plot(df['local_step'], cum_ret_pct, color=self.colors['primary'], lw=2, label="Strategy Return %")
         
@@ -281,33 +251,32 @@ class PortfolioVisualizer:
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
-        Create aggregated portfolio dashboard. 
-        Flatten traces -> Filter -> Pivot on PnL Steps -> Cumsum
+        Create aggregated portfolio dashboard with improved Correlation analysis AND
+        Correctly calculated Portfolio-Wide Maximum Drawdown.
         """
         metrics = final_summary['metrics']
-        pair_summaries = metrics.get('pair_summaries', [])
+        pair_summaries = metrics['pair_summaries']
         
-        # 1. Flatten Data
-        flat_traces = self._normalize_traces(all_traces)
-        
-        # 2. Filter for actual step data (exclude training events, summary events)
-        # We need rows that contain 'pair' and 'realized_pnl_this_step'
-        df_all = pd.DataFrame(flat_traces)
-        
+        # --- Data Processing ---
+        df_all = pd.DataFrame(all_traces)
         if df_all.empty:
             print("⚠️ No traces to visualize.")
             return
 
-        # Check required columns. If they don't exist, we can't plot portfolio curves.
-        if 'pair' not in df_all.columns:
-            print("⚠️ Trace data missing 'pair' column. Skipping portfolio aggregation.")
-            return
+        if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
+        if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
 
-        if 'realized_pnl_this_step' not in df_all.columns:
-            # Fallback: maybe we only have empty traces or non-trading traces
-            print("⚠️ Trace data missing 'realized_pnl_this_step'. Skipping portfolio curves.")
-            df_all['realized_pnl_this_step'] = 0.0
+        # --- Global Win Rate Logic ---
+        trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
+        trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
         
+        total_global_trades = len(trade_events)
+        if total_global_trades > 0:
+            global_wins = (trade_events['net_pnl'] > 0).sum()
+            global_win_rate = global_wins / total_global_trades
+        else:
+            global_win_rate = 0.0
+
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
 
         # Total Capital Est
@@ -317,47 +286,37 @@ class PortfolioVisualizer:
             total_capital = 10000 * len(df_all['pair'].unique())
         total_capital = max(total_capital, 1.0) 
 
-        # --- SAFE PIVOT ---
-        # We pivot on 'realized_pnl_this_step' because it is usually always present 
-        # in step logs, whereas 'realized_pnl' (cumulative) might be missing.
-        try:
-            # Fill NaNs with 0 to allow pivot even if some steps are missing
-            df_pivot = df_all.fillna({'realized_pnl_this_step': 0.0})
-            
-            pnl_step_matrix = df_pivot.pivot_table(
-                index=time_col, 
-                columns='pair', 
-                values='realized_pnl_this_step', 
-                aggfunc='sum'
-            )
-            pnl_step_matrix = pnl_step_matrix.fillna(0.0)
-            pnl_matrix = pnl_step_matrix.cumsum() # Reconstruct cumulative PnL
-            
-        except Exception as e:
-            print(f"⚠️ Error pivoting PnL data: {e}")
-            pnl_matrix = pd.DataFrame()
+        # P&L Matrix (Cumulative PnL per pair over time)
+        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
+        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
         
         # Portfolio Curve
-        if not pnl_matrix.empty:
-            total_portfolio_pnl_dollars = pnl_matrix.sum(axis=1)
-            portfolio_return_pct = (total_portfolio_pnl_dollars / total_capital) * 100
-            portfolio_equity_curve = 100 + portfolio_return_pct
-        else:
-            portfolio_equity_curve = pd.Series([100])
+        total_portfolio_pnl_dollars = pnl_matrix.sum(axis=1)
+        portfolio_return_pct = (total_portfolio_pnl_dollars / total_capital) * 100
+        portfolio_equity_curve = 100 + portfolio_return_pct
+
+        # --- NEW: CALCULATE AGGREGATE PORTFOLIO MAX DRAWDOWN ---
+        # 1. Calculate High Water Mark (Running Max)
+        running_max = portfolio_equity_curve.cummax()
+        # 2. Calculate Drawdown Series
+        dd_series = (portfolio_equity_curve - running_max) / running_max
+        # 3. Get Max Drawdown (Scalar)
+        portfolio_max_dd = abs(dd_series.min())
+        
+        print(f"    ℹ️  Calculated Global Portfolio Max Drawdown: {portfolio_max_dd*100:.2f}%")
+        # -------------------------------------------------------
 
         # --- Figure Setup ---
         fig = plt.figure(figsize=(22, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
         
-        final_pnl = metrics.get('total_pnl', 0.0)
-        final_pct = metrics.get('avg_return', 0.0) * 100 
-        if 'cum_return' in metrics:
-             final_pct = metrics['cum_return'] * 100
+        final_pnl = total_portfolio_pnl_dollars.iloc[-1]
+        final_pct = portfolio_return_pct.iloc[-1]
         
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
-        # 1. Main Equity Curve 
+        # 1. Main Equity Curve
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
@@ -391,8 +350,7 @@ class PortfolioVisualizer:
 
         ax2 = fig.add_subplot(gs[1, :])
         colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
-        if pair_names:
-            bars = ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
+        bars = ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
         ax2.axhline(0, color='black', lw=1)
         ax2.set_title("Individual Pair Contribution (%)", loc='left')
         ax2.set_ylabel("Return %")
@@ -400,23 +358,24 @@ class PortfolioVisualizer:
         if len(pair_names) > 10:
             plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
 
-        # 3. Correlation Analysis 
-        if not pnl_matrix.empty and pnl_matrix.shape[1] > 1:
-            pnl_changes = pnl_matrix.diff().fillna(0.0)
+        # 3. Correlation Analysis
+        pnl_changes = pnl_matrix.diff().fillna(0.0)
+        
+        if pnl_changes.shape[1] > 1:
             corr_matrix = pnl_changes.corr()
             mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
             
             # 3a. Histogram
             corr_values = corr_matrix.where(mask).stack().values
             ax3 = fig.add_subplot(gs[2, 0])
-            if len(corr_values) > 0:
-                sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
-                ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
-                ax3.legend()
+            sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
             ax3.set_title("Diversification Health (Correlation Dist.)", loc='left')
             ax3.set_xlabel("Pairwise Correlation")
             ax3.set_ylabel("Frequency")
-            
+            if len(corr_values) > 0:
+                ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
+                ax3.legend()
+
             # 3b. Top Risk Table
             corr_stacked = corr_matrix.where(mask).stack()
             corr_stacked.index.names = ['Pair A', 'Pair B'] 
@@ -441,6 +400,7 @@ class PortfolioVisualizer:
                               loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
             table.auto_set_font_size(False)
             table.set_fontsize(11)
+            
         else:
             ax3 = fig.add_subplot(gs[2, :2])
             ax3.text(0.5, 0.5, "Insufficient Data for Correlation Analysis", ha='center', fontsize=14)
@@ -449,8 +409,7 @@ class PortfolioVisualizer:
         # 4. Max Drawdown Distribution
         ax5 = fig.add_subplot(gs[2, 2])
         pair_dds = [p['max_drawdown']*100 for p in pair_summaries]
-        if pair_dds:
-            sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+        sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
         ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
         ax5.set_xlabel("Drawdown %")
 
@@ -459,16 +418,17 @@ class PortfolioVisualizer:
         ax6.axis('off')
         
         flat_metrics = [
-            ("Total Net P&L", f"${metrics.get('total_pnl', 0):,.2f}"),
+            ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
-            ("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}"),
-            ("Win Rate", f"{metrics.get('win_rate', 0)*100:.2f}%"),
-            ("Portfolio Max DD", f"{metrics.get('max_drawdown', 0)*100:.2f}%"),
-            ("VaR (95%)", f"{metrics.get('var_95', 0):.4f}"),
+            ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
+            ("Win Rate", f"{global_win_rate*100:.2f}%"),
+            ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
+            ("VaR (95%)", f"{metrics['var_95']:.4f}"),
             ("Active Pairs", f"{len(pair_names)}"),
             ("Skipped Pairs", f"{len(skipped_names)}")
         ]
         
+        col_count = 4
         row_count = 2
         cell_text = [ [] for _ in range(row_count) ]
         
@@ -497,9 +457,15 @@ class PortfolioVisualizer:
         print(f"\n📊 Saved portfolio dashboard: {filepath}")
     
     def visualize_executive_summary(self, explanation_text: str):
+        """
+        Creates a dedicated Executive Summary card with the Gemini explanation.
+        Optimized to dynamically resize height so text is never cut off.
+        """
         if not explanation_text:
             return
 
+        # 1. Formatting and Wrapping text first to calculate size
+        # Increased width to 100 characters for better fit
         wrapper = textwrap.TextWrapper(width=100, replace_whitespace=False)
         formatted_text = ""
         
@@ -508,20 +474,28 @@ class PortfolioVisualizer:
             if p.strip():
                 formatted_text += "\n".join(wrapper.wrap(p)) + "\n\n"
         
+        # 2. Calculate required height
+        # Estimate: Base height + (Lines * Height per line)
         num_lines = formatted_text.count('\n')
-        estimated_height = max(10, 4 + (num_lines * 0.4)) 
+        estimated_height = max(10, 4 + (num_lines * 0.4)) # 0.4 inch per line buffer
 
+        # 3. Create Figure with Dynamic Height
         fig = plt.figure(figsize=(18, estimated_height))
         fig.patch.set_facecolor(self.colors['text_bg'])
         ax = fig.add_subplot(111)
         ax.axis('off')
 
+        # 4. Render Text
+        # Header
         ax.text(0.05, 0.98, "Risk Manager: Executive Summary", 
                  fontsize=24, weight='bold', color=self.colors['primary'], va='top', ha='left')
         
+        # Body (Aligned Top-Left)
+        # We start slightly lower (0.92) to leave room for header
         ax.text(0.05, 0.92, formatted_text, 
                  fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
 
+        # Footer
         ax.text(0.5, 0.02, "Generated by AI Supervisor Agent", 
                  fontsize=12, color=self.colors['neutral'], ha='center', va='bottom')
 
@@ -532,6 +506,7 @@ class PortfolioVisualizer:
         print(f"📄 Saved executive summary: {filepath}")
 
     def _calculate_sharpe(self, returns):
+        """Calculates the Annualized Sharpe Ratio."""
         if len(returns) < 2: return 0.0
         rf = CONFIG.get("risk_free_rate", 0.04) / 252 
         exc = np.array(returns) - rf
@@ -542,31 +517,26 @@ def generate_all_visualizations(all_traces: List[Dict],
                                  skipped_pairs: List[Dict],
                                  final_summary: Dict,
                                  output_dir: str = "reports"):
+    """
+    Generate complete visual report for portfolio and all pairs.
+    """
     print("\n" + "="*70)
     print("GENERATING VISUAL REPORTS")
     print("="*70)
     
     visualizer = PortfolioVisualizer(output_dir)
     
-    # 1. Normalize traces (flatten if necessary) right at the start
-    flat_traces = visualizer._normalize_traces(all_traces)
-    
-    # Group by pair
+    # Group traces by pair
     traces_by_pair = {}
-    for t in flat_traces:
-        # Check if it's a trade step with a pair identifier
-        if 'pair' in t:
-            pair = t['pair']
-            if pair not in traces_by_pair:
-                traces_by_pair[pair] = []
-            traces_by_pair[pair].append(t)
+    for t in all_traces:
+        pair = t['pair']
+        if pair not in traces_by_pair:
+            traces_by_pair[pair] = []
+        traces_by_pair[pair].append(t)
     
     # Generate individual pair reports
     print("\n📊 Generating pair-level reports...")
     for pair_name, traces in traces_by_pair.items():
-        # Skip pairs with no actual data points
-        if not traces: continue
-            
         skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
         was_skipped = skip_info is not None
         
@@ -575,7 +545,6 @@ def generate_all_visualizations(all_traces: List[Dict],
     
     # Generate portfolio aggregate
     print("\n📊 Generating portfolio aggregate report...")
-    # Pass original traces; visualizer handles normalization internally again if needed
     visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
     
     # Generate Executive Summary Text Card
