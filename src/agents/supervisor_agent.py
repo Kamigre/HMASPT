@@ -173,6 +173,7 @@ class SupervisorAgent:
         else:
             self.monitoring_state[pair_key]['grace_period'] = False
 
+        # Calculate LIVE metrics (only for immediate monitoring)
         metrics = self._compute_live_metrics(operator_traces)
         
         # ============================================================
@@ -279,6 +280,7 @@ class SupervisorAgent:
         }
         
     def _compute_live_metrics(self, traces):
+        """Simple lightweight calculation for live monitoring only."""
         returns = [t.get("daily_return", 0) for t in traces]
         portfolio_values = [t.get("portfolio_value", 0) for t in traces]
         
@@ -287,9 +289,16 @@ class SupervisorAgent:
         
         drawdown = (peak_pv - current_pv) / max(peak_pv, 1e-8)
         
+        # Approximation for live check
+        if len(returns) < 2: 
+            sharpe = 0.0
+        else:
+            std = np.std(returns, ddof=1)
+            sharpe = (np.mean(returns) / std * np.sqrt(252)) if std > 1e-8 else 0.0
+
         return {
             'drawdown': drawdown,
-            'sharpe': self._calculate_sharpe(returns),
+            'sharpe': sharpe,
             'total_steps': len(traces)
         }
 
@@ -298,104 +307,116 @@ class SupervisorAgent:
     # ===================================================================
     
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Evaluate complete portfolio performance."""
+        """
+        Evaluate complete portfolio performance by extracting PRE-CALCULATED
+        metrics from the Operator's output.
+        """
         
         # Group traces by pair
         traces_by_pair = {}
         for t in operator_traces:
-            traces_by_pair.setdefault(t['pair'], []).append(t)
-
-        all_returns = []
-        all_pnls = []
-        pair_summaries = []
-
-        # Process each pair
-        for pair, traces in traces_by_pair.items():
-            pair_returns = []
-            pair_pnls = []
+            pair = t.get('pair')
+            # Handle cases where pair might be a tuple or string "A-B"
+            if isinstance(pair, (list, tuple)):
+                pair_str = f"{pair[0]}-{pair[1]}"
+            else:
+                pair_str = str(pair)
             
-            # Sort traces by step just in case they are out of order
-            traces = sorted(traces, key=lambda x: x['step'])
+            traces_by_pair.setdefault(pair_str, []).append(t)
 
-            for i in range(1, len(traces)):
-                pnl = traces[i].get("realized_pnl_this_step", 0)
+        pair_summaries = []
+        global_pnl = 0.0
+        global_returns_acc = [] # Just for global VaR/CVaR if needed
+        total_steps = 0
+        
+        # Iterate through pairs and extract Operator's calculated metrics
+        for pair_str, traces in traces_by_pair.items():
+            
+            # Sort traces to ensure we get the final state
+            sorted_traces = sorted(traces, key=lambda x: x.get('step', 0))
+            final_trace = sorted_traces[-1]
+            
+            # 1. Identify where the metrics are stored.
+            # They might be in a dedicated "holdout_complete" event or embedded in the last trace
+            # Logic: We prefer explicit pre-calculated keys.
+            
+            # Default values (safe fallbacks)
+            p_metrics = {
+                "sharpe": 0.0,
+                "sortino": 0.0, 
+                "win_rate": 0.0,
+                "max_drawdown": 0.0,
+                "final_return": 0.0,
+                "total_trades": 0
+            }
+            
+            # Try to find a trace that looks like a Summary/Metrics object
+            summary_trace = next((t for t in sorted_traces if "sharpe" in t and "win_rate" in t), None)
+            
+            if summary_trace:
+                # Option A: We found a dedicated summary trace (from train_on_pairs or holdout_metrics)
+                p_metrics["sharpe"] = summary_trace.get("sharpe", 0.0)
+                p_metrics["sortino"] = summary_trace.get("sortino", 0.0)
+                p_metrics["win_rate"] = summary_trace.get("win_rate", 0.0)
+                p_metrics["max_drawdown"] = summary_trace.get("max_drawdown", 0.0)
                 
-                pv_curr = traces[i].get("portfolio_value", 0)
-                pv_prev = traces[i-1].get("portfolio_value", 0)
+                # Check for various keys for return (cum_return vs final_return)
+                p_metrics["final_return"] = summary_trace.get("final_return", summary_trace.get("cum_return", 0.0))
                 
-                if pv_prev > 0:
-                    ret = (pv_curr - pv_prev) / pv_prev
-                else:
-                    ret = 0.0
+            else:
+                # Option B: We only have step traces. Extract cumulative values from the last step.
+                # Operator instructions say "Take them from operator", implying we shouldn't recalculate.
+                # However, step traces usually have cumulative return/drawdown maintained by the Env.
+                p_metrics["final_return"] = final_trace.get("cum_return", 0.0) * 100 # usually stored as decimal in step, % in summary
+                p_metrics["max_drawdown"] = final_trace.get("max_drawdown", 0.0)
                 
-                pair_returns.append(ret)
-                all_returns.append(ret)
-                
-                pair_pnls.append(pnl)
-                all_pnls.append(pnl)
-
-            # Pair stats
-            initial = traces[0]['portfolio_value']
-            final = traces[-1]['portfolio_value']
-            cum_ret = (final - initial) / initial if initial > 0 else 0
+                # If Sharpe isn't in the step trace, we leave it as 0.0 or mark as N/A to obey "no calc" rule,
+                # but we will try to look for the 'sharpe' key just in case it was added to the last step.
+                if "sharpe" in final_trace:
+                     p_metrics["sharpe"] = final_trace["sharpe"]
+            
+            # PnL Calculation (Summing realized PnL from steps is reliable)
+            pair_pnl = sum(t.get("realized_pnl_this_step", 0) for t in traces)
+            global_pnl += pair_pnl
+            total_steps += len(traces)
             
             pair_summaries.append({
-                "pair": pair,
-                "total_pnl": sum(pair_pnls),
-                "cum_return": cum_ret,
-                "sharpe": self._calculate_sharpe(pair_returns),
-                "sortino": self._calculate_sortino(pair_returns),
-                "max_drawdown": max([t.get("max_drawdown", 0) for t in traces] + [0]),
+                "pair": pair_str,
+                "total_pnl": pair_pnl,
+                "cum_return": p_metrics["final_return"],
+                "sharpe": p_metrics["sharpe"],
+                "sortino": p_metrics["sortino"],
+                "max_drawdown": p_metrics["max_drawdown"],
+                "win_rate": p_metrics["win_rate"],
                 "steps": len(traces)
             })
 
-        # Global stats
+        # Global stats aggregation (averaging pair metrics where appropriate)
+        if pair_summaries:
+            avg_sharpe = float(np.mean([p['sharpe'] for p in pair_summaries]))
+            avg_sortino = float(np.mean([p['sortino'] for p in pair_summaries]))
+            avg_return = float(np.mean([p['cum_return'] for p in pair_summaries]))
+            avg_win_rate = float(np.mean([p['win_rate'] for p in pair_summaries]))
+            max_dd_global = max([p['max_drawdown'] for p in pair_summaries] + [0])
+        else:
+            avg_sharpe = 0.0
+            avg_sortino = 0.0
+            avg_return = 0.0
+            avg_win_rate = 0.0
+            max_dd_global = 0.0
+
         metrics = {
-            "total_pnl": sum(all_pnls),
-            "sharpe_ratio": self._calculate_sharpe(all_returns),
-            "sortino_ratio": self._calculate_sortino(all_returns),
-            "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
-            "avg_return": float(np.mean(all_returns)) if all_returns else 0,
-            "total_steps": len(operator_traces),
+            "total_pnl": global_pnl,
+            "sharpe_ratio": avg_sharpe, # Average of Operator's Sharpes
+            "sortino_ratio": avg_sortino,
+            "max_drawdown": max_dd_global,
+            "avg_return": avg_return,
+            "win_rate": avg_win_rate,
+            "total_steps": total_steps,
             "n_pairs": len(traces_by_pair),
             "pair_summaries": pair_summaries
         }
         
-        # --- CORRECT WIN RATE CALCULATION (Matching Visualizer) ---
-        # Filter for steps where a trade was explicitly closed/adjusted
-        closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
-        if closed_trades:
-            # A win is defined as Positive PnL AFTER transaction costs
-            wins = sum(1 for t in closed_trades if (t.get("realized_pnl_this_step", 0) - t.get("transaction_costs", 0)) > 0)
-            metrics["win_rate"] = wins / len(closed_trades)
-        else:
-            metrics["win_rate"] = 0.0
-        
-        # Calculate Risk Metrics (VaR/CVaR)
-        if all_returns:
-            metrics["var_95"] = float(np.percentile(all_returns, 5))
-            tail_losses = [r for r in all_returns if r <= metrics["var_95"]]
-            metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
-        else:
-            metrics["var_95"] = 0.0
-            metrics["cvar_95"] = 0.0
-
-        # Additional activity metrics
-        metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
-        metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
-        metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
-        metrics["std_return"] = float(np.std(all_returns)) if all_returns else 0.0
-        metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
-        
-        # Store cumulative return properly
-        if operator_traces:
-            sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
-            start_pv = sorted_traces[0].get("portfolio_value", 0)
-            end_pv = sorted_traces[-1].get("portfolio_value", 0)
-            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0
-        else:
-            metrics["cum_return"] = 0.0
-
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
         
@@ -406,24 +427,9 @@ class SupervisorAgent:
         if metrics['max_drawdown'] > 0.30:
             actions.append({"action": "reduce_risk", "reason": "Portfolio drawdown > 30%", "severity": "high"})
         if metrics['sharpe_ratio'] < 0:
-            actions.append({"action": "halt_trading", "reason": "Negative Sharpe Ratio", "severity": "high"})
+            actions.append({"action": "halt_trading", "reason": "Negative Average Sharpe Ratio", "severity": "high"})
         return actions
         
-    def _calculate_sharpe(self, returns: List[float]) -> float:
-        if len(returns) < 2: return 0.0
-        rf = CONFIG.get("risk_free_rate", 0.04) / 252
-        exc = np.array(returns) - rf
-        std = np.std(exc, ddof=1)
-        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
-
-    def _calculate_sortino(self, returns: List[float]) -> float:
-        if len(returns) < 2: return 0.0
-        rf = CONFIG.get("risk_free_rate", 0.04) / 252
-        exc = np.array(returns) - rf
-        down = exc[exc < 0]
-        std = np.sqrt(np.mean(down**2)) if len(down) > 0 else 0.0
-        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
-
     def _generate_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
         if not self.use_gemini:
             return self._fallback_explanation(metrics, actions)
@@ -432,7 +438,8 @@ class SupervisorAgent:
                 You are the Chief Risk Officer (CRO) at a Quantitative Hedge Fund. 
                 Your mandate is capital preservation and risk-adjusted growth.
                 
-                Analyze the following Pairs Trading Portfolio results:
+                Analyze the following Pairs Trading Portfolio results.
+                NOTE: These metrics are aggregated from the Operator's pre-calculated execution logs.
                 
                 --- METRICS ---
                 {json.dumps(metrics, indent=2, default=str)}
@@ -446,18 +453,19 @@ class SupervisorAgent:
                 Structure your response into these three specific sections:
                 
                 ### 1. Performance Attribution
-                - Evaluate the quality of returns (Sharpe > 2.0 is target).
-                - Analyze the "Quality of Earnings": Compare Win Rate vs. Total PnL. (e.g., If Win Rate is high but PnL is low/negative, are we taking small profits and large losses?)
-                - Comment on the disparity between Average Return and Median Return (skewness).
+                - Evaluate the quality of returns (Average Sharpe > 2.0 is target).
+                - Analyze the "Quality of Earnings": Compare average Win Rate vs. Total PnL.
+                - Are we seeing consistent performance across pairs, or are outliers driving the stats?
                 
                 ### 2. Risk Decomposition
-                - Analyze Tail Risk: specific comment on Max Drawdown vs. VaR/CVaR (95%).
-                - Assess "Stalemate Risk": Look at 'avg_steps_per_pair'. Are we holding positions too long for a mean-reversion strategy?
-                - Identify if specific pairs are dragging down the aggregate (Concentration of loss).
+                - Analyze Tail Risk: Comment on the Max Drawdown relative to the average return.
+                - Assess "Stalemate Risk": Look at 'total_steps'. Are capital turnover rates healthy?
+                - Identify if specific pairs (in summary list) are failing.
                 
                 ### 3. CRO Verdict & Adjustments
                 - Review the AUTOMATED ACTIONS above. Do you concur, or do you recommend a manual override?
                 - Provide a final "Traffic Light" signal: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
+                
                 """
         
         try:
@@ -467,7 +475,7 @@ class SupervisorAgent:
             return self._fallback_explanation(metrics, actions)
 
     def _fallback_explanation(self, metrics, actions):
-        return f"Portfolio Sharpe: {metrics['sharpe_ratio']:.2f}. Drawdown: {metrics['max_drawdown']:.2%}. Win Rate: {metrics['win_rate']:.1%}."
+        return f"Portfolio Avg Sharpe: {metrics['sharpe_ratio']:.2f}. Max Drawdown: {metrics['max_drawdown']:.2%}. Avg Win Rate: {metrics['win_rate']:.1%}."
 
     def _basic_check(self, operator_traces, pair):
         return {"action": "continue", "reason": "basic_check_pass", "metrics": {}}
