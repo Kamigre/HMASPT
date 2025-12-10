@@ -400,14 +400,22 @@ class SupervisorAgent:
 
         # --- 4. CALCULATE GLOBAL METRICS ---
         
-        # Max Drawdown
+        # Max Drawdown (same as before)
         running_max = normalized_equity_curve.cummax()
         dd_series = (normalized_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
-        
+
+        # --- CONSISTENT TOTAL PNL / CUMULATIVE RETURN ---
+        # Compute total portfolio PnL directly from the dollar equity construction.
+        # This ensures total_pnl and cum_return are consistent and reflect the
+        # actual dollar change of the aggregated portfolio (realized + realized-from-diff).
+        final_capital = equity_curve_dollars.iloc[-1] if len(equity_curve_dollars) > 0 else inferred_initial_capital
+        total_portfolio_pnl = float(final_capital - inferred_initial_capital)
+
         # Basic Metrics
         metrics = {
-            "total_pnl": total_portfolio_realized_pnl,
+            # Use the aggregate dollar pnl as the canonical total_pnl
+            "total_pnl": total_portfolio_pnl,
             "sharpe_ratio": self._calculate_sharpe(global_returns),
             "sortino_ratio": self._calculate_sortino(global_returns),
             "max_drawdown": portfolio_max_dd, 
@@ -416,12 +424,12 @@ class SupervisorAgent:
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
         }
-        
+
         # --- 5. EXPORT CURVE DATA ---
         metrics["equity_curve"] = normalized_equity_curve.tolist()
         metrics["equity_curve_dates"] = normalized_equity_curve.index.tolist()
 
-        # --- 6. WIN RATE & RISK ---
+        # --- 6. WIN RATE & RISK (unchanged) ---
         if 'realized_pnl_this_step' in df_all.columns:
             closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
             if not closed_trades.empty:
@@ -440,8 +448,9 @@ class SupervisorAgent:
         else:
             metrics["var_95"] = 0.0; metrics["cvar_95"] = 0.0
 
-        # Final Cumulative Return
-        metrics["cum_return"] = (normalized_equity_curve.iloc[-1] - 100) / 100 if not normalized_equity_curve.empty else 0.0
+        # --- FINAL CUMULATIVE RETURN (now consistent with total_pnl/inferred_initial_capital) ---
+        # Return expressed as PnL / InitialCapital
+        metrics["cum_return"] = total_portfolio_pnl / inferred_initial_capital if inferred_initial_capital != 0 else 0.0
 
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
