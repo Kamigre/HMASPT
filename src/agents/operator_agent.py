@@ -664,7 +664,11 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "cum_return": float(info.get("cum_return", 0.0)),
                 "position": float(info.get("position", 0)),
                 "max_drawdown": float(info.get("drawdown", 0)),
+                
+                # --- PnL METRICS ---
+                "realized_pnl": float(info.get("realized_pnl", 0.0)),           # <--- ADDED: Accumulated PnL
                 "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
+                
                 "transaction_costs": float(info.get("transaction_costs", 0.0)),
                 "daily_return": float(info.get("daily_return", 0.0)),
                 "current_spread": float(info.get("current_spread", 0.0)),
@@ -712,6 +716,10 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['realized_pnl_this_step'] = forced_pnl
                         final_trace['transaction_costs'] = forced_cost
                         final_trace['portfolio_value'] = float(info.get("portfolio_value", trace['portfolio_value']))
+                        
+                        # --- UPDATE ACCUMULATED PnL IN FINAL TRACE ---
+                        final_trace['realized_pnl'] = float(info.get("realized_pnl", trace['realized_pnl'])) # <--- ADDED
+                        
                         final_trace['cum_return'] = float(info.get("cum_return", trace['cum_return']))
                         final_trace['max_drawdown'] = float(info.get("drawdown", trace['max_drawdown']))
                         final_trace['daily_return'] = float(info.get("daily_return", 0.0))
@@ -789,6 +797,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             print(f"  Sharpe Ratio:   {sharpe:.3f}")
             print(f"  Sortino Ratio:  {sortino:.3f}")
             print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
+            print(f"  Accum. PnL:     {episode_traces[-1]['realized_pnl']:.2f}") # <--- Optional: Print it for verification
             
             # Position Distribution
             positions = [t['position'] for t in episode_traces]
