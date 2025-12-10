@@ -666,7 +666,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "max_drawdown": round(float(info.get("drawdown", 0)), 2),
                 "realized_pnl_this_step": round(float(info.get("realized_pnl_this_step", 0.0)), 2),
                 "transaction_costs": round(float(info.get("transaction_costs", 0.0)), 2),
-                "daily_return": round(float(info.get("daily_return", 0.0)), 4), # 4 decimals for small daily returns
+                "daily_return": round(float(info.get("daily_return", 0.0)), 4), 
                 "current_spread": round(float(info.get("current_spread", 0.0)), 2),
                 "z_score": round(float(info.get("z_score", 0.0)), 2), 
                 "days_in_position": int(info.get("days_in_position", 0)),
@@ -710,6 +710,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['position'] = 0 # Flat
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
+                        
+                        # --- UPDATED: Ensure cumulative realized PnL reflects the forced close ---
+                        final_trace['realized_pnl'] = round(float(info.get("realized_pnl", trace['realized_pnl'] + forced_pnl)), 2)
+                        final_trace['unrealized_pnl'] = round(float(info.get("unrealized_pnl", 0.0)), 2)
+                        # ------------------------------------------------------------------------
+
                         final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
                         final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
                         final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
