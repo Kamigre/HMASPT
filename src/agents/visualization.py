@@ -534,6 +534,34 @@ class PortfolioVisualizer:
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
+    def _calculate_sortino(self, returns):
+            """Calculates the Annualized Sortino Ratio (Downside Risk only)."""
+            if len(returns) < 2: return 0.0
+            
+            # 1. Define Risk-Free Rate and Excess Returns
+            rf = CONFIG.get("risk_free_rate", 0.04) / 252 
+            returns_np = np.array(returns)
+            exc = returns_np - rf
+            avg_excess_return = np.mean(exc)
+            
+            # 2. Calculate Downside Deviation
+            # We only care about returns that fell BELOW the target (rf)
+            negative_excess_returns = exc[exc < 0]
+            
+            if len(negative_excess_returns) == 0:
+                # If there is no downside risk (no returns below rf), 
+                # Sortino is theoretically infinite. We cap it or return a high value.
+                return 10.0 if avg_excess_return > 0 else 0.0
+    
+            # ddof=1 for sample standard deviation
+            downside_std = np.std(negative_excess_returns, ddof=1)
+            
+            # 3. Calculate Ratio & Annualize
+            if downside_std > 1e-8:
+                return (avg_excess_return / downside_std) * np.sqrt(252)
+            else:
+                return 0.0
+
 def generate_all_visualizations(all_traces: List[Dict], 
                                  skipped_pairs: List[Dict],
                                  final_summary: Dict,
