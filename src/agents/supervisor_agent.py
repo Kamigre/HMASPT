@@ -354,13 +354,12 @@ class SupervisorAgent:
         global_returns_series = global_dollar_pnl / prev_capital
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         
+        # Clean returns list for metrics
+        global_returns = global_returns_series.tolist()
+        
         # Reconstruct the "Normalized" Equity Curve (Start at 100)
-        # We calculate directly on the Series now, removing the intermediate list conversion
         cum_returns = (1 + global_returns_series).cumprod()
         normalized_equity_curve = 100 * cum_returns
-        
-        # Optional: If you need the % return formatted specifically
-        portfolio_return_pct = normalized_equity_curve - 100
         
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
@@ -410,10 +409,10 @@ class SupervisorAgent:
         # Basic Metrics
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
-            "sharpe_ratio": self._calculate_sharpe(global_returns_series),
-            "sortino_ratio": self._calculate_sortino(global_returns_series),
+            "sharpe_ratio": self._calculate_sharpe(global_returns),
+            "sortino_ratio": self._calculate_sortino(global_returns),
             "max_drawdown": portfolio_max_dd, 
-            "avg_return": float(np.mean(global_returns_series)) if global_returns_series else 0.0,
+            "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
             "total_steps": len(df_all),
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
