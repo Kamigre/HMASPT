@@ -669,9 +669,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "daily_return": round(float(info.get("daily_return", 0.0)), 4), # 4 decimals for small daily returns
                 "current_spread": round(float(info.get("current_spread", 0.0)), 2),
                 "z_score": round(float(info.get("z_score", 0.0)), 2), 
-                "days_in_position": int(info.get("days_in_position", 0))
-                "price_x": round(float(info.get("price_x", 0), 2),
-                "price_y": round(float(info.get("price_y", 0), 2)
+                "days_in_position": int(info.get("days_in_position", 0)),
+                "price_x": round(float(info.get("price_x", 0.0)), 2),
+                "price_y": round(float(info.get("price_y", 0.0)), 2)
             }
 
             episode_traces.append(trace)
