@@ -93,6 +93,10 @@ class PortfolioVisualizer:
         else:
             win_rate = 0.0
             
+        # Ensure we use cumulative PnL properly. If realized_pnl column is 0 or missing but steps exist, reconstruct it
+        if df['realized_pnl'].sum() == 0 and df['realized_pnl_this_step'].abs().sum() > 0:
+             df['realized_pnl'] = df['realized_pnl_this_step'].cumsum()
+
         total_pnl = df['realized_pnl'].iloc[-1]
         final_ret = df['cum_return'].iloc[-1]
         total_entries = len(trades_entry)
@@ -108,7 +112,6 @@ class PortfolioVisualizer:
                      fontsize=22, weight='bold', color=status_color, y=0.96)
 
         # 1. Equity Curve 
-
         ax1 = fig.add_subplot(gs[0, :3])
         ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
@@ -255,7 +258,7 @@ class PortfolioVisualizer:
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard. 
-        CRITICAL: This uses the metrics ALREADY calculated in `final_summary` by the Supervisor.
+        CRITICAL: Uses 'realized_pnl_this_step' to reconstruct the matrix to avoid KeyErrors.
         """
         # Load pre-calculated metrics
         metrics = final_summary['metrics']
@@ -278,9 +281,12 @@ class PortfolioVisualizer:
             total_capital = 10000 * len(df_all['pair'].unique())
         total_capital = max(total_capital, 1.0) 
 
-        # P&L Matrix (Cumulative PnL per pair over time)
-        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
-        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
+        # --- FIX: P&L Matrix Reconstruction ---
+        # 1. Pivot on 'realized_pnl_this_step' (guaranteed to exist)
+        # 2. Cumsum to get cumulative PnL curve
+        pnl_step_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl_this_step', aggfunc='sum')
+        pnl_step_matrix = pnl_step_matrix.fillna(0.0)
+        pnl_matrix = pnl_step_matrix.cumsum()
         
         # Portfolio Curve
         total_portfolio_pnl_dollars = pnl_matrix.sum(axis=1)
@@ -303,7 +309,6 @@ class PortfolioVisualizer:
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
         # 1. Main Equity Curve 
-
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
