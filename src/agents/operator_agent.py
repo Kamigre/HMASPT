@@ -734,6 +734,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         all_traces.append(final_trace)
                         operator.add_trace(final_trace)
 
+                        terminated = True
+
                     stop_triggered = True
                     break # Exit loop
                 
