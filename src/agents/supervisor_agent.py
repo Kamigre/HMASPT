@@ -354,12 +354,13 @@ class SupervisorAgent:
         global_returns_series = global_dollar_pnl / prev_capital
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         
-        # Clean returns list for metrics
-        global_returns = global_returns_series.tolist()
-        
         # Reconstruct the "Normalized" Equity Curve (Start at 100)
+        # We calculate directly on the Series now, removing the intermediate list conversion
         cum_returns = (1 + global_returns_series).cumprod()
         normalized_equity_curve = 100 * cum_returns
+        
+        # Optional: If you need the % return formatted specifically
+        portfolio_return_pct = normalized_equity_curve - 100
         
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
