@@ -723,9 +723,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['unrealized_pnl'] = 0.0
                         # -----------------------------------------
 
-                        final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
-                        final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
-                        final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
+                        final_trace['portfolio_value'] = final_trace['realized_pnl'] + env.initial_capital
+                        final_trace['cum_return'] = final_trace['portfolio_value'] / env.initial_capital - 1
+                        final_trace['max_drawdown'] = calculate_drawdown_from_traces(episode_traces + [final_trace])
                         final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
                         final_trace['forced_close'] = True
                         
@@ -733,8 +733,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         episode_traces.append(final_trace)
                         all_traces.append(final_trace)
                         operator.add_trace(final_trace)
-
-                        terminated = True
 
                     stop_triggered = True
                     break # Exit loop
