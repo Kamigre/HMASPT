@@ -11,20 +11,14 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
-
-# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
-
-# ==============================================================================
-# 1. ENHANCED MODEL ARCHITECTURE (BCE Loss + Vectorization)
-# ==============================================================================
 
 class EnhancedTGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=64, num_heads=4, dropout=0.2):
         super().__init__()
         
-        # 1. Input Encoder
+        # Input Encoder
         self.node_encoder = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -32,17 +26,17 @@ class EnhancedTGNN(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # 2. Memory Gate (GRU Cell)
+        # Memory Gate (GRU Cell)
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         
-        # 3. Graph Attention Layers
+        # Graph Attention Layers
         self.gat1 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn1 = BatchNorm(hidden_dim)
         
         self.gat2 = GATv2Conv(hidden_dim, hidden_dim, heads=num_heads, concat=False, dropout=dropout, edge_dim=1)
         self.bn2 = BatchNorm(hidden_dim)
         
-        # 4. Pair Scorer Parameters (Bilinear Matrix)
+        # Pair Scorer Parameters (Bilinear Matrix)
         self.bilinear_W = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
         nn.init.xavier_uniform_(self.bilinear_W)
         
@@ -52,16 +46,17 @@ class EnhancedTGNN(nn.Module):
         self.criterion = nn.BCEWithLogitsLoss()
     
     def forward_snapshot(self, x, edge_index, edge_weight, hidden_state=None):
-        # A. Encode
+
+        # Encode
         h = self.node_encoder(x)
         
-        # B. Memory Update
+        # Memory Update
         if hidden_state is not None:
             h = self.gru(h, hidden_state)
         
         new_hidden_state = h.clone()
 
-        # C. Message Passing
+        # Message Passing
         if edge_index.numel() > 0:
             h_in = h
             h = self.gat1(h, edge_index, edge_attr=edge_weight)
@@ -76,16 +71,13 @@ class EnhancedTGNN(nn.Module):
             h = F.relu(h)
             h = h + h_in
 
-        # D. Normalize
+        # Normalize
         h_out = F.normalize(h, p=2, dim=1)
         
         return h_out, new_hidden_state
 
     def compute_binary_loss(self, embeddings, pos_pairs, neg_pairs):
-        """
-        Computes Binary Cross Entropy Loss.
-        Forces positive pairs -> 1.0 and negative pairs -> 0.0
-        """
+
         # Score Positive Pairs (Target = 1)
         pos_src = embeddings[pos_pairs[0]]
         pos_dst = embeddings[pos_pairs[1]]
@@ -106,21 +98,17 @@ class EnhancedTGNN(nn.Module):
         return self.criterion(all_scores, all_labels)
 
     def _score_vectors(self, src, dst):
-        """ Computes x_src * W * x_dst + Cosine(x_src, x_dst) """
+
         bilinear = torch.sum((src @ self.bilinear_W) * dst, dim=1)
         cosine = F.cosine_similarity(src, dst)
         return bilinear + cosine
 
     def get_all_scores_matrix(self, embeddings):
-        """ Vectorized Inference (Bilinear + Cosine) """
+
         weighted_emb = embeddings @ self.bilinear_W
         bilinear_scores = weighted_emb @ embeddings.T
         cosine_scores = embeddings @ embeddings.T
         return bilinear_scores + cosine_scores
-
-# ==============================================================================
-# 2. OPTIMIZED AGENT (Forecasting + Binary Selection)
-# ==============================================================================
 
 @dataclass
 class OptimizedSelectorAgent:
@@ -164,11 +152,7 @@ class OptimizedSelectorAgent:
         }
         with open(self.trace_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
-    
-    # ------------------------------------------------------------------------
-    # Feature Engineering
-    # ------------------------------------------------------------------------
-    
+  
     def build_node_features(self, windows=[1, 2, 4], train_end_date=None) -> pd.DataFrame:
         df = self.df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
         df["date"] = pd.to_datetime(df["date"])
@@ -215,6 +199,7 @@ class OptimizedSelectorAgent:
         return df
 
     def prepare_data(self, train_end_date: str = None):
+
         if train_end_date is None:
             last_date = self.df["date"].max()
             train_end_date = last_date - pd.DateOffset(months=self.holdout_months)
@@ -235,11 +220,8 @@ class OptimizedSelectorAgent:
         
         return self.train_df, self.val_df, self.test_df
 
-    # ------------------------------------------------------------------------
-    # Graph Construction
-    # ------------------------------------------------------------------------
-
     def build_shifted_snapshots(self, df: pd.DataFrame, window_days: int = 20, mode='train'):
+
         df = df.sort_values('date')
         returns_pivot = df.pivot(index='date', columns='ticker', values='log_returns').fillna(0)
         returns_pivot = returns_pivot.reindex(columns=self.tickers, fill_value=0)
@@ -252,7 +234,7 @@ class OptimizedSelectorAgent:
         for i in range(window_days, len(dates) - forecast_days, step):
             current_date = dates[i]
             
-            # 1. Input Graph (Past)
+            # Input Graph (Past)
             start_idx = i - window_days
             past_returns = returns_pivot.iloc[start_idx : i+1]
             corr_matrix = np.nan_to_num(past_returns.corr().values)
@@ -267,7 +249,7 @@ class OptimizedSelectorAgent:
                  edge_index = torch.tensor(input_edges.T, dtype=torch.long)
                  edge_weights = torch.tensor([corr_matrix[u,v] for u,v in input_edges], dtype=torch.float)
 
-            # 2. Target Graph (Future)
+            # Target Graph (Future)
             target_start = i + 1
             target_end = i + 1 + forecast_days
             future_returns = returns_pivot.iloc[target_start : target_end]
@@ -295,17 +277,12 @@ class OptimizedSelectorAgent:
         node_features = snapshot_df.set_index('ticker')[feature_cols].reindex(self.tickers).fillna(0.0)
         return torch.tensor(node_features.values, dtype=torch.float)
 
-    # ------------------------------------------------------------------------
-    # Training Loop (Hard Negatives + Grad Accumulation + BPTT)
-    # ------------------------------------------------------------------------
-
     def train(self, epochs: int = 20, lr: float = 0.001):
         seed = CONFIG.get("random_seed", 42)
         torch.manual_seed(seed)
         
         if self.train_df is None: raise ValueError("Call prepare_data() first")
 
-        # Initialize Model
         sample_feat = self.create_snapshot_features(self.train_df, self.train_df['date'].iloc[0])
         self.model = EnhancedTGNN(
             node_dim=sample_feat.shape[1],
@@ -339,14 +316,12 @@ class OptimizedSelectorAgent:
                 edge_weights = snap['edge_weights'].to(self.device)
                 target_pos = snap['target_pos_pairs'].to(self.device)
                 
-                # 1. Forward Pass
-                # Note: We do NOT detach hidden_state here inside the chunk. 
-                # We want gradients to flow through the chunk.
+                # Forward Pass
                 embeddings, hidden_state = self.model.forward_snapshot(x, edge_index, edge_weights, hidden_state)
                 
                 if target_pos.size(1) == 0: continue
 
-                # 2. Hard Negative Mining
+                # Hard Negative Mining
                 num_pos = target_pos.size(1)
                 num_easy = max(1, num_pos // 2)
                 neg_src_easy = torch.randint(0, len(self.tickers), (num_easy,), device=self.device)
@@ -362,21 +337,20 @@ class OptimizedSelectorAgent:
                 else:
                     neg_pairs = torch.cat([easy_neg_pairs, easy_neg_pairs], dim=1)
                 
-                # 3. Compute Loss
+                # Compute Loss
                 loss = self.model.compute_binary_loss(embeddings, target_pos, neg_pairs)
                 
-                # 4. Accumulate Loss (Do NOT backward yet)
-                # We divide by accumulation_steps so the magnitude of the gradient 
-                # is roughly the same as if we updated every step.
+                # Accumulate Loss (NOT backward yet)
                 loss_chunk = loss / self.accumulation_steps
                 accumulated_loss += loss_chunk
-                total_train_loss += loss.item() # For logging, we want the real loss
+                total_train_loss += loss.item()
 
-                # 5. Backward & Step (At the end of the chunk)
+                # Backward & Step (at the end of the chunk)
                 is_end_of_chunk = (i + 1) % self.accumulation_steps == 0
                 is_last_step = (i + 1) == len(train_snapshots)
 
                 if is_end_of_chunk or is_last_step:
+
                     # NOW we compute gradients. This backprops through the last N steps.
                     accumulated_loss.backward()
                     
@@ -394,7 +368,7 @@ class OptimizedSelectorAgent:
 
             avg_train_loss = total_train_loss / len(train_snapshots)
             
-            # --- VALIDATE ---
+            # Validation
             self.model.eval()
             val_loss = 0.0
             hidden_state = None
@@ -442,10 +416,6 @@ class OptimizedSelectorAgent:
                 print("Early stopping triggered.")
                 break
 
-    # ------------------------------------------------------------------------
-    # Inference (Vectorized + Probability)
-    # ------------------------------------------------------------------------
-
     def score_pairs(self, use_validation: bool = True, top_k: int = 100):
         if self.model is None: raise ValueError("Model not trained")
         
@@ -484,7 +454,7 @@ class OptimizedSelectorAgent:
             mask = torch.triu(torch.ones_like(prob_matrix), diagonal=1).bool()
             
             # We want specific values, not just top K relative.
-            prob_matrix[~mask] = -1.0 # Filter out invalid
+            prob_matrix[~mask] = -1.0
             
             top_vals, top_flat_indices = torch.topk(prob_matrix.flatten(), k=top_k)
             
@@ -493,11 +463,11 @@ class OptimizedSelectorAgent:
             
             results = []
             for r, c, score in zip(rows.cpu().numpy(), cols.cpu().numpy(), top_vals.cpu().numpy()):
-                if score > 0.0: # Only keep positive probabilities
+                if score > 0.0:
                     results.append({
                         'x': self.tickers[r],
                         'y': self.tickers[c],
-                        'score': float(score), # This is now a probability (0.0 - 1.0)
+                        'score': float(score),
                         'date': last_snap['date']
                     })
                 
