@@ -658,6 +658,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "pair": f"{pair[0]}-{pair[1]}",
                 "step": global_step,
                 "local_step": local_step,
+                "realized_pnl": round(float(info.get("realized_pnl", 0.0)), 2),
+                "unrealized_pnl": round(float(info.get("unrealized_pnl", 0.0)), 2),
                 "portfolio_value": round(float(info.get("portfolio_value", 0.0)), 2),
                 "cum_return": round(float(info.get("cum_return", 0.0)), 2),
                 "position": round(float(info.get("position", 0)), 2),
@@ -668,6 +670,8 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "current_spread": round(float(info.get("current_spread", 0.0)), 2),
                 "z_score": round(float(info.get("z_score", 0.0)), 2), 
                 "days_in_position": int(info.get("days_in_position", 0))
+                "price_x": round(float(info.get("price_x", 0), 2),
+                "price_y": round(float(info.get("price_y", 0), 2)
             }
 
             episode_traces.append(trace)
