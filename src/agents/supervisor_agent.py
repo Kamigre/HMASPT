@@ -232,13 +232,13 @@ class SupervisorAgent:
         violation = False
         violation_reason = ""
         
-        # Warning Threshold: 5% Drawdown
-        if metrics['drawdown'] > 0.05: 
+        # Warning Threshold: 10% Drawdown
+        if metrics['drawdown'] > 0.1: 
             violation = True
-            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 5%"
+            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 10%"
         
         # Efficiency Threshold: Bad Sharpe after 15 days
-        elif metrics['sharpe'] < -1.5 and days_in_pos > 15: 
+        elif metrics['sharpe'] < -0.5 and days_in_pos > 15: 
             violation = True
             violation_reason = f"Sharpe {metrics['sharpe']:.2f} (Inefficient Risk)"
 
@@ -263,7 +263,7 @@ class SupervisorAgent:
                 return {
                     'action': 'stop',
                     'severity': 'critical',
-                    'reason': f'Strike 2/2: {violation_reason}. Validation Failed.',
+                    'reason': f'Strike 2/2: {violation_reason}. Failed.',
                     'metrics': metrics
                 }
         else:
