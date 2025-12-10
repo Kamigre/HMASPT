@@ -410,10 +410,10 @@ class SupervisorAgent:
         # Basic Metrics
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
-            "sharpe_ratio": self._calculate_sharpe(global_returns),
-            "sortino_ratio": self._calculate_sortino(global_returns),
+            "sharpe_ratio": self._calculate_sharpe(global_returns_series),
+            "sortino_ratio": self._calculate_sortino(global_returns_series),
             "max_drawdown": portfolio_max_dd, 
-            "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
+            "avg_return": float(np.mean(global_returns_series)) if global_returns_series else 0.0,
             "total_steps": len(df_all),
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
