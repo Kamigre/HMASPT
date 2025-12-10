@@ -303,16 +303,21 @@ class SupervisorAgent:
         # --- 1. DATA PREPARATION ---
         df_all = pd.DataFrame(operator_traces)
         
+        # Handle empty data case immediately
         if df_all.empty:
             return {
-                "total_pnl": 0.0,
-                "sharpe_ratio": 0.0,
-                "sortino_ratio": 0.0,
-                "max_drawdown": 0.0,
-                "avg_return": 0.0,
-                "total_steps": 0,
-                "n_pairs": 0,
-                "pair_summaries": []
+                "metrics": {
+                    "total_pnl": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "sortino_ratio": 0.0,
+                    "max_drawdown": 0.0,
+                    "win_rate": 0.0,
+                    "var_95": 0.0,
+                    "cvar_95": 0.0,
+                    "cum_return": 0.0
+                },
+                "actions": [],
+                "explanation": "No data available."
             }
     
         # Ensure we have a consistent time column
@@ -333,11 +338,10 @@ class SupervisorAgent:
         global_returns = global_returns_series.tolist()
     
         # --- 3. PROCESS PAIR SUMMARIES ---
-        # We still need individual pair metrics for the summary
         pair_summaries = []
         total_portfolio_realized_pnl = 0.0
         
-        # Get unique pairs from columns
+        # Get unique pairs
         pairs = equity_matrix.columns.tolist()
     
         for pair in pairs:
@@ -348,7 +352,6 @@ class SupervisorAgent:
                 continue
     
             # Returns for this specific pair
-            # We calculate pct_change on the portfolio_value
             pair_returns = pair_df['portfolio_value'].pct_change().dropna().tolist()
             
             # PnL & Metrics
@@ -360,12 +363,10 @@ class SupervisorAgent:
             final_val = pair_df.iloc[-1]['portfolio_value']
             cum_ret = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
             
-            # Max Drawdown for this pair
-            # (Assuming 'max_drawdown' is tracked in the trace, otherwise we calculate it)
+            # Robust Max Drawdown calculation for this pair
             if 'max_drawdown' in pair_df.columns:
                 pair_max_dd = pair_df['max_drawdown'].max()
             else:
-                # Fallback calculation if not in trace
                 run_max = pair_df['portfolio_value'].cummax()
                 dd = (pair_df['portfolio_value'] - run_max) / run_max
                 pair_max_dd = abs(dd.min())
@@ -381,14 +382,15 @@ class SupervisorAgent:
             })
     
         # --- 4. CALCULATE GLOBAL PORTFOLIO METRICS ---
-        # Drawdown on the Global Curve
+        
+        # 4a. Robust Portfolio Drawdown (based on global equity curve)
         running_max = global_equity_series.cummax()
         dd_series = (global_equity_series - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
     
+        # 4b. Basic Metrics Dictionary
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
-            # Now using the aligned global_returns!
             "sharpe_ratio": self._calculate_sharpe(global_returns),
             "sortino_ratio": self._calculate_sortino(global_returns),
             "max_drawdown": portfolio_max_dd, 
@@ -399,17 +401,20 @@ class SupervisorAgent:
         }
         
         # --- 5. CALCULATE WIN RATE (Based on closed trades) ---
-        # Filter for steps where a trade was explicitly closed/adjusted
-        closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
-        if closed_trades:
-            # A win is defined as Positive PnL AFTER transaction costs
-            wins = sum(1 for t in closed_trades if (t.get("realized_pnl_this_step", 0) - t.get("transaction_costs", 0)) > 0)
-            metrics["win_rate"] = wins / len(closed_trades)
+        # Filter for rows where PnL changed or a trade event occurred
+        if 'realized_pnl_this_step' in df_all.columns:
+            closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
+            if not closed_trades.empty:
+                # A win is defined as Positive PnL AFTER transaction costs
+                costs = closed_trades.get('transaction_costs', 0.0)
+                wins = ((closed_trades['realized_pnl_this_step'] - costs) > 0).sum()
+                metrics["win_rate"] = wins / len(closed_trades)
+            else:
+                metrics["win_rate"] = 0.0
         else:
             metrics["win_rate"] = 0.0
         
         # --- 6. CALCULATE RISK METRICS (VaR/CVaR) ---
-        # We use global_returns here to represent the risk of the whole portfolio
         if global_returns:
             metrics["var_95"] = float(np.percentile(global_returns, 5))
             tail_losses = [r for r in global_returns if r <= metrics["var_95"]]
@@ -417,7 +422,7 @@ class SupervisorAgent:
         else:
             metrics["var_95"] = 0.0
             metrics["cvar_95"] = 0.0
-
+    
         # --- 7. ADDITIONAL ACTIVITY METRICS ---
         metrics["positive_returns"] = sum(1 for r in global_returns if r > 0)
         metrics["negative_returns"] = sum(1 for r in global_returns if r < 0)
@@ -426,13 +431,13 @@ class SupervisorAgent:
         metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
         
         # --- 8. GLOBAL CUMULATIVE RETURN ---
-        if sorted_steps:
-            start_pv = portfolio_by_step[sorted_steps[0]]
-            end_pv = portfolio_by_step[sorted_steps[-1]]
+        if not global_equity_series.empty:
+            start_pv = global_equity_series.iloc[0]
+            end_pv = global_equity_series.iloc[-1]
             metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0.0
         else:
             metrics["cum_return"] = 0.0
-
+    
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
         
