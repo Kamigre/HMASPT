@@ -262,7 +262,7 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-                # ===============================
+               # ===============================
         # 7. SIMPLIFIED REWARD FUNCTION
         # ===============================
         
@@ -328,7 +328,7 @@ class PairTradingEnv(gym.Env):
         terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
-        
+       
 @dataclass
 class OperatorAgent:
     
@@ -464,7 +464,7 @@ class OperatorAgent:
             daily_returns.append(info.get('daily_return', 0))
             positions.append(info.get('position', 0))
 
-        # Calculate metrics using homogenous methods
+        # Calculate metrics
         rets = np.array(daily_returns)
         rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess_rets = rets - rf_daily
@@ -664,19 +664,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "cum_return": float(info.get("cum_return", 0.0)),
                 "position": float(info.get("position", 0)),
                 "max_drawdown": float(info.get("drawdown", 0)),
-                
-                # --- PnL METRICS ---
-                "realized_pnl": float(info.get("realized_pnl", 0.0)),           # <--- ADDED: Accumulated PnL
                 "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
-                
                 "transaction_costs": float(info.get("transaction_costs", 0.0)),
                 "daily_return": float(info.get("daily_return", 0.0)),
                 "current_spread": float(info.get("current_spread", 0.0)),
                 "z_score": float(info.get("z_score", 0.0)), 
-                "days_in_position": int(info.get("days_in_position", 0)),
-                # Log raw prices for behavior analysis
-                "price_x": float(info.get("price_x", 0.0)),
-                "price_y": float(info.get("price_y", 0.0))
+                "days_in_position": int(info.get("days_in_position", 0))
             }
 
             episode_traces.append(trace)
@@ -716,10 +709,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['realized_pnl_this_step'] = forced_pnl
                         final_trace['transaction_costs'] = forced_cost
                         final_trace['portfolio_value'] = float(info.get("portfolio_value", trace['portfolio_value']))
-                        
-                        # --- UPDATE ACCUMULATED PnL IN FINAL TRACE ---
-                        final_trace['realized_pnl'] = float(info.get("realized_pnl", trace['realized_pnl'])) # <--- ADDED
-                        
                         final_trace['cum_return'] = float(info.get("cum_return", trace['cum_return']))
                         final_trace['max_drawdown'] = float(info.get("drawdown", trace['max_drawdown']))
                         final_trace['daily_return'] = float(info.get("daily_return", 0.0))
@@ -747,32 +736,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             final_return = episode_traces[-1]['cum_return'] * 100
             max_dd = episode_traces[-1]['max_drawdown']
             
-            # CONSISTENT WIN RATE LOGIC: NET PNL > 0
-            pnl_events = [t for t in episode_traces if t['realized_pnl_this_step'] != 0]
+            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
             if len(pnl_events) > 0:
-                wins = len([t for t in pnl_events if (t['realized_pnl_this_step'] - t['transaction_costs']) > 0])
+                wins = len([p for p in pnl_events if p > 0])
                 win_rate = (wins / len(pnl_events)) * 100
             else:
                 win_rate = 0.0
-
-            # --- [NEW] LOGGING METRICS ---
-            # Explicitly log the calculated metrics to JSONLogger
-            holdout_metrics = {
-                "pair": f"{pair[0]}-{pair[1]}",
-                "final_return": final_return,
-                "max_drawdown": max_dd,
-                "sharpe": sharpe,
-                "sortino": sortino,
-                "win_rate": win_rate,
-                "total_trades": len(pnl_events),
-                "steps": local_step,
-                "status": "STOPPED" if stop_triggered else "COMPLETE",
-                "intervention_reason": intervention_reason if stop_triggered else None
-            }
-            
-            if operator.logger:
-                operator.logger.log("operator", "holdout_complete", holdout_metrics)
-            # -----------------------------
 
             # 2. Log skipped pair info with the FINAL metrics
             if stop_triggered:
@@ -786,18 +755,19 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     "drawdown": max_dd
                 }
                 skipped_pairs.append(skip_info)
+                if operator.logger:
+                    operator.logger.log("supervisor", "intervention", skip_info)
 
             # 3. Print Detailed Results
             status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
             
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Status:         {status_str}")
-            print(f"  Final Return:   {final_return:.2f}%")
-            print(f"  Max Drawdown:   {max_dd:.2%}")
-            print(f"  Sharpe Ratio:   {sharpe:.3f}")
-            print(f"  Sortino Ratio:  {sortino:.3f}")
-            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
-            print(f"  Accum. PnL:     {episode_traces[-1]['realized_pnl']:.2f}") # <--- Optional: Print it for verification
+            print(f"  Status:        {status_str}")
+            print(f"  Final Return:  {final_return:.2f}%")
+            print(f"  Max Drawdown:  {max_dd:.2%}")
+            print(f"  Sharpe Ratio:  {sharpe:.3f}")
+            print(f"  Sortino Ratio: {sortino:.3f}")
+            print(f"  Win Rate:      {win_rate:.1f}% ({len(pnl_events)} trades)")
             
             # Position Distribution
             positions = [t['position'] for t in episode_traces]
@@ -864,5 +834,5 @@ def calculate_sortino(traces, risk_free_rate=None):
         return 0.0
         
     downside_deviation = np.sqrt(np.mean(downside_returns**2))
-    if downside_deviation < 1e-9: return 0.0      
+    if downside_deviation < 1e-9: return 0.0    
     return (mean_excess / downside_deviation) * np.sqrt(252)
