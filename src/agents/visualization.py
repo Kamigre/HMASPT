@@ -304,8 +304,6 @@ class PortfolioVisualizer:
 
         # 1. Main Equity Curve 
 
-[Image of financial growth chart]
-
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
