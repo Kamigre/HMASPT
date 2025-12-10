@@ -712,6 +712,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         
                         # --- UPDATED: Ensure cumulative realized PnL reflects the forced close ---
+                        # We fetch 'realized_pnl' directly from 'info', which the Env just updated
                         final_trace['realized_pnl'] = round(float(info.get("realized_pnl", trace['realized_pnl'] + forced_pnl)), 2)
                         final_trace['unrealized_pnl'] = round(float(info.get("unrealized_pnl", 0.0)), 2)
                         # ------------------------------------------------------------------------
