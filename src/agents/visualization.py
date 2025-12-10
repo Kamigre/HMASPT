@@ -109,8 +109,6 @@ class PortfolioVisualizer:
 
         # 1. Equity Curve 
 
-[Image of stock market chart]
-
         ax1 = fig.add_subplot(gs[0, :3])
         ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
