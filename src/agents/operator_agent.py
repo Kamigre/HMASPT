@@ -694,7 +694,11 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     if env.position != 0:
                         print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
                         
-                        # Step environment with Action 1 (Flat)
+                        # Capture the CUMULATIVE realized PnL from the *previous* step (before liquidation)
+                        # We use the 'trace' object we just appended, which represents the state BEFORE the force close
+                        previous_cumulative_realized = trace['realized_pnl']
+
+                        # Step environment with Action 1 (Flat) to execute the close
                         obs, reward, terminated, _, info = env.step(1)
                         
                         forced_pnl = info.get('realized_pnl_this_step', 0.0)
@@ -710,14 +714,14 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         
-                        # --- CRITICAL FIX START ---
-                        # Manually calculate cumulative Realized PnL to avoid stale info
-                        prev_cum_realized = trace['realized_pnl']
-                        final_trace['realized_pnl'] = round(prev_cum_realized + forced_pnl, 2)
+                        # --- CRITICAL FIX: MANUAL ACCUMULATION ---
+                        # Instead of trusting 'info' immediately, we manually add the forced PnL 
+                        # to the known previous cumulative total.
+                        final_trace['realized_pnl'] = round(previous_cumulative_realized + forced_pnl - forced_cost, 2)
                         
                         # Hardcode Unrealized PnL to 0.0 because position is closed
                         final_trace['unrealized_pnl'] = 0.0
-                        # --- CRITICAL FIX END ---
+                        # -----------------------------------------
 
                         final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
                         final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
