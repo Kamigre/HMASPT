@@ -713,19 +713,11 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['position'] = 0 # Forced Flat
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
-                        
-                        # --- CRITICAL FIX: MANUAL ACCUMULATION ---
-                        # Instead of trusting 'info' immediately, we manually add the forced PnL 
-                        # to the known previous cumulative total.
+                        final_trace['unrealized_pnl'] = 0
                         final_trace['realized_pnl'] = round(previous_cumulative_realized + forced_pnl - forced_cost, 2)
-                        
-                        # Hardcode Unrealized PnL to 0.0 because position is closed
-                        final_trace['unrealized_pnl'] = 0.0
-                        # -----------------------------------------
-
-                        final_trace['portfolio_value'] = final_trace['realized_pnl'] + env.initial_capital
-                        final_trace['cum_return'] = final_trace['portfolio_value'] / env.initial_capital - 1
-                        final_trace['max_drawdown'] = calculate_drawdown_from_traces(episode_traces + [final_trace])
+                        final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
+                        final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
+                        final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
                         final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
                         final_trace['forced_close'] = True
                         
