@@ -708,6 +708,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['step'] += 1
                         final_trace['local_step'] += 1
                         final_trace['position'] = 0 # Flat
+                        final_trace['realized_pnl'] = round(float(info.get("realized_pnl", 0.0)), 2),
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
