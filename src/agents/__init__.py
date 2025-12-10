@@ -1,22 +1,17 @@
-"""
-HMASPT Agents Module
+# Inter-agent communication
+from .message_bus import JSONLogger
 
-Multi-agent system for pairs trading:
-- MessageBus: Inter-agent communication
-- SelectorAgent: TGNN-based pair selection
-- OperatorAgent: RL-based trading execution
-- SupervisorAgent: Portfolio monitoring and coordination
-"""
-
-from .message_bus import MessageBus, JSONLogger, Graph, SwarmOrchestrator
-from .operator_agent import OperatorAgent, train_operator_on_pairs, PairTradingEnv
-from .supervisor_agent import SupervisorAgent
+# SelectorAgent: TGNN-based pair selection
 from .selector_agent import OptimizedSelectorAgent, EnhancedTGNN
 
+# RL-based trading execution
+from .operator_agent import OperatorAgent, train_operator_on_pairs, PairTradingEnv
+
+# Portfolio monitoring and coordination
+from .supervisor_agent import SupervisorAgent
+
 __all__ = [
-    "MessageBus",
     "JSONLogger",
-    "Graph",
     "SelectorAgent",
     "OperatorAgent",
     "SupervisorAgent",
