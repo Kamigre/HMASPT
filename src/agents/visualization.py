@@ -55,6 +55,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score and Drawdown analysis.
+        Uses standardized metric logic.
         """
         if len(traces) == 0:
             return
@@ -78,10 +79,11 @@ class PortfolioVisualizer:
         trades_entry = df[df['trade_occurred'] == True] 
         forced_exit = df[df['forced_close'] == True]
 
-        # --- Win Rate Logic (Per Pair) ---
+        # --- Win Rate Logic (Per Pair) - STANDARDIZED WITH SUPERVISOR ---
         closed_trades_mask = df['realized_pnl_this_step'] != 0
         closed_trades_df = df[closed_trades_mask].copy()
         
+        # Standard: Win = (PnL - Costs) > 0
         closed_trades_df['net_trade_pnl'] = closed_trades_df['realized_pnl_this_step'] - closed_trades_df['transaction_costs']
         
         total_closed_trades = len(closed_trades_df)
@@ -105,7 +107,10 @@ class PortfolioVisualizer:
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
                      fontsize=22, weight='bold', color=status_color, y=0.96)
 
-        # 1. Equity Curve
+        # 1. Equity Curve 
+
+[Image of stock market chart]
+
         ax1 = fig.add_subplot(gs[0, :3])
         ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
@@ -251,32 +256,21 @@ class PortfolioVisualizer:
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
-        Create aggregated portfolio dashboard with improved Correlation analysis AND
-        Correctly calculated Portfolio-Wide Maximum Drawdown.
+        Create aggregated portfolio dashboard. 
+        CRITICAL: This uses the metrics ALREADY calculated in `final_summary` by the Supervisor.
         """
+        # Load pre-calculated metrics
         metrics = final_summary['metrics']
         pair_summaries = metrics['pair_summaries']
         
-        # --- Data Processing ---
+        # --- Data Processing for Plots ---
         df_all = pd.DataFrame(all_traces)
         if df_all.empty:
             print("⚠️ No traces to visualize.")
             return
 
         if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
-        if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
-
-        # --- Global Win Rate Logic ---
-        trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
-        trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
         
-        total_global_trades = len(trade_events)
-        if total_global_trades > 0:
-            global_wins = (trade_events['net_pnl'] > 0).sum()
-            global_win_rate = global_wins / total_global_trades
-        else:
-            global_win_rate = 0.0
-
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
 
         # Total Capital Est
@@ -295,28 +289,25 @@ class PortfolioVisualizer:
         portfolio_return_pct = (total_portfolio_pnl_dollars / total_capital) * 100
         portfolio_equity_curve = 100 + portfolio_return_pct
 
-        # --- NEW: CALCULATE AGGREGATE PORTFOLIO MAX DRAWDOWN ---
-        # 1. Calculate High Water Mark (Running Max)
-        running_max = portfolio_equity_curve.cummax()
-        # 2. Calculate Drawdown Series
-        dd_series = (portfolio_equity_curve - running_max) / running_max
-        # 3. Get Max Drawdown (Scalar)
-        portfolio_max_dd = abs(dd_series.min())
-        
-        print(f"    ℹ️  Calculated Global Portfolio Max Drawdown: {portfolio_max_dd*100:.2f}%")
-        # -------------------------------------------------------
-
         # --- Figure Setup ---
         fig = plt.figure(figsize=(22, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
         
-        final_pnl = total_portfolio_pnl_dollars.iloc[-1]
-        final_pct = portfolio_return_pct.iloc[-1]
+        # Use metrics from final_summary for the title to match text reports
+        final_pnl = metrics['total_pnl']
+        final_pct = metrics['avg_return'] * 100 # Avg return across pairs, or use cum_return from summary
+        
+        # Prefer cumulative return if available in summary
+        if 'cum_return' in metrics:
+             final_pct = metrics['cum_return'] * 100
         
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
-        # 1. Main Equity Curve
+        # 1. Main Equity Curve 
+
+[Image of financial growth chart]
+
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
@@ -358,7 +349,7 @@ class PortfolioVisualizer:
         if len(pair_names) > 10:
             plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
 
-        # 3. Correlation Analysis
+        # 3. Correlation Analysis 
         pnl_changes = pnl_matrix.diff().fillna(0.0)
         
         if pnl_changes.shape[1] > 1:
@@ -413,16 +404,16 @@ class PortfolioVisualizer:
         ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
         ax5.set_xlabel("Drawdown %")
 
-        # 5. Global Stats Table
+        # 5. Global Stats Table - PULLING FROM PRE-CALCULATED METRICS
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
         flat_metrics = [
-            ("Total Net P&L", f"${final_pnl:,.2f}"),
+            ("Total Net P&L", f"${metrics['total_pnl']:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
             ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
-            ("Win Rate", f"{global_win_rate*100:.2f}%"),
-            ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
+            ("Win Rate", f"{metrics['win_rate']*100:.2f}%"),
+            ("Portfolio Max DD", f"{metrics['max_drawdown']*100:.2f}%"),
             ("VaR (95%)", f"{metrics['var_95']:.4f}"),
             ("Active Pairs", f"{len(pair_names)}"),
             ("Skipped Pairs", f"{len(skipped_names)}")
