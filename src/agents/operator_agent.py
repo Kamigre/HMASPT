@@ -747,6 +747,25 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             else:
                 win_rate = 0.0
 
+            # --- [NEW] LOGGING METRICS ---
+            # Explicitly log the calculated metrics to JSONLogger
+            holdout_metrics = {
+                "pair": f"{pair[0]}-{pair[1]}",
+                "final_return": final_return,
+                "max_drawdown": max_dd,
+                "sharpe": sharpe,
+                "sortino": sortino,
+                "win_rate": win_rate,
+                "total_trades": len(pnl_events),
+                "steps": local_step,
+                "status": "STOPPED" if stop_triggered else "COMPLETE",
+                "intervention_reason": intervention_reason if stop_triggered else None
+            }
+            
+            if operator.logger:
+                operator.logger.log("operator", "holdout_complete", holdout_metrics)
+            # -----------------------------
+
             # 2. Log skipped pair info with the FINAL metrics
             if stop_triggered:
                 skip_info = {
@@ -759,8 +778,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     "drawdown": max_dd
                 }
                 skipped_pairs.append(skip_info)
-                if operator.logger:
-                    operator.logger.log("supervisor", "intervention", skip_info)
 
             # 3. Print Detailed Results
             status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
@@ -838,5 +855,5 @@ def calculate_sortino(traces, risk_free_rate=None):
         return 0.0
         
     downside_deviation = np.sqrt(np.mean(downside_returns**2))
-    if downside_deviation < 1e-9: return 0.0     
+    if downside_deviation < 1e-9: return 0.0      
     return (mean_excess / downside_deviation) * np.sqrt(252)
