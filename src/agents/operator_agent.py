@@ -695,7 +695,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
                         
                         # Step environment with Action 1 (Flat)
-                        # We must update the env state so the final portfolio value reflects the close
                         obs, reward, terminated, _, info = env.step(1)
                         
                         forced_pnl = info.get('realized_pnl_this_step', 0.0)
@@ -707,15 +706,18 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace = trace.copy()
                         final_trace['step'] += 1
                         final_trace['local_step'] += 1
-                        final_trace['position'] = 0 # Flat
+                        final_trace['position'] = 0 # Forced Flat
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         
-                        # --- UPDATED: Ensure cumulative realized PnL reflects the forced close ---
-                        # We fetch 'realized_pnl' directly from 'info', which the Env just updated
-                        final_trace['realized_pnl'] = round(float(info.get("realized_pnl", trace['realized_pnl'] + forced_pnl)), 2)
-                        final_trace['unrealized_pnl'] = round(float(info.get("unrealized_pnl", 0.0)), 2)
-                        # ------------------------------------------------------------------------
+                        # --- CRITICAL FIX START ---
+                        # Manually calculate cumulative Realized PnL to avoid stale info
+                        prev_cum_realized = trace['realized_pnl']
+                        final_trace['realized_pnl'] = round(prev_cum_realized + forced_pnl, 2)
+                        
+                        # Hardcode Unrealized PnL to 0.0 because position is closed
+                        final_trace['unrealized_pnl'] = 0.0
+                        # --- CRITICAL FIX END ---
 
                         final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
                         final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
