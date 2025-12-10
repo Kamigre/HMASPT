@@ -12,8 +12,6 @@ from sb3_contrib import RecurrentPPO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import sys
-
-# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import CONFIG
 from agents.message_bus import JSONLogger
@@ -262,7 +260,7 @@ class PairTradingEnv(gym.Env):
         self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
         
-               # ===============================
+        # ===============================
         # 7. SIMPLIFIED REWARD FUNCTION
         # ===============================
         
@@ -304,31 +302,31 @@ class PairTradingEnv(gym.Env):
         
         # 10. Info
         info = {
-            'portfolio_value': float(self.portfolio_value),
-            'cash': float(self.cash),
-            'realized_pnl': float(self.realized_pnl),
-            'unrealized_pnl': float(self.unrealized_pnl),
-            'realized_pnl_this_step': float(realized_pnl_this_step),
-            'transaction_costs': float(transaction_costs),
+            'portfolio_value': round(float(self.portfolio_value), 2),
+            'cash': round(float(self.cash), 2),
+            'realized_pnl': round(float(self.realized_pnl), 2),
+            'unrealized_pnl': round(float(self.unrealized_pnl), 2),
+            'realized_pnl_this_step': round(float(realized_pnl_this_step), 2),
+            'transaction_costs': round(float(transaction_costs), 2),
             'position': int(self.position),
-            'entry_spread': float(self.entry_spread),
-            'current_spread': float(current_spread),
-            'z_score': float(current_zscore), 
+            'entry_spread': round(float(self.entry_spread), 2),
+            'current_spread': round(float(current_spread), 2),
+            'z_score': round(float(current_zscore), 2), 
             'days_in_position': int(self.days_in_position),
-            'daily_return': float(daily_return),
-            'drawdown': float(drawdown),
+            'daily_return': round(float(daily_return), 4), # Kept at 4 as daily returns are small
+            'drawdown': round(float(drawdown), 2),
             'num_trades': int(self.num_trades),
             'trade_occurred': bool(trade_occurred),
-            'cum_return': float(self.portfolio_value / self.initial_capital - 1),
+            'cum_return': round(float(self.portfolio_value / self.initial_capital - 1), 2),
             'forced_close': is_last_step and trade_occurred,
-            'price_x': float(self.price_x_np[current_idx]),
-            'price_y': float(self.price_y_np[current_idx])
+            'price_x': round(float(self.price_x_np[current_idx]), 2),
+            'price_y': round(float(self.price_y_np[current_idx]), 2)
         }
         
         terminated = is_last_step
         
         return obs, float(reward), terminated, False, info
-       
+        
 @dataclass
 class OperatorAgent:
     
@@ -495,10 +493,10 @@ class OperatorAgent:
 
         trace = {
             "pair": (x, y),
-            "cum_return": final_return,
-            "max_drawdown": (env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value,
-            "sharpe": sharpe,
-            "sortino": sortino,
+            "cum_return": round(final_return, 2),
+            "max_drawdown": round((env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value, 2),
+            "sharpe": round(sharpe, 2),
+            "sortino": round(sortino, 2),
             "model_path": model_path,
             "positions_used": unique_positions.tolist()
         }
@@ -660,15 +658,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "pair": f"{pair[0]}-{pair[1]}",
                 "step": global_step,
                 "local_step": local_step,
-                "portfolio_value": float(info.get("portfolio_value", 0.0)),
-                "cum_return": float(info.get("cum_return", 0.0)),
-                "position": float(info.get("position", 0)),
-                "max_drawdown": float(info.get("drawdown", 0)),
-                "realized_pnl_this_step": float(info.get("realized_pnl_this_step", 0.0)),
-                "transaction_costs": float(info.get("transaction_costs", 0.0)),
-                "daily_return": float(info.get("daily_return", 0.0)),
-                "current_spread": float(info.get("current_spread", 0.0)),
-                "z_score": float(info.get("z_score", 0.0)), 
+                "portfolio_value": round(float(info.get("portfolio_value", 0.0)), 2),
+                "cum_return": round(float(info.get("cum_return", 0.0)), 2),
+                "position": round(float(info.get("position", 0)), 2),
+                "max_drawdown": round(float(info.get("drawdown", 0)), 2),
+                "realized_pnl_this_step": round(float(info.get("realized_pnl_this_step", 0.0)), 2),
+                "transaction_costs": round(float(info.get("transaction_costs", 0.0)), 2),
+                "daily_return": round(float(info.get("daily_return", 0.0)), 4), # 4 decimals for small daily returns
+                "current_spread": round(float(info.get("current_spread", 0.0)), 2),
+                "z_score": round(float(info.get("z_score", 0.0)), 2), 
                 "days_in_position": int(info.get("days_in_position", 0))
             }
 
@@ -706,12 +704,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['step'] += 1
                         final_trace['local_step'] += 1
                         final_trace['position'] = 0 # Flat
-                        final_trace['realized_pnl_this_step'] = forced_pnl
-                        final_trace['transaction_costs'] = forced_cost
-                        final_trace['portfolio_value'] = float(info.get("portfolio_value", trace['portfolio_value']))
-                        final_trace['cum_return'] = float(info.get("cum_return", trace['cum_return']))
-                        final_trace['max_drawdown'] = float(info.get("drawdown", trace['max_drawdown']))
-                        final_trace['daily_return'] = float(info.get("daily_return", 0.0))
+                        final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
+                        final_trace['transaction_costs'] = round(forced_cost, 2)
+                        final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
+                        final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
+                        final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
+                        final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
                         
                         # Append this trace so metrics include the forced close
                         episode_traces.append(final_trace)
@@ -750,9 +748,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     "reason": intervention_reason,
                     "severity": intervention_severity,
                     "step_stopped": global_step,
-                    "final_return": final_return,
-                    "sharpe": sharpe,
-                    "drawdown": max_dd
+                    "final_return": round(final_return, 2),
+                    "sharpe": round(sharpe, 2),
+                    "drawdown": round(max_dd, 2)
                 }
                 skipped_pairs.append(skip_info)
                 if operator.logger:
@@ -762,12 +760,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
             
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Status:        {status_str}")
-            print(f"  Final Return:  {final_return:.2f}%")
-            print(f"  Max Drawdown:  {max_dd:.2%}")
-            print(f"  Sharpe Ratio:  {sharpe:.3f}")
-            print(f"  Sortino Ratio: {sortino:.3f}")
-            print(f"  Win Rate:      {win_rate:.1f}% ({len(pnl_events)} trades)")
+            print(f"  Status:         {status_str}")
+            print(f"  Final Return:   {final_return:.2f}%")
+            print(f"  Max Drawdown:   {max_dd:.2%}")
+            print(f"  Sharpe Ratio:   {sharpe:.3f}")
+            print(f"  Sortino Ratio:  {sortino:.3f}")
+            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
             
             # Position Distribution
             positions = [t['position'] for t in episode_traces]
@@ -779,10 +777,10 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
 
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
-                "return": final_return,
-                "sharpe": sharpe,
-                "drawdown": max_dd,
-                "win_rate": win_rate,
+                "return": round(final_return, 2),
+                "sharpe": round(sharpe, 2),
+                "drawdown": round(max_dd, 2),
+                "win_rate": round(win_rate, 2),
                 "status": "STOPPED" if stop_triggered else "COMPLETE"
             })
             
@@ -834,5 +832,5 @@ def calculate_sortino(traces, risk_free_rate=None):
         return 0.0
         
     downside_deviation = np.sqrt(np.mean(downside_returns**2))
-    if downside_deviation < 1e-9: return 0.0    
+    if downside_deviation < 1e-9: return 0.0     
     return (mean_excess / downside_deviation) * np.sqrt(252)
