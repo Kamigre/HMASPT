@@ -300,25 +300,53 @@ class SupervisorAgent:
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Evaluate complete portfolio performance."""
         
-        # 1. Group traces by pair
+        # --- 1. PRE-CALCULATE GLOBAL TIME SERIES ---
+        # We must aggregate value by time step to get true Portfolio Returns.
+        # This handles correlations (e.g., hedging) correctly for Sharpe/Sortino.
+        portfolio_by_step = {}
+        for t in operator_traces:
+            step = t['step']
+            # Sum the portfolio_value of all pairs active at this step
+            portfolio_by_step.setdefault(step, 0.0)
+            portfolio_by_step[step] += t.get('portfolio_value', 0.0)
+
+        # Sort steps and calculate GLOBAL returns stream
+        sorted_steps = sorted(portfolio_by_step.keys())
+        global_returns = []
+        
+        if len(sorted_steps) > 1:
+            for i in range(1, len(sorted_steps)):
+                curr_step = sorted_steps[i]
+                prev_step = sorted_steps[i-1]
+                
+                curr_pv = portfolio_by_step[curr_step]
+                prev_pv = portfolio_by_step[prev_step]
+                
+                # Avoid division by zero
+                if prev_pv > 0:
+                    ret = (curr_pv - prev_pv) / prev_pv
+                else:
+                    ret = 0.0
+                global_returns.append(ret)
+
+        # --- 2. GROUP TRACES BY PAIR ---
         traces_by_pair = {}
         for t in operator_traces:
             traces_by_pair.setdefault(t['pair'], []).append(t)
 
-        all_returns = []
         pair_summaries = []
         
         # Initialize global accumulator for Total Realized PnL
         total_portfolio_realized_pnl = 0.0
 
-        # 2. Process each pair individually
+        # --- 3. PROCESS EACH PAIR INDIVIDUALLY ---
         for pair, traces in traces_by_pair.items():
             pair_returns = []
             
             # Sort traces by step to ensure chronological order
             traces = sorted(traces, key=lambda x: x['step'])
 
-            # Calculate returns per step for Sharpe/Sortino
+            # Calculate returns per step for Pair-Specific Sharpe/Sortino
             for i in range(1, len(traces)):
                 pv_curr = traces[i].get("portfolio_value", 0)
                 pv_prev = traces[i-1].get("portfolio_value", 0)
@@ -329,11 +357,9 @@ class SupervisorAgent:
                     ret = 0.0
                 
                 pair_returns.append(ret)
-                all_returns.append(ret)
+                # NOTE: We do NOT append to global_returns here anymore.
 
             # --- CALCULATE PAIR PNL ---
-            # We take the realized_pnl from the very last trace of the pair.
-            # This assumes 'realized_pnl' tracks the running total for that pair.
             final_trace = traces[-1]
             pair_total_pnl = final_trace.get("realized_pnl", 0)
 
@@ -355,19 +381,20 @@ class SupervisorAgent:
                 "steps": len(traces)
             })
 
-        # 3. Calculate Global Portfolio Metrics
+        # --- 4. CALCULATE GLOBAL PORTFOLIO METRICS ---
+        # Note: We now use `global_returns` for portfolio-wide risk metrics
         metrics = {
-            "total_pnl": total_portfolio_realized_pnl,  # <--- Updated Sum
-            "sharpe_ratio": self._calculate_sharpe(all_returns),
-            "sortino_ratio": self._calculate_sortino(all_returns),
+            "total_pnl": total_portfolio_realized_pnl,
+            "sharpe_ratio": self._calculate_sharpe(global_returns),
+            "sortino_ratio": self._calculate_sortino(global_returns),
             "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
-            "avg_return": float(np.mean(all_returns)) if all_returns else 0,
+            "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
             "total_steps": len(operator_traces),
             "n_pairs": len(traces_by_pair),
             "pair_summaries": pair_summaries
         }
         
-        # 4. Calculate Win Rate (Based on closed trades)
+        # --- 5. CALCULATE WIN RATE (Based on closed trades) ---
         # Filter for steps where a trade was explicitly closed/adjusted
         closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
         if closed_trades:
@@ -377,28 +404,28 @@ class SupervisorAgent:
         else:
             metrics["win_rate"] = 0.0
         
-        # 5. Calculate Risk Metrics (VaR/CVaR)
-        if all_returns:
-            metrics["var_95"] = float(np.percentile(all_returns, 5))
-            tail_losses = [r for r in all_returns if r <= metrics["var_95"]]
+        # --- 6. CALCULATE RISK METRICS (VaR/CVaR) ---
+        # We use global_returns here to represent the risk of the whole portfolio
+        if global_returns:
+            metrics["var_95"] = float(np.percentile(global_returns, 5))
+            tail_losses = [r for r in global_returns if r <= metrics["var_95"]]
             metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
         else:
             metrics["var_95"] = 0.0
             metrics["cvar_95"] = 0.0
 
-        # 6. Additional activity metrics
-        metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
-        metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
-        metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
-        metrics["std_return"] = float(np.std(all_returns)) if all_returns else 0.0
+        # --- 7. ADDITIONAL ACTIVITY METRICS ---
+        metrics["positive_returns"] = sum(1 for r in global_returns if r > 0)
+        metrics["negative_returns"] = sum(1 for r in global_returns if r < 0)
+        metrics["median_return"] = float(np.median(global_returns)) if global_returns else 0.0
+        metrics["std_return"] = float(np.std(global_returns)) if global_returns else 0.0
         metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
         
-        # 7. Global Cumulative Return
-        if operator_traces:
-            sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
-            start_pv = sorted_traces[0].get("portfolio_value", 0)
-            end_pv = sorted_traces[-1].get("portfolio_value", 0)
-            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0
+        # --- 8. GLOBAL CUMULATIVE RETURN ---
+        if sorted_steps:
+            start_pv = portfolio_by_step[sorted_steps[0]]
+            end_pv = portfolio_by_step[sorted_steps[-1]]
+            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0.0
         else:
             metrics["cum_return"] = 0.0
 
