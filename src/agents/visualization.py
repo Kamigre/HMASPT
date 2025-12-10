@@ -249,7 +249,7 @@ class PortfolioVisualizer:
         plt.close()
         print(f"    📉 Saved behavior analysis: {filepath}")
 
-    def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
+def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard with improved Correlation analysis AND
         Correctly calculated Portfolio-Wide Maximum Drawdown.
@@ -278,40 +278,53 @@ class PortfolioVisualizer:
             global_win_rate = 0.0
 
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
+        if time_col not in df_all.columns and 'step' in df_all.columns:
+             time_col = 'step'
 
-        # Total Capital Est
-        if 'position_value' in df_all.columns:
-            total_capital = df_all.groupby('pair')['position_value'].max().sum()
-        else:
-            total_capital = 10000 * len(df_all['pair'].unique())
-        total_capital = max(total_capital, 1.0) 
-
-        # P&L Matrix (Cumulative PnL per pair over time)
-        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
-        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
+        # --- 1. AGGREGATE PORTFOLIO CURVE ---
+        # Pivot 'portfolio_value' to get total equity over time (Sum of all pairs)
+        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+        equity_matrix = equity_matrix.ffill().fillna(0.0)
         
-        # Portfolio Curve
-        total_portfolio_pnl_dollars = pnl_matrix.sum(axis=1)
-        portfolio_return_pct = (total_portfolio_pnl_dollars / total_capital) * 100
-        portfolio_equity_curve = 100 + portfolio_return_pct
+        # Sum across all pairs
+        global_equity_series = equity_matrix.sum(axis=1)
+        
+        if global_equity_series.empty or global_equity_series.max() == 0:
+             print("⚠️ Portfolio equity is zero or empty.")
+             return
 
-        # --- NEW: CALCULATE AGGREGATE PORTFOLIO MAX DRAWDOWN ---
-        # 1. Calculate High Water Mark (Running Max)
+        # Normalize to Base 100
+        start_equity = global_equity_series.iloc[0]
+        portfolio_equity_curve = (global_equity_series / start_equity) * 100 if start_equity > 0 else global_equity_series + 100
+        portfolio_return_pct = portfolio_equity_curve - 100
+
+        # --- 2. CALCULATE METRICS FROM AGGREGATED DATA ---
+        
+        # 2a. Drawdown
         running_max = portfolio_equity_curve.cummax()
-        # 2. Calculate Drawdown Series
         dd_series = (portfolio_equity_curve - running_max) / running_max
-        # 3. Get Max Drawdown (Scalar)
-        portfolio_max_dd = abs(dd_series.min())
+        portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
         
-        print(f"    ℹ️  Calculated Global Portfolio Max Drawdown: {portfolio_max_dd*100:.2f}%")
-        # -------------------------------------------------------
+        # 2b. RE-CALCULATE SHARPE & SORTINO (Based on Aggregated Curve)
+        # We calculate the pct change of the global equity curve step-by-step
+        global_returns_series = global_equity_series.pct_change().dropna()
+        
+        # Convert to list for helper functions
+        global_returns_list = global_returns_series.tolist()
+        
+        # NOTE: Ensure periods_per_year matches your data frequency!
+        # Assuming Daily (252) here. If Hourly, use 8760.
+        agg_sharpe = self._calculate_sharpe(global_returns_list, periods_per_year=252)
+        agg_sortino = self._calculate_sortino(global_returns_list, periods_per_year=252)
+
+        print(f"    ℹ️  Global Metrics (Recalculated): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
 
         # --- Figure Setup ---
         fig = plt.figure(figsize=(22, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
         
-        final_pnl = total_portfolio_pnl_dollars.iloc[-1]
-        final_pct = portfolio_return_pct.iloc[-1]
+        final_pnl = metrics.get('total_pnl', 0.0)
+        final_pct = portfolio_return_pct.iloc[-1] if not portfolio_return_pct.empty else 0.0
         
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
@@ -338,7 +351,9 @@ class PortfolioVisualizer:
                           xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
                           bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
 
-        ax1.set_title(f"Aggregated Performance (Est. Capital: ${total_capital:,.0f})", loc='left')
+        # Use total capital from equity series max for label
+        est_capital = global_equity_series.max()
+        ax1.set_title(f"Aggregated Performance (Peak Equity: ${est_capital:,.0f})", loc='left')
         ax1.set_ylabel("Equity (Base 100)")
         ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.3)
@@ -359,6 +374,8 @@ class PortfolioVisualizer:
             plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
 
         # 3. Correlation Analysis
+        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
+        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
         pnl_changes = pnl_matrix.diff().fillna(0.0)
         
         if pnl_changes.shape[1] > 1:
@@ -409,7 +426,10 @@ class PortfolioVisualizer:
         # 4. Max Drawdown Distribution
         ax5 = fig.add_subplot(gs[2, 2])
         pair_dds = [p['max_drawdown']*100 for p in pair_summaries]
-        sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+        if pair_dds:
+            sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+        else:
+            ax5.text(0.5, 0.5, "No Drawdown Data", ha='center')
         ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
         ax5.set_xlabel("Drawdown %")
 
@@ -417,15 +437,16 @@ class PortfolioVisualizer:
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
+        # Use our newly calculated aggregated metrics
         flat_metrics = [
             ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
-            ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
+            ("Sharpe Ratio", f"{agg_sharpe:.2f}"),       # <--- Updated
+            ("Sortino Ratio", f"{agg_sortino:.2f}"),     # <--- Added
             ("Win Rate", f"{global_win_rate*100:.2f}%"),
             ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
-            ("VaR (95%)", f"{metrics['var_95']:.4f}"),
-            ("Active Pairs", f"{len(pair_names)}"),
-            ("Skipped Pairs", f"{len(skipped_names)}")
+            ("VaR (95%)", f"{metrics.get('var_95', 0.0):.4f}"),
+            ("Active Pairs", f"{len(pair_names)}")
         ]
         
         col_count = 4
