@@ -300,7 +300,7 @@ class SupervisorAgent:
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Evaluate complete portfolio performance using robust 'Delta PnL' aggregation.
-        This PREVENTS 'Capital Injection' bugs where new pairs appearing look like profit.
+        Derives initial capital from the first step of data found.
         """
         
         # --- 1. DATA PREPARATION ---
@@ -333,6 +333,14 @@ class SupervisorAgent:
         
         # Forward fill: If a pair creates no new trace, it holds its last value.
         equity_matrix_ffill = equity_matrix.ffill()
+
+        # --- DYNAMIC CAPITAL INFERENCE ---
+        # We assume the capital at the very first step is the "Initial Capital".
+        # If your data starts AFTER some losses, this will reset the baseline to that moment.
+        first_step_capital = equity_matrix_ffill.iloc[0].sum()
+        
+        # Fallback: If for some reason the sum is 0 (e.g. data hasn't initialized), default to 1.0 to avoid zero-division later
+        inferred_initial_capital = first_step_capital if first_step_capital > 0 else 1.0
         
         # Calculate Dollar PnL per step (Change in value)
         # diff() ensures that the first appearance of a pair (NaN -> Value) results in NaN change, not Profit.
@@ -341,26 +349,17 @@ class SupervisorAgent:
         # Sum dollar PnL across all pairs for each step
         global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
-        # Calculate Total Invested Capital per step (Sum of active pairs)
-        # We fill NaN with 0 here just for the summation of capital
-        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
+        # --- CRITICAL FIX: ARITHMETIC EQUITY CONSTRUCTION --- 
+        # Start with the inferred capital and add the cumulative PnL
+        equity_curve_dollars = inferred_initial_capital + global_dollar_pnl.cumsum()
         
-        # Calculate Percentage Returns
-        # Return = Global Dollar PnL / Previous Step's Total Capital
-        # We shift capital by 1 to represent "Assets at beginning of period"
-        prev_capital = total_capital_series.shift(1)
-        
-        # Avoid division by zero and handle infinity
-        global_returns_series = global_dollar_pnl / prev_capital
-        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        
-        # Clean returns list for metrics
+        # Calculate Percentage Returns based on the ACTUAL dollar curve
+        global_returns_series = equity_curve_dollars.pct_change().fillna(0.0)
         global_returns = global_returns_series.tolist()
         
         # Reconstruct the "Normalized" Equity Curve (Start at 100)
-        cum_returns = (1 + global_returns_series).cumprod()
-        normalized_equity_curve = 100 * cum_returns
-        
+        normalized_equity_curve = (equity_curve_dollars / inferred_initial_capital) * 100
+
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
         total_portfolio_realized_pnl = 0.0
@@ -401,7 +400,7 @@ class SupervisorAgent:
 
         # --- 4. CALCULATE GLOBAL METRICS ---
         
-        # Max Drawdown (Based on the normalized curve)
+        # Max Drawdown
         running_max = normalized_equity_curve.cummax()
         dd_series = (normalized_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
@@ -418,10 +417,8 @@ class SupervisorAgent:
             "pair_summaries": pair_summaries
         }
         
-        # --- 5. EXPORT CURVE DATA FOR VISUALIZATION ---
-        # We embed the time series data directly so the visualizer can opt to use it directly
+        # --- 5. EXPORT CURVE DATA ---
         metrics["equity_curve"] = normalized_equity_curve.tolist()
-        # Convert timestamps to strings for JSON serializability if needed, or keep as Index
         metrics["equity_curve_dates"] = normalized_equity_curve.index.tolist()
 
         # --- 6. WIN RATE & RISK ---
@@ -429,7 +426,6 @@ class SupervisorAgent:
             closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
             if not closed_trades.empty:
                 costs = closed_trades.get('transaction_costs', 0.0)
-                # Count win if Net PnL > 0
                 wins = ((closed_trades['realized_pnl_this_step'] - costs) > 0).sum()
                 metrics["win_rate"] = wins / len(closed_trades)
             else:
