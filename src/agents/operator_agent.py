@@ -710,6 +710,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
                         final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
                         final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
+                        final_trace['forced_close'] = True
                         
                         # Append this trace so metrics include the forced close
                         episode_traces.append(final_trace)
@@ -779,6 +780,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "pair": f"{pair[0]}-{pair[1]}",
                 "return": round(final_return, 2),
                 "sharpe": round(sharpe, 2),
+                "sortino": round(sortino, 2),
                 "drawdown": round(max_dd, 2),
                 "win_rate": round(win_rate, 2),
                 "status": "STOPPED" if stop_triggered else "COMPLETE"
@@ -794,7 +796,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
     total_ret = 0
     for s in pair_summaries:
         status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
-        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['sharpe']:>7.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
+        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['sortino']:>7.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
         total_ret += s['return']
         
     avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
