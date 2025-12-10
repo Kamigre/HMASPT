@@ -72,7 +72,23 @@ class PortfolioVisualizer:
             if col not in df.columns: df[col] = val
 
         steps = df['local_step']
-        df['cum_return_pct'] = df['cum_return'] * 100
+        
+        # --- FIX: RECALCULATE CUMULATIVE RETURN CORRECTLY ---
+        # If 'cum_return' from traces is reliable, use it. Otherwise, calculate from equity.
+        if 'portfolio_value' in df.columns:
+            start_val = df['portfolio_value'].iloc[0]
+            if start_val > 0:
+                df['equity_curve_norm'] = (df['portfolio_value'] / start_val) * 100
+                df['cum_return_pct'] = df['equity_curve_norm'] - 100
+            else:
+                # Fallback if start value is 0 (unlikely but possible)
+                df['equity_curve_norm'] = 100 + (df['cum_return'] * 100)
+                df['cum_return_pct'] = df['cum_return'] * 100
+        else:
+            # Fallback to existing cum_return
+            df['cum_return_pct'] = df['cum_return'] * 100
+            df['equity_curve_norm'] = 100 + df['cum_return_pct']
+
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
         trades_entry = df[df['trade_occurred'] == True] 
@@ -92,7 +108,7 @@ class PortfolioVisualizer:
             win_rate = 0.0
             
         total_pnl = df['realized_pnl'].iloc[-1]
-        final_ret = df['cum_return'].iloc[-1]
+        final_ret = df['cum_return_pct'].iloc[-1] / 100 # Back to decimal for consistency
         total_entries = len(trades_entry)
 
         # --- Plotting ---
@@ -107,17 +123,21 @@ class PortfolioVisualizer:
 
         # 1. Equity Curve
         ax1 = fig.add_subplot(gs[0, :3])
-        ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
+        # Use the corrected normalized curve
+        ax1.plot(steps, df['equity_curve_norm'], color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         
         # Fill
-        ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
-        ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
+        # We fill based on value relative to 100, not based on +/- return directly
+        ax1.fill_between(steps, 100, df['equity_curve_norm'], 
+                         where=(df['equity_curve_norm'] >= 100), color=self.colors['fill_profit'], alpha=0.15)
+        ax1.fill_between(steps, 100, df['equity_curve_norm'], 
+                         where=(df['equity_curve_norm'] < 100), color=self.colors['fill_loss'], alpha=0.15)
 
         if not forced_exit.empty:
-            ax1.scatter(forced_exit['local_step'], 100 * (1 + forced_exit['cum_return']), 
+            # Match scatter y-values to the plotted curve
+            forced_indices = forced_exit.index
+            ax1.scatter(forced_exit['local_step'], df.loc[forced_indices, 'equity_curve_norm'], 
                         color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
 
         ax1.set_ylabel('Equity (Base 100)')
@@ -215,6 +235,16 @@ class PortfolioVisualizer:
         df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
         df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
         
+        # --- FIX: RECALCULATE CUMULATIVE RETURN CORRECTLY ---
+        if 'portfolio_value' in df.columns:
+            start_val = df['portfolio_value'].iloc[0]
+            if start_val > 0:
+                cum_ret_pct = ((df['portfolio_value'] / start_val) - 1) * 100
+            else:
+                cum_ret_pct = df['cum_return'] * 100
+        else:
+             cum_ret_pct = df['cum_return'] * 100
+
         fig = plt.figure(figsize=(16, 10))
         gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1], hspace=0.15)
         
@@ -231,7 +261,6 @@ class PortfolioVisualizer:
         plt.setp(ax1.get_xticklabels(), visible=False)
 
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        cum_ret_pct = df['cum_return'] * 100
         ax2.plot(df['local_step'], cum_ret_pct, color=self.colors['primary'], lw=2, label="Strategy Return %")
         
         ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct >= 0), color=self.colors['fill_profit'], alpha=0.2)
@@ -252,8 +281,6 @@ class PortfolioVisualizer:
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard.
-        Crucial Update: Uses the pre-calculated equity curve from 'evaluate_portfolio' 
-        to ensure the graph matches the calculated Sharpe/Sortino ratios exactly.
         """
         metrics = final_summary['metrics']
         pair_summaries = metrics.get('pair_summaries', [])
@@ -265,24 +292,18 @@ class PortfolioVisualizer:
             return
     
         # --- 1. RETRIEVE PRE-CALCULATED CURVE (Single Source of Truth) ---
-        # We prefer the curve calculated in evaluate_portfolio to avoid 're-calculation drift'
         if "equity_curve" in metrics and "equity_curve_dates" in metrics:
             dates = metrics["equity_curve_dates"]
             values = metrics["equity_curve"]
-            # Reconstruct Series
             portfolio_equity_curve = pd.Series(data=values, index=dates)
         else:
-            # Fallback: If metrics are missing (e.g. from older version), calculate crudely
             print("⚠️ Pre-calculated curve not found. Falling back to simple summation.")
             time_col = 'timestamp' if 'timestamp' in df_all.columns else 'step'
             equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
             global_sum = equity_matrix.ffill().fillna(0).sum(axis=1)
             portfolio_equity_curve = (global_sum / global_sum.iloc[0]) * 100
     
-        # Prepare data for plotting
-        portfolio_return_pct = portfolio_equity_curve - 100
-        
-        # Retrieve Metrics Directly (Do not recalculate)
+        # Retrieve Metrics Directly
         agg_sharpe = metrics.get('sharpe_ratio', 0.0)
         agg_sortino = metrics.get('sortino_ratio', 0.0)
         portfolio_max_dd = metrics.get('max_drawdown', 0.0)
@@ -320,7 +341,6 @@ class PortfolioVisualizer:
                          xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
                          bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
     
-        est_capital = df_all['portfolio_value'].max() # Rough estimate for title
         ax1.set_title(f"Aggregated Performance (Sharpe: {agg_sharpe:.2f} | Sortino: {agg_sortino:.2f})", loc='left')
         ax1.set_ylabel("Equity (Base 100)")
         ax1.legend(loc='upper left')
@@ -339,7 +359,7 @@ class PortfolioVisualizer:
         if len(pair_names) > 10:
             plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
     
-        # 3. Correlation Analysis (Only if we have time col)
+        # 3. Correlation Analysis
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
         if time_col in df_all.columns:
             pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
@@ -354,11 +374,13 @@ class PortfolioVisualizer:
                 corr_values = corr_matrix.where(mask).stack().values
                 ax3 = fig.add_subplot(gs[2, 0])
                 sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
-                ax3.set_title("Diversification Health (Correlation Dist.)", loc='left')
+                ax3.set_title("Diversification Health", loc='left')
                 ax3.set_xlabel("Pairwise Correlation")
                 
-                # 3b. Top Risk Table
-                corr_stacked = corr_matrix.where(mask).stack().reset_index()
+                # 3b. Top Risk Table -- FIXED BUG HERE --
+                # Using name='Corr' prevents the collision with the existing 'pair' column name if it exists in index
+                corr_stacked = corr_matrix.where(mask).stack().reset_index(name='Corr')
+                # Now rename explicitly
                 corr_stacked.columns = ['Pair A', 'Pair B', 'Corr']
                 top_corr = corr_stacked.sort_values('Corr', ascending=False).head(8)
                 
@@ -389,7 +411,6 @@ class PortfolioVisualizer:
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
-        # Use metrics passed from evaluate_portfolio
         flat_metrics = [
             ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
@@ -427,13 +448,10 @@ class PortfolioVisualizer:
     def visualize_executive_summary(self, explanation_text: str):
         """
         Creates a dedicated Executive Summary card with the Gemini explanation.
-        Optimized to dynamically resize height so text is never cut off.
         """
         if not explanation_text:
             return
 
-        # 1. Formatting and Wrapping text first to calculate size
-        # Increased width to 100 characters for better fit
         wrapper = textwrap.TextWrapper(width=100, replace_whitespace=False)
         formatted_text = ""
         
@@ -442,28 +460,20 @@ class PortfolioVisualizer:
             if p.strip():
                 formatted_text += "\n".join(wrapper.wrap(p)) + "\n\n"
         
-        # 2. Calculate required height
-        # Estimate: Base height + (Lines * Height per line)
         num_lines = formatted_text.count('\n')
-        estimated_height = max(10, 4 + (num_lines * 0.4)) # 0.4 inch per line buffer
+        estimated_height = max(10, 4 + (num_lines * 0.4)) 
 
-        # 3. Create Figure with Dynamic Height
         fig = plt.figure(figsize=(18, estimated_height))
         fig.patch.set_facecolor(self.colors['text_bg'])
         ax = fig.add_subplot(111)
         ax.axis('off')
 
-        # 4. Render Text
-        # Header
         ax.text(0.05, 0.98, "Risk Manager: Executive Summary", 
                  fontsize=24, weight='bold', color=self.colors['primary'], va='top', ha='left')
         
-        # Body (Aligned Top-Left)
-        # We start slightly lower (0.92) to leave room for header
         ax.text(0.05, 0.92, formatted_text, 
                  fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
 
-        # Footer
         ax.text(0.5, 0.02, "Generated by AI Supervisor Agent", 
                  fontsize=12, color=self.colors['neutral'], ha='center', va='bottom')
 
@@ -482,28 +492,21 @@ class PortfolioVisualizer:
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
     def _calculate_sortino(self, returns):
-            """Calculates the Annualized Sortino Ratio (Downside Risk only)."""
+            """Calculates the Annualized Sortino Ratio."""
             if len(returns) < 2: return 0.0
             
-            # 1. Define Risk-Free Rate and Excess Returns
             rf = CONFIG.get("risk_free_rate", 0.04) / 252 
             returns_np = np.array(returns)
             exc = returns_np - rf
             avg_excess_return = np.mean(exc)
             
-            # 2. Calculate Downside Deviation
-            # We only care about returns that fell BELOW the target (rf)
             negative_excess_returns = exc[exc < 0]
             
             if len(negative_excess_returns) == 0:
-                # If there is no downside risk (no returns below rf), 
-                # Sortino is theoretically infinite. We cap it or return a high value.
                 return 10.0 if avg_excess_return > 0 else 0.0
     
-            # ddof=1 for sample standard deviation
             downside_std = np.std(negative_excess_returns, ddof=1)
             
-            # 3. Calculate Ratio & Annualize
             if downside_std > 1e-8:
                 return (avg_excess_return / downside_std) * np.sqrt(252)
             else:
@@ -522,7 +525,6 @@ def generate_all_visualizations(all_traces: List[Dict],
     
     visualizer = PortfolioVisualizer(output_dir)
     
-    # Group traces by pair
     traces_by_pair = {}
     for t in all_traces:
         pair = t['pair']
@@ -530,7 +532,6 @@ def generate_all_visualizations(all_traces: List[Dict],
             traces_by_pair[pair] = []
         traces_by_pair[pair].append(t)
     
-    # Generate individual pair reports
     print("\n📊 Generating pair-level reports...")
     for pair_name, traces in traces_by_pair.items():
         skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
@@ -539,11 +540,9 @@ def generate_all_visualizations(all_traces: List[Dict],
         visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
         visualizer.visualize_pair_behavior(traces, pair_name)
     
-    # Generate portfolio aggregate
     print("\n📊 Generating portfolio aggregate report...")
     visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
     
-    # Generate Executive Summary Text Card
     if 'explanation' in final_summary:
         print("\n📄 Generating executive summary card...")
         visualizer.visualize_executive_summary(final_summary['explanation'])
