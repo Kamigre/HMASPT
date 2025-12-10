@@ -298,97 +298,118 @@ class SupervisorAgent:
     # ===================================================================
     
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Evaluate complete portfolio performance using robust Pandas aggregation."""
+        """
+        Evaluate complete portfolio performance using robust 'Delta PnL' aggregation.
+        This prevents 'Capital Injection' bugs where new pairs appearing look like profit.
+        """
         
         # --- 1. DATA PREPARATION ---
         df_all = pd.DataFrame(operator_traces)
         
-        # Handle empty data case immediately
+        # Handle empty data
         if df_all.empty:
             return {
                 "metrics": {
-                    "total_pnl": 0.0,
-                    "sharpe_ratio": 0.0,
-                    "sortino_ratio": 0.0,
-                    "max_drawdown": 0.0,
-                    "win_rate": 0.0,
-                    "var_95": 0.0,
-                    "cvar_95": 0.0,
-                    "cum_return": 0.0
+                    "total_pnl": 0.0, "sharpe_ratio": 0.0, "sortino_ratio": 0.0,
+                    "max_drawdown": 0.0, "win_rate": 0.0, "cum_return": 0.0,
+                    # Return empty lists for consistency
+                    "equity_curve": [], "dates": [] 
                 },
                 "actions": [],
                 "explanation": "No data available."
             }
     
-        # Ensure we have a consistent time column
+        # Normalize time column
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'step'
+        if time_col not in df_all.columns and 'local_step' in df_all.columns:
+            time_col = 'local_step'
     
-        # --- 2. CALCULATE GLOBAL TIME SERIES (Pandas Method) ---
-        # Pivot to align all pairs by time/step
+        # Ensure time is sorted
+        df_all[time_col] = pd.to_datetime(df_all[time_col]) if time_col == 'timestamp' else df_all[time_col]
+        df_all = df_all.sort_values(by=time_col)
+    
+        # --- 2. ROBUST EQUITY CURVE CALCULATION ---
+        # Pivot: Index=Time, Columns=Pair, Values=Portfolio Value
         equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
         
-        # Forward fill to handle steps where a pair didn't emit a new trace (holds last value)
-        equity_matrix = equity_matrix.ffill().fillna(0.0)
+        # Forward fill: If a pair creates no new trace, it holds its last value.
+        # We do NOT fillna(0) yet, because 0 implies a 100% loss. NaN implies "not active".
+        equity_matrix_ffill = equity_matrix.ffill()
+    
+        # Calculate Dollar PnL per step (Change in value)
+        # diff() ensures that the first appearance of a pair (NaN -> Value) results in NaN change, not Profit.
+        dollar_pnl_matrix = equity_matrix_ffill.diff()
         
-        # Sum across all pairs to get the TRUE Portfolio Equity Curve
-        global_equity_series = equity_matrix.sum(axis=1)
+        # Sum dollar PnL across all pairs for each step
+        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
-        # Calculate Portfolio-Wide Returns (percentage change step-to-step)
-        global_returns_series = global_equity_series.pct_change().dropna()
+        # Calculate Total Invested Capital per step (Sum of active pairs)
+        # We fill NaN with 0 here just for the summation of capital
+        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
+        
+        # Calculate Percentage Returns
+        # Return = Global Dollar PnL / Previous Step's Total Capital
+        # We shift capital by 1 to represent "Assets at beginning of period"
+        prev_capital = total_capital_series.shift(1)
+        
+        # Avoid division by zero
+        global_returns_series = global_dollar_pnl / prev_capital
+        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        
+        # Clean returns list for metrics
         global_returns = global_returns_series.tolist()
     
+        # Reconstruct the "Normalized" Equity Curve (Start at 100)
+        # This is the standard curve used for visual comparison
+        cum_returns = (1 + global_returns_series).cumprod()
+        normalized_equity_curve = 100 * cum_returns
+        
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
         total_portfolio_realized_pnl = 0.0
-        
-        # Get unique pairs
         pairs = equity_matrix.columns.tolist()
     
         for pair in pairs:
-            # Extract pair specific data from original DF
-            pair_df = df_all[df_all['pair'] == pair].sort_values(by=time_col)
-            
-            if pair_df.empty:
-                continue
+            pair_df = df_all[df_all['pair'] == pair]
+            if pair_df.empty: continue
     
             # Returns for this specific pair
-            pair_returns = pair_df['portfolio_value'].pct_change().dropna().tolist()
-            
+            pair_vals = pair_df['portfolio_value'].sort_index()
+            pair_ret = pair_vals.pct_change().dropna().tolist()
+    
             # PnL & Metrics
             final_trace = pair_df.iloc[-1]
             pair_total_pnl = final_trace.get("realized_pnl", 0.0)
             total_portfolio_realized_pnl += pair_total_pnl
             
+            # Pair-specific Drawdown
+            p_vals = pair_df['portfolio_value']
+            p_max = p_vals.cummax()
+            p_dd = (p_vals - p_max) / p_max
+            pair_max_dd = abs(p_dd.min()) if not p_dd.empty else 0.0
+    
             initial_val = pair_df.iloc[0]['portfolio_value']
             final_val = pair_df.iloc[-1]['portfolio_value']
-            cum_ret = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
-            
-            # Robust Max Drawdown calculation for this pair
-            if 'max_drawdown' in pair_df.columns:
-                pair_max_dd = pair_df['max_drawdown'].max()
-            else:
-                run_max = pair_df['portfolio_value'].cummax()
-                dd = (pair_df['portfolio_value'] - run_max) / run_max
-                pair_max_dd = abs(dd.min())
+            c_ret = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
     
             pair_summaries.append({
                 "pair": pair,
                 "total_pnl": pair_total_pnl,
-                "cum_return": cum_ret,
-                "sharpe": self._calculate_sharpe(pair_returns),
-                "sortino": self._calculate_sortino(pair_returns),
+                "cum_return": c_ret,
+                "sharpe": self._calculate_sharpe(pair_ret),
+                "sortino": self._calculate_sortino(pair_ret),
                 "max_drawdown": pair_max_dd,
                 "steps": len(pair_df)
             })
     
-        # --- 4. CALCULATE GLOBAL PORTFOLIO METRICS ---
+        # --- 4. CALCULATE GLOBAL METRICS ---
         
-        # 4a. Robust Portfolio Drawdown (based on global equity curve)
-        running_max = global_equity_series.cummax()
-        dd_series = (global_equity_series - running_max) / running_max
+        # Max Drawdown (Based on the normalized curve)
+        running_max = normalized_equity_curve.cummax()
+        dd_series = (normalized_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
-    
-        # 4b. Basic Metrics Dictionary
+        
+        # Basic Metrics
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
             "sharpe_ratio": self._calculate_sharpe(global_returns),
@@ -399,13 +420,17 @@ class SupervisorAgent:
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
         }
-        
-        # --- 5. CALCULATE WIN RATE (Based on closed trades) ---
-        # Filter for rows where PnL changed or a trade event occurred
+    
+        # --- 5. EXPORT CURVE DATA FOR VISUALIZATION (Single Source of Truth) ---
+        # We embed the time series data directly so the visualizer doesn't have to recalculate it.
+        metrics["equity_curve"] = normalized_equity_curve.tolist()
+        # Convert timestamps to strings for JSON serializability if needed, or keep as Index
+        metrics["equity_curve_dates"] = normalized_equity_curve.index.tolist()
+    
+        # --- 6. WIN RATE & RISK ---
         if 'realized_pnl_this_step' in df_all.columns:
             closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
             if not closed_trades.empty:
-                # A win is defined as Positive PnL AFTER transaction costs
                 costs = closed_trades.get('transaction_costs', 0.0)
                 wins = ((closed_trades['realized_pnl_this_step'] - costs) > 0).sum()
                 metrics["win_rate"] = wins / len(closed_trades)
@@ -413,30 +438,16 @@ class SupervisorAgent:
                 metrics["win_rate"] = 0.0
         else:
             metrics["win_rate"] = 0.0
-        
-        # --- 6. CALCULATE RISK METRICS (VaR/CVaR) ---
+    
         if global_returns:
             metrics["var_95"] = float(np.percentile(global_returns, 5))
             tail_losses = [r for r in global_returns if r <= metrics["var_95"]]
             metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
         else:
-            metrics["var_95"] = 0.0
-            metrics["cvar_95"] = 0.0
+            metrics["var_95"] = 0.0; metrics["cvar_95"] = 0.0
     
-        # --- 7. ADDITIONAL ACTIVITY METRICS ---
-        metrics["positive_returns"] = sum(1 for r in global_returns if r > 0)
-        metrics["negative_returns"] = sum(1 for r in global_returns if r < 0)
-        metrics["median_return"] = float(np.median(global_returns)) if global_returns else 0.0
-        metrics["std_return"] = float(np.std(global_returns)) if global_returns else 0.0
-        metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
-        
-        # --- 8. GLOBAL CUMULATIVE RETURN ---
-        if not global_equity_series.empty:
-            start_pv = global_equity_series.iloc[0]
-            end_pv = global_equity_series.iloc[-1]
-            metrics["cum_return"] = (end_pv - start_pv) / start_pv if start_pv > 0 else 0.0
-        else:
-            metrics["cum_return"] = 0.0
+        # Final Cumulative Return
+        metrics["cum_return"] = (normalized_equity_curve.iloc[-1] - 100) / 100 if not normalized_equity_curve.empty else 0.0
     
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
