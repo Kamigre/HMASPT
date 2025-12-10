@@ -338,35 +338,29 @@ class SupervisorAgent:
         # diff() ensures that the first appearance of a pair (NaN -> Value) results in NaN change, not Profit.
         dollar_pnl_matrix = equity_matrix_ffill.diff()
         
-        # Sum dollar PnL across all pairs for each step (The daily/stepwise profit in $)
-        global_dollar_pnl_series = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
+        # Sum dollar PnL across all pairs for each step
+        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
-        # Calculate Total Invested Capital at the start (Initial Capital)
-        # We assume the very first valid row of the matrix represents the initial state.
-        initial_capital = equity_matrix_ffill.iloc[0].sum()
+        # Calculate Total Invested Capital per step (Sum of active pairs)
+        # We fill NaN with 0 here just for the summation of capital
+        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
         
-        # Safety check for zero capital to avoid division errors
-        if initial_capital == 0:
-            initial_capital = 1.0 # Fallback to avoid division by zero if starts empty
-            
-        # --- FIXED: Arithmetic Equity Curve ---
-        # Instead of compounding returns (cumprod), we accumulate the Dollar PnL 
-        # and add it to the Initial Capital to get the running Equity Value.
-        cumulative_dollar_pnl = global_dollar_pnl_series.cumsum()
+        # Calculate Percentage Returns
+        # Return = Global Dollar PnL / Previous Step's Total Capital
+        # We shift capital by 1 to represent "Assets at beginning of period"
+        prev_capital = total_capital_series.shift(1)
         
-        # The running equity is simply Initial Capital + Accumulated Profit/Loss
-        running_equity_value = initial_capital + cumulative_dollar_pnl
-        
-        # Normalize to start at 100 for the visualization
-        # Formula: (Running Equity / Initial Capital) * 100
-        normalized_equity_curve = (running_equity_value / initial_capital) * 100
-        
-        # Global Returns (Percentage change for Sharpe/Sortino calculations)
-        # We still calculate step-wise returns for volatility metrics
-        prev_equity = running_equity_value.shift(1).fillna(initial_capital)
-        global_returns_series = (running_equity_value - prev_equity) / prev_equity
+        # Avoid division by zero and handle infinity
+        global_returns_series = global_dollar_pnl / prev_capital
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        global_returns = global_returns_series.tolist()
+        
+        # Reconstruct the "Normalized" Equity Curve (Start at 100)
+        # We calculate directly on the Series now, removing the intermediate list conversion
+        cum_returns = (1 + global_returns_series).cumprod()
+        normalized_equity_curve = 100 * cum_returns
+        
+        # Optional: If you need the % return formatted specifically
+        portfolio_return_pct = normalized_equity_curve - 100
         
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
@@ -415,18 +409,20 @@ class SupervisorAgent:
         
         # Basic Metrics
         metrics = {
-            "total_pnl": cumulative_dollar_pnl.iloc[-1] if not cumulative_dollar_pnl.empty else 0.0,
-            "sharpe_ratio": self._calculate_sharpe(global_returns),
-            "sortino_ratio": self._calculate_sortino(global_returns),
+            "total_pnl": total_portfolio_realized_pnl,
+            "sharpe_ratio": self._calculate_sharpe(global_returns_series),
+            "sortino_ratio": self._calculate_sortino(global_returns_series),
             "max_drawdown": portfolio_max_dd, 
-            "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
+            "avg_return": float(np.mean(global_returns_series)) if global_returns_series else 0.0,
             "total_steps": len(df_all),
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
         }
         
         # --- 5. EXPORT CURVE DATA FOR VISUALIZATION ---
+        # We embed the time series data directly so the visualizer can opt to use it directly
         metrics["equity_curve"] = normalized_equity_curve.tolist()
+        # Convert timestamps to strings for JSON serializability if needed, or keep as Index
         metrics["equity_curve_dates"] = normalized_equity_curve.index.tolist()
 
         # --- 6. WIN RATE & RISK ---
@@ -450,7 +446,6 @@ class SupervisorAgent:
             metrics["var_95"] = 0.0; metrics["cvar_95"] = 0.0
 
         # Final Cumulative Return
-        # This will now match exactly: (Total PnL / Initial Capital)
         metrics["cum_return"] = (normalized_equity_curve.iloc[-1] - 100) / 100 if not normalized_equity_curve.empty else 0.0
 
         actions = self._generate_portfolio_actions(metrics)
