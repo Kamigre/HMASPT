@@ -300,26 +300,26 @@ class SupervisorAgent:
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Evaluate complete portfolio performance."""
         
-        # Group traces by pair
+        # 1. Group traces by pair
         traces_by_pair = {}
         for t in operator_traces:
             traces_by_pair.setdefault(t['pair'], []).append(t)
 
         all_returns = []
-        all_pnls = []
         pair_summaries = []
+        
+        # Initialize global accumulator for Total Realized PnL
+        total_portfolio_realized_pnl = 0.0
 
-        # Process each pair
+        # 2. Process each pair individually
         for pair, traces in traces_by_pair.items():
             pair_returns = []
-            pair_pnls = []
             
-            # Sort traces by step just in case they are out of order
+            # Sort traces by step to ensure chronological order
             traces = sorted(traces, key=lambda x: x['step'])
 
+            # Calculate returns per step for Sharpe/Sortino
             for i in range(1, len(traces)):
-                pnl = traces[i].get("realized_pnl_this_step", 0)
-                
                 pv_curr = traces[i].get("portfolio_value", 0)
                 pv_prev = traces[i-1].get("portfolio_value", 0)
                 
@@ -330,18 +330,24 @@ class SupervisorAgent:
                 
                 pair_returns.append(ret)
                 all_returns.append(ret)
-                
-                pair_pnls.append(pnl)
-                all_pnls.append(pnl)
 
-            # Pair stats
+            # --- CALCULATE PAIR PNL ---
+            # We take the realized_pnl from the very last trace of the pair.
+            # This assumes 'realized_pnl' tracks the running total for that pair.
+            final_trace = traces[-1]
+            pair_total_pnl = final_trace.get("realized_pnl", 0)
+
+            # Add to global total
+            total_portfolio_realized_pnl += pair_total_pnl
+
+            # Calculate Pair Specific Metrics
             initial = traces[0]['portfolio_value']
-            final = traces[-1]['portfolio_value']
+            final = final_trace['portfolio_value']
             cum_ret = (final - initial) / initial if initial > 0 else 0
             
             pair_summaries.append({
                 "pair": pair,
-                "total_pnl": sum(pair_pnls),
+                "total_pnl": pair_total_pnl,
                 "cum_return": cum_ret,
                 "sharpe": self._calculate_sharpe(pair_returns),
                 "sortino": self._calculate_sortino(pair_returns),
@@ -349,9 +355,9 @@ class SupervisorAgent:
                 "steps": len(traces)
             })
 
-        # Global stats
+        # 3. Calculate Global Portfolio Metrics
         metrics = {
-            "total_pnl": sum(all_pnls),
+            "total_pnl": total_portfolio_realized_pnl,  # <--- Updated Sum
             "sharpe_ratio": self._calculate_sharpe(all_returns),
             "sortino_ratio": self._calculate_sortino(all_returns),
             "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
@@ -361,7 +367,7 @@ class SupervisorAgent:
             "pair_summaries": pair_summaries
         }
         
-        # --- CORRECT WIN RATE CALCULATION (Matching Visualizer) ---
+        # 4. Calculate Win Rate (Based on closed trades)
         # Filter for steps where a trade was explicitly closed/adjusted
         closed_trades = [t for t in operator_traces if t.get("realized_pnl_this_step", 0) != 0]
         if closed_trades:
@@ -371,7 +377,7 @@ class SupervisorAgent:
         else:
             metrics["win_rate"] = 0.0
         
-        # Calculate Risk Metrics (VaR/CVaR)
+        # 5. Calculate Risk Metrics (VaR/CVaR)
         if all_returns:
             metrics["var_95"] = float(np.percentile(all_returns, 5))
             tail_losses = [r for r in all_returns if r <= metrics["var_95"]]
@@ -380,14 +386,14 @@ class SupervisorAgent:
             metrics["var_95"] = 0.0
             metrics["cvar_95"] = 0.0
 
-        # Additional activity metrics
+        # 6. Additional activity metrics
         metrics["positive_returns"] = sum(1 for r in all_returns if r > 0)
         metrics["negative_returns"] = sum(1 for r in all_returns if r < 0)
         metrics["median_return"] = float(np.median(all_returns)) if all_returns else 0.0
         metrics["std_return"] = float(np.std(all_returns)) if all_returns else 0.0
         metrics["avg_steps_per_pair"] = metrics["total_steps"] / max(metrics["n_pairs"], 1)
         
-        # Store cumulative return properly
+        # 7. Global Cumulative Return
         if operator_traces:
             sorted_traces = sorted(operator_traces, key=lambda x: x['step'])
             start_pv = sorted_traces[0].get("portfolio_value", 0)
