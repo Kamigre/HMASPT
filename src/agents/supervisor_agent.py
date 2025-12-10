@@ -298,99 +298,103 @@ class SupervisorAgent:
     # ===================================================================
     
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Evaluate complete portfolio performance."""
+        """Evaluate complete portfolio performance using robust Pandas aggregation."""
         
-        # --- 1. PRE-CALCULATE GLOBAL TIME SERIES ---
-        # We must aggregate value by time step to get true Portfolio Returns.
-        # This handles correlations (e.g., hedging) correctly for Sharpe/Sortino.
-        portfolio_by_step = {}
-        for t in operator_traces:
-            step = t['step']
-            # Sum the portfolio_value of all pairs active at this step
-            portfolio_by_step.setdefault(step, 0.0)
-            portfolio_by_step[step] += t.get('portfolio_value', 0.0)
-
-        # Sort steps and calculate GLOBAL returns stream
-        sorted_steps = sorted(portfolio_by_step.keys())
-        global_returns = []
+        # --- 1. DATA PREPARATION ---
+        df_all = pd.DataFrame(operator_traces)
         
-        if len(sorted_steps) > 1:
-            for i in range(1, len(sorted_steps)):
-                curr_step = sorted_steps[i]
-                prev_step = sorted_steps[i-1]
-                
-                curr_pv = portfolio_by_step[curr_step]
-                prev_pv = portfolio_by_step[prev_step]
-                
-                # Avoid division by zero
-                if prev_pv > 0:
-                    ret = (curr_pv - prev_pv) / prev_pv
-                else:
-                    ret = 0.0
-                global_returns.append(ret)
-
-        # --- 2. GROUP TRACES BY PAIR ---
-        traces_by_pair = {}
-        for t in operator_traces:
-            traces_by_pair.setdefault(t['pair'], []).append(t)
-
+        if df_all.empty:
+            return {
+                "total_pnl": 0.0,
+                "sharpe_ratio": 0.0,
+                "sortino_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "avg_return": 0.0,
+                "total_steps": 0,
+                "n_pairs": 0,
+                "pair_summaries": []
+            }
+    
+        # Ensure we have a consistent time column
+        time_col = 'timestamp' if 'timestamp' in df_all.columns else 'step'
+    
+        # --- 2. CALCULATE GLOBAL TIME SERIES (Pandas Method) ---
+        # Pivot to align all pairs by time/step
+        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+        
+        # Forward fill to handle steps where a pair didn't emit a new trace (holds last value)
+        equity_matrix = equity_matrix.ffill().fillna(0.0)
+        
+        # Sum across all pairs to get the TRUE Portfolio Equity Curve
+        global_equity_series = equity_matrix.sum(axis=1)
+        
+        # Calculate Portfolio-Wide Returns (percentage change step-to-step)
+        global_returns_series = global_equity_series.pct_change().dropna()
+        global_returns = global_returns_series.tolist()
+    
+        # --- 3. PROCESS PAIR SUMMARIES ---
+        # We still need individual pair metrics for the summary
         pair_summaries = []
-        
-        # Initialize global accumulator for Total Realized PnL
         total_portfolio_realized_pnl = 0.0
-
-        # --- 3. PROCESS EACH PAIR INDIVIDUALLY ---
-        for pair, traces in traces_by_pair.items():
-            pair_returns = []
+        
+        # Get unique pairs from columns
+        pairs = equity_matrix.columns.tolist()
+    
+        for pair in pairs:
+            # Extract pair specific data from original DF
+            pair_df = df_all[df_all['pair'] == pair].sort_values(by=time_col)
             
-            # Sort traces by step to ensure chronological order
-            traces = sorted(traces, key=lambda x: x['step'])
-
-            # Calculate returns per step for Pair-Specific Sharpe/Sortino
-            for i in range(1, len(traces)):
-                pv_curr = traces[i].get("portfolio_value", 0)
-                pv_prev = traces[i-1].get("portfolio_value", 0)
-                
-                if pv_prev > 0:
-                    ret = (pv_curr - pv_prev) / pv_prev
-                else:
-                    ret = 0.0
-                
-                pair_returns.append(ret)
-                # NOTE: We do NOT append to global_returns here anymore.
-
-            # --- CALCULATE PAIR PNL ---
-            final_trace = traces[-1]
-            pair_total_pnl = final_trace.get("realized_pnl", 0)
-
-            # Add to global total
+            if pair_df.empty:
+                continue
+    
+            # Returns for this specific pair
+            # We calculate pct_change on the portfolio_value
+            pair_returns = pair_df['portfolio_value'].pct_change().dropna().tolist()
+            
+            # PnL & Metrics
+            final_trace = pair_df.iloc[-1]
+            pair_total_pnl = final_trace.get("realized_pnl", 0.0)
             total_portfolio_realized_pnl += pair_total_pnl
-
-            # Calculate Pair Specific Metrics
-            initial = traces[0]['portfolio_value']
-            final = final_trace['portfolio_value']
-            cum_ret = (final - initial) / initial if initial > 0 else 0
             
+            initial_val = pair_df.iloc[0]['portfolio_value']
+            final_val = pair_df.iloc[-1]['portfolio_value']
+            cum_ret = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
+            
+            # Max Drawdown for this pair
+            # (Assuming 'max_drawdown' is tracked in the trace, otherwise we calculate it)
+            if 'max_drawdown' in pair_df.columns:
+                pair_max_dd = pair_df['max_drawdown'].max()
+            else:
+                # Fallback calculation if not in trace
+                run_max = pair_df['portfolio_value'].cummax()
+                dd = (pair_df['portfolio_value'] - run_max) / run_max
+                pair_max_dd = abs(dd.min())
+    
             pair_summaries.append({
                 "pair": pair,
                 "total_pnl": pair_total_pnl,
                 "cum_return": cum_ret,
                 "sharpe": self._calculate_sharpe(pair_returns),
                 "sortino": self._calculate_sortino(pair_returns),
-                "max_drawdown": max([t.get("max_drawdown", 0) for t in traces] + [0]),
-                "steps": len(traces)
+                "max_drawdown": pair_max_dd,
+                "steps": len(pair_df)
             })
-
+    
         # --- 4. CALCULATE GLOBAL PORTFOLIO METRICS ---
-        # Note: We now use `global_returns` for portfolio-wide risk metrics
+        # Drawdown on the Global Curve
+        running_max = global_equity_series.cummax()
+        dd_series = (global_equity_series - running_max) / running_max
+        portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
+    
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
+            # Now using the aligned global_returns!
             "sharpe_ratio": self._calculate_sharpe(global_returns),
             "sortino_ratio": self._calculate_sortino(global_returns),
-            "max_drawdown": max([p['max_drawdown'] for p in pair_summaries] + [0]),
+            "max_drawdown": portfolio_max_dd, 
             "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
-            "total_steps": len(operator_traces),
-            "n_pairs": len(traces_by_pair),
+            "total_steps": len(df_all),
+            "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
         }
         
