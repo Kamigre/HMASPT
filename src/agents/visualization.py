@@ -249,7 +249,7 @@ class PortfolioVisualizer:
         plt.close()
         print(f"    📉 Saved behavior analysis: {filepath}")
 
-        def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
+    def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard.
         Crucial Update: Uses the pre-calculated equity curve from 'evaluate_portfolio' 
