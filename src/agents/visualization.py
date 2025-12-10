@@ -250,232 +250,236 @@ class PortfolioVisualizer:
         print(f"    📉 Saved behavior analysis: {filepath}")
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
-            """
-            Create aggregated portfolio dashboard with improved Correlation analysis AND
-            Correctly calculated Portfolio-Wide Maximum Drawdown.
-            """
-            metrics = final_summary['metrics']
-            pair_summaries = metrics['pair_summaries']
+        """
+        Create aggregated portfolio dashboard with improved Correlation analysis AND
+        Correctly calculated Portfolio-Wide Maximum Drawdown using Robust Logic.
+        """
+        metrics = final_summary['metrics']
+        pair_summaries = metrics['pair_summaries']
+        
+        # --- Data Processing ---
+        df_all = pd.DataFrame(all_traces)
+        if df_all.empty:
+            print("⚠️ No traces to visualize.")
+            return
+
+        if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
+        if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
+
+        # --- Global Win Rate Logic ---
+        trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
+        trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
+        
+        total_global_trades = len(trade_events)
+        if total_global_trades > 0:
+            global_wins = (trade_events['net_pnl'] > 0).sum()
+            global_win_rate = global_wins / total_global_trades
+        else:
+            global_win_rate = 0.0
+
+        time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
+        if time_col not in df_all.columns and 'step' in df_all.columns:
+             time_col = 'step'
+        
+        # Ensure time sorting for visualization
+        if time_col == 'timestamp':
+            df_all[time_col] = pd.to_datetime(df_all[time_col])
+        df_all = df_all.sort_values(by=time_col)
+
+        # --- 1. AGGREGATE PORTFOLIO CURVE (HOMOGENIZED LOGIC) ---
+        # We must use the EXACT same logic as evaluate_portfolio to ensure Sharpe/DD match.
+        # Using simple Sum(PortfolioValue) is WRONG for capital injection scenarios.
+        
+        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+        equity_matrix_ffill = equity_matrix.ffill()
+        
+        # Dollar PnL Change
+        dollar_pnl_matrix = equity_matrix_ffill.diff()
+        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
+        
+        # Invested Capital (Shifted)
+        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
+        prev_capital = total_capital_series.shift(1)
+        
+        # Global Returns
+        global_returns_series = global_dollar_pnl / prev_capital
+        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        
+        # Construct Curve (Base 100)
+        portfolio_equity_curve = 100 * (1 + global_returns_series).cumprod()
+        portfolio_return_pct = portfolio_equity_curve - 100
+
+        # --- 2. CALCULATE METRICS FROM AGGREGATED DATA ---
+        
+        # 2a. Drawdown
+        running_max = portfolio_equity_curve.cummax()
+        dd_series = (portfolio_equity_curve - running_max) / running_max
+        portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
+        
+        # 2b. RE-CALCULATE SHARPE & SORTINO (Based on Aggregated Curve)
+        global_returns_list = global_returns_series.tolist()
+        
+        agg_sharpe = self._calculate_sharpe(global_returns_list)
+        agg_sortino = self._calculate_sortino(global_returns_list)
+
+        print(f"    ℹ️  Global Metrics (Visualizer): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
+
+        # --- Figure Setup ---
+        fig = plt.figure(figsize=(22, 16))
+        gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
+        
+        final_pnl = metrics.get('total_pnl', 0.0)
+        final_pct = portfolio_return_pct.iloc[-1] if not portfolio_return_pct.empty else 0.0
+        
+        fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
+                     fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
+
+        # 1. Main Equity Curve
+        ax1 = fig.add_subplot(gs[0, :])
+        ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
+                          color=self.colors['primary'], alpha=0.1)
+        ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
+        
+        ax1_right = ax1.twinx()
+        ax1_right.set_ylim(ax1.get_ylim())
+        ax1_right.set_yticks(ax1.get_yticks())
+        ax1_right.set_yticklabels([f"{y-100:.0f}%" for y in ax1.get_yticks()])
+        ax1_right.set_ylabel("Total Return (%)", rotation=270, labelpad=20, weight='bold', color=self.colors['neutral'])
+        ax1_right.grid(False)
+
+        if not portfolio_equity_curve.empty:
+            val = portfolio_equity_curve.iloc[-1]
+            ret = val - 100
+            color = self.colors['profit'] if ret >= 0 else self.colors['loss']
+            ax1.annotate(f"{ret:+.2f}%", xy=(portfolio_equity_curve.index[-1], val),
+                         xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
+                         bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
+
+        # Use total capital from equity series max for label (Approximate peak AUM)
+        est_capital = total_capital_series.max()
+        ax1.set_title(f"Aggregated Performance (Peak AUM: ${est_capital:,.0f})", loc='left')
+        ax1.set_ylabel("Equity (Base 100)")
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+
+        # 2. Pair Returns Ranking
+        pair_names = [p['pair'] for p in pair_summaries]
+        pair_returns = [p['cum_return'] * 100 for p in pair_summaries]
+        
+        ax2 = fig.add_subplot(gs[1, :])
+        colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
+        bars = ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
+        ax2.axhline(0, color='black', lw=1)
+        ax2.set_title("Individual Pair Contribution (%)", loc='left')
+        ax2.set_ylabel("Return %")
+        
+        if len(pair_names) > 10:
+            plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+
+        # 3. Correlation Analysis
+        pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
+        pnl_matrix = pnl_matrix.ffill().fillna(0.0)
+        pnl_changes = pnl_matrix.diff().fillna(0.0)
+        
+        if pnl_changes.shape[1] > 1:
+            corr_matrix = pnl_changes.corr()
+            mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
             
-            # --- Data Processing ---
-            df_all = pd.DataFrame(all_traces)
-            if df_all.empty:
-                print("⚠️ No traces to visualize.")
-                return
-    
-            if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
-            if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
-    
-            # --- Global Win Rate Logic ---
-            trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
-            trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
+            # 3a. Histogram
+            corr_values = corr_matrix.where(mask).stack().values
+            ax3 = fig.add_subplot(gs[2, 0])
+            sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
+            ax3.set_title("Diversification Health (Correlation Dist.)", loc='left')
+            ax3.set_xlabel("Pairwise Correlation")
+            ax3.set_ylabel("Frequency")
+            if len(corr_values) > 0:
+                ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
+                ax3.legend()
+
+            # 3b. Top Risk Table
+            corr_stacked = corr_matrix.where(mask).stack()
+            corr_stacked.index.names = ['Pair A', 'Pair B'] 
+            corr_pairs = corr_stacked.reset_index()
+            corr_pairs.columns = ['Pair A', 'Pair B', 'Corr']
             
-            total_global_trades = len(trade_events)
-            if total_global_trades > 0:
-                global_wins = (trade_events['net_pnl'] > 0).sum()
-                global_win_rate = global_wins / total_global_trades
-            else:
-                global_win_rate = 0.0
-    
-            time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
-            if time_col not in df_all.columns and 'step' in df_all.columns:
-                 time_col = 'step'
-    
-            # --- 1. AGGREGATE PORTFOLIO CURVE ---
-            # Pivot 'portfolio_value' to get total equity over time (Sum of all pairs)
-            equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
-            equity_matrix = equity_matrix.ffill().fillna(0.0)
+            top_corr = corr_pairs.sort_values('Corr', ascending=False).head(8)
             
-            # Sum across all pairs
-            global_equity_series = equity_matrix.sum(axis=1)
+            ax4 = fig.add_subplot(gs[2, 1])
+            ax4.axis('off')
+            ax4.set_title("⚠️ Top Concentration Risks", loc='center', color=self.colors['loss'])
             
-            if global_equity_series.empty or global_equity_series.max() == 0:
-                 print("⚠️ Portfolio equity is zero or empty.")
-                 return
-    
-            # Normalize to Base 100
-            start_equity = global_equity_series.iloc[0]
-            portfolio_equity_curve = (global_equity_series / start_equity) * 100 if start_equity > 0 else global_equity_series + 100
-            portfolio_return_pct = portfolio_equity_curve - 100
-    
-            # --- 2. CALCULATE METRICS FROM AGGREGATED DATA ---
+            cell_text = []
+            for _, row in top_corr.iterrows():
+                val_color = self.colors['loss'] if row['Corr'] > 0.7 else self.colors['primary']
+                cell_text.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
             
-            # 2a. Drawdown
-            running_max = portfolio_equity_curve.cummax()
-            dd_series = (portfolio_equity_curve - running_max) / running_max
-            portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
-            
-            # 2b. RE-CALCULATE SHARPE & SORTINO (Based on Aggregated Curve)
-            # We calculate the pct change of the global equity curve step-by-step
-            global_returns_series = global_equity_series.pct_change().dropna()
-            
-            # Convert to list for helper functions
-            global_returns_list = global_returns_series.tolist()
-            
-            # NOTE: Ensure periods_per_year matches your data frequency!
-            # Assuming Daily (252) here. If Hourly, use 8760.
-            agg_sharpe = self._calculate_sharpe(global_returns_list)
-            agg_sortino = self._calculate_sortino(global_returns_list)
-    
-            print(f"    ℹ️  Global Metrics (Recalculated): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
-    
-            # --- Figure Setup ---
-            fig = plt.figure(figsize=(22, 16))
-            gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
-            
-            final_pnl = metrics.get('total_pnl', 0.0)
-            final_pct = portfolio_return_pct.iloc[-1] if not portfolio_return_pct.empty else 0.0
-            
-            fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
-                         fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
-    
-            # 1. Main Equity Curve
-            ax1 = fig.add_subplot(gs[0, :])
-            ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
-            ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
-                              color=self.colors['primary'], alpha=0.1)
-            ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
-            
-            ax1_right = ax1.twinx()
-            ax1_right.set_ylim(ax1.get_ylim())
-            ax1_right.set_yticks(ax1.get_yticks())
-            ax1_right.set_yticklabels([f"{y-100:.0f}%" for y in ax1.get_yticks()])
-            ax1_right.set_ylabel("Total Return (%)", rotation=270, labelpad=20, weight='bold', color=self.colors['neutral'])
-            ax1_right.grid(False)
-    
-            if not portfolio_equity_curve.empty:
-                val = portfolio_equity_curve.iloc[-1]
-                ret = val - 100
-                color = self.colors['profit'] if ret >= 0 else self.colors['loss']
-                ax1.annotate(f"{ret:+.2f}%", xy=(portfolio_equity_curve.index[-1], val),
-                              xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
-                              bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
-    
-            # Use total capital from equity series max for label
-            est_capital = global_equity_series.max()
-            ax1.set_title(f"Aggregated Performance (Peak Equity: ${est_capital:,.0f})", loc='left')
-            ax1.set_ylabel("Equity (Base 100)")
-            ax1.legend(loc='upper left')
-            ax1.grid(True, alpha=0.3)
-    
-            # 2. Pair Returns Ranking
-            pair_names = [p['pair'] for p in pair_summaries]
-            pair_returns = [p['cum_return'] * 100 for p in pair_summaries]
-            skipped_names = [s['pair'] for s in skipped_pairs]
-    
-            ax2 = fig.add_subplot(gs[1, :])
-            colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
-            bars = ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
-            ax2.axhline(0, color='black', lw=1)
-            ax2.set_title("Individual Pair Contribution (%)", loc='left')
-            ax2.set_ylabel("Return %")
-            
-            if len(pair_names) > 10:
-                plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
-    
-            # 3. Correlation Analysis
-            pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
-            pnl_matrix = pnl_matrix.ffill().fillna(0.0)
-            pnl_changes = pnl_matrix.diff().fillna(0.0)
-            
-            if pnl_changes.shape[1] > 1:
-                corr_matrix = pnl_changes.corr()
-                mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
-                
-                # 3a. Histogram
-                corr_values = corr_matrix.where(mask).stack().values
-                ax3 = fig.add_subplot(gs[2, 0])
-                sns.histplot(corr_values, kde=True, ax=ax3, color=self.colors['zscore'], bins=15, alpha=0.6)
-                ax3.set_title("Diversification Health (Correlation Dist.)", loc='left')
-                ax3.set_xlabel("Pairwise Correlation")
-                ax3.set_ylabel("Frequency")
-                if len(corr_values) > 0:
-                    ax3.axvline(np.mean(corr_values), color='black', linestyle='--', label=f'Avg: {np.mean(corr_values):.2f}')
-                    ax3.legend()
-    
-                # 3b. Top Risk Table
-                corr_stacked = corr_matrix.where(mask).stack()
-                corr_stacked.index.names = ['Pair A', 'Pair B'] 
-                corr_pairs = corr_stacked.reset_index()
-                corr_pairs.columns = ['Pair A', 'Pair B', 'Corr']
-                
-                top_corr = corr_pairs.sort_values('Corr', ascending=False).head(8)
-                
-                ax4 = fig.add_subplot(gs[2, 1])
-                ax4.axis('off')
-                ax4.set_title("⚠️ Top Concentration Risks", loc='center', color=self.colors['loss'])
-                
-                cell_text = []
-                for _, row in top_corr.iterrows():
-                    val_color = self.colors['loss'] if row['Corr'] > 0.7 else self.colors['primary']
-                    cell_text.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
-                
-                if not cell_text:
-                    cell_text = [["No significant correlations", "-"]]
-    
-                table = ax4.table(cellText=cell_text, colLabels=["Pair Combination", "Correlation"], 
-                                  loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
-                table.auto_set_font_size(False)
-                table.set_fontsize(11)
-                
-            else:
-                ax3 = fig.add_subplot(gs[2, :2])
-                ax3.text(0.5, 0.5, "Insufficient Data for Correlation Analysis", ha='center', fontsize=14)
-                ax3.axis('off')
-    
-            # 4. Max Drawdown Distribution
-            ax5 = fig.add_subplot(gs[2, 2])
-            pair_dds = [p['max_drawdown']*100 for p in pair_summaries]
-            if pair_dds:
-                sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
-            else:
-                ax5.text(0.5, 0.5, "No Drawdown Data", ha='center')
-            ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
-            ax5.set_xlabel("Drawdown %")
-    
-            # 5. Global Stats Table
-            ax6 = fig.add_subplot(gs[3, :])
-            ax6.axis('off')
-            
-            # Use our newly calculated aggregated metrics
-            flat_metrics = [
-                ("Total Net P&L", f"${final_pnl:,.2f}"),
-                ("Total Return", f"{final_pct:+.2f}%"),
-                ("Sharpe Ratio", f"{agg_sharpe:.2f}"),       # <--- Updated
-                ("Sortino Ratio", f"{agg_sortino:.2f}"),     # <--- Added
-                ("Win Rate", f"{global_win_rate*100:.2f}%"),
-                ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
-                ("VaR (95%)", f"{metrics.get('var_95', 0.0):.4f}"),
-                ("Active Pairs", f"{len(pair_names)}")
-            ]
-            
-            col_count = 4
-            row_count = 2
-            cell_text = [ [] for _ in range(row_count) ]
-            
-            for i, (label, val) in enumerate(flat_metrics):
-                r = i % row_count
-                cell_text[r].extend([label, val])
-    
-            table = ax6.table(cellText=cell_text, loc='center', cellLoc='center', bbox=[0.05, 0.2, 0.9, 0.6])
+            if not cell_text:
+                cell_text = [["No significant correlations", "-"]]
+
+            table = ax4.table(cellText=cell_text, colLabels=["Pair Combination", "Correlation"], 
+                              loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
             table.auto_set_font_size(False)
-            table.set_fontsize(13)
+            table.set_fontsize(11)
             
-            for (row, col), cell in table.get_celld().items():
-                cell.set_edgecolor('white')
-                if col % 2 == 0:
-                    cell.set_facecolor('#f7f9f9')
-                    cell.set_text_props(weight='bold', color=self.colors['primary'])
-                else:
-                    cell.set_facecolor('white')
-                    cell.set_text_props(color='black')
-    
-            # Save Main Dashboard
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = os.path.join(self.output_dir, f"portfolio_dashboard_{timestamp}.png")
-            plt.savefig(filepath)
-            plt.close()
-            print(f"\n📊 Saved portfolio dashboard: {filepath}")
+        else:
+            ax3 = fig.add_subplot(gs[2, :2])
+            ax3.text(0.5, 0.5, "Insufficient Data for Correlation Analysis", ha='center', fontsize=14)
+            ax3.axis('off')
+
+        # 4. Max Drawdown Distribution
+        ax5 = fig.add_subplot(gs[2, 2])
+        pair_dds = [p['max_drawdown']*100 for p in pair_summaries]
+        if pair_dds:
+            sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+        else:
+            ax5.text(0.5, 0.5, "No Drawdown Data", ha='center')
+        ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
+        ax5.set_xlabel("Drawdown %")
+
+        # 5. Global Stats Table
+        ax6 = fig.add_subplot(gs[3, :])
+        ax6.axis('off')
+        
+        # Use our newly calculated aggregated metrics
+        flat_metrics = [
+            ("Total Net P&L", f"${final_pnl:,.2f}"),
+            ("Total Return", f"{final_pct:+.2f}%"),
+            ("Sharpe Ratio", f"{agg_sharpe:.2f}"),
+            ("Sortino Ratio", f"{agg_sortino:.2f}"),
+            ("Win Rate", f"{global_win_rate*100:.2f}%"),
+            ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
+            ("VaR (95%)", f"{metrics.get('var_95', 0.0):.4f}"),
+            ("Active Pairs", f"{len(pair_names)}")
+        ]
+        
+        col_count = 4
+        row_count = 2
+        cell_text = [ [] for _ in range(row_count) ]
+        
+        for i, (label, val) in enumerate(flat_metrics):
+            r = i % row_count
+            cell_text[r].extend([label, val])
+
+        table = ax6.table(cellText=cell_text, loc='center', cellLoc='center', bbox=[0.05, 0.2, 0.9, 0.6])
+        table.auto_set_font_size(False)
+        table.set_fontsize(13)
+        
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor('white')
+            if col % 2 == 0:
+                cell.set_facecolor('#f7f9f9')
+                cell.set_text_props(weight='bold', color=self.colors['primary'])
+            else:
+                cell.set_facecolor('white')
+                cell.set_text_props(color='black')
+
+        # Save Main Dashboard
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.output_dir, f"portfolio_dashboard_{timestamp}.png")
+        plt.savefig(filepath)
+        plt.close()
+        print(f"\n📊 Saved portfolio dashboard: {filepath}")
     
     def visualize_executive_summary(self, explanation_text: str):
         """
