@@ -114,7 +114,7 @@ class SupervisorAgent:
             centered = spread - spread.mean()
             crossings = (centered.shift(1) * centered < 0).sum()
             days = (series_x.index[-1] - series_x.index[0]).days
-            crossings_per_year = float(crossings) / max(days / 365.0, 1e-9)
+            crossings_per_year = float(crossings) / max(days / 252.0, 1e-9)
 
             # Decision Logic
             pass_criteria = (adf_p < 0.05) and (float(hl) < half_life_max) and (crossings_per_year >= min_crossings_per_year)
