@@ -314,8 +314,8 @@ class PortfolioVisualizer:
             
             # NOTE: Ensure periods_per_year matches your data frequency!
             # Assuming Daily (252) here. If Hourly, use 8760.
-            agg_sharpe = self._calculate_sharpe(global_returns_list, periods_per_year=252)
-            agg_sortino = self._calculate_sortino(global_returns_list, periods_per_year=252)
+            agg_sharpe = self._calculate_sharpe(global_returns_list)
+            agg_sortino = self._calculate_sortino(global_returns_list)
     
             print(f"    ℹ️  Global Metrics (Recalculated): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
     
