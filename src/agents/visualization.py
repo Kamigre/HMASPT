@@ -260,11 +260,10 @@ class PortfolioVisualizer:
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
         Create aggregated portfolio dashboard with improved Correlation analysis AND
-        Correctly calculated Portfolio-Wide Maximum Drawdown using Robust Logic.
-        FIXED: Anchors Portfolio Equity Curve to 100.
+        Correctly calculated Portfolio-Wide Maximum Drawdown, VaR, and CVaR.
         """
-        metrics = final_summary['metrics']
-        pair_summaries = metrics['pair_summaries']
+        metrics = final_summary.get('metrics', {})
+        pair_summaries = metrics.get('pair_summaries', [])
         
         # --- Data Processing ---
         df_all = pd.DataFrame(all_traces)
@@ -312,13 +311,11 @@ class PortfolioVisualizer:
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         
         # Construct Curve (Base 100)
-        # FIX: Manual prepend of 100 start
         cum_ret_series = (1 + global_returns_series).cumprod()
         portfolio_equity_curve = 100 * cum_ret_series
         
-        # We manually insert a start point for the PLOT logic
-        # Assuming index is numeric steps or datetime, we just need a visual anchor
-        plot_index = [portfolio_equity_curve.index[0] - 1] + portfolio_equity_curve.index.tolist()
+        # Visual Anchor for Plot
+        plot_index = [portfolio_equity_curve.index[0]] + portfolio_equity_curve.index.tolist()
         plot_values = [100.0] + portfolio_equity_curve.tolist()
         
         portfolio_return_pct = portfolio_equity_curve - 100
@@ -330,13 +327,27 @@ class PortfolioVisualizer:
         dd_series = (portfolio_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
         
-        # 2b. RE-CALCULATE SHARPE & SORTINO (Based on Aggregated Curve)
+        # 2b. Sharpe & Sortino
         global_returns_list = global_returns_series.tolist()
-        
         agg_sharpe = self._calculate_sharpe(global_returns_list)
         agg_sortino = self._calculate_sortino(global_returns_list)
 
-        print(f"    ℹ️  Global Metrics (Visualizer): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%")
+        # 2c. VaR and CVaR (Value at Risk / Conditional Value at Risk)
+        # We calculate this using the historical simulation method (percentiles)
+        if len(global_returns_series) > 0:
+            # VaR 95% = 5th percentile of returns distribution
+            var_95 = np.percentile(global_returns_series, 5)
+            
+            # CVaR 95% = Mean of returns falling below the VaR threshold
+            cvar_returns = global_returns_series[global_returns_series <= var_95]
+            cvar_95 = cvar_returns.mean() if len(cvar_returns) > 0 else var_95
+        else:
+            var_95 = 0.0
+            cvar_95 = 0.0
+
+        
+
+        print(f"    ℹ️  Global Metrics: Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%, VaR={var_95:.4f}, CVaR={cvar_95:.4f}")
 
         # --- Figure Setup ---
         fig = plt.figure(figsize=(22, 16))
@@ -348,11 +359,15 @@ class PortfolioVisualizer:
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
-        # 1. Main Equity Curve (FIXED PLOTTING ARRAYS)
+        # 1. Main Equity Curve
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(plot_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
-        
-        # Fill needs to align with original series for simpler logic
+        # Only plot if we have data to match dimensions
+        if len(plot_index) == len(plot_values):
+            ax1.plot(plot_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        else:
+            # Fallback if manual anchor insertion caused mismatch
+            ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve.values, color=self.colors['primary'], lw=3, label='Portfolio Value')
+
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
                           color=self.colors['primary'], alpha=0.1)
         ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
@@ -372,7 +387,6 @@ class PortfolioVisualizer:
                           xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
                           bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
 
-        # Use total capital from equity series max for label (Approximate peak AUM)
         est_capital = total_capital_series.max()
         ax1.set_title(f"Aggregated Performance (Peak AUM: ${est_capital:,.0f})", loc='left')
         ax1.set_ylabel("Equity (Base 100)")
@@ -380,18 +394,20 @@ class PortfolioVisualizer:
         ax1.grid(True, alpha=0.3)
 
         # 2. Pair Returns Ranking
-        pair_names = [p['pair'] for p in pair_summaries]
-        pair_returns = [p['cum_return'] * 100 for p in pair_summaries]
+        pair_names = [p.get('pair', 'Unknown') for p in pair_summaries]
+        pair_returns = [p.get('cum_return', 0.0) * 100 for p in pair_summaries]
         
         ax2 = fig.add_subplot(gs[1, :])
-        colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
-        bars = ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
-        ax2.axhline(0, color='black', lw=1)
-        ax2.set_title("Individual Pair Contribution (%)", loc='left')
-        ax2.set_ylabel("Return %")
-        
-        if len(pair_names) > 10:
-            plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+        if pair_names:
+            colors = [self.colors['profit'] if r > 0 else self.colors['loss'] for r in pair_returns]
+            ax2.bar(pair_names, pair_returns, color=colors, alpha=0.8, width=0.6)
+            ax2.axhline(0, color='black', lw=1)
+            ax2.set_title("Individual Pair Contribution (%)", loc='left')
+            ax2.set_ylabel("Return %")
+            if len(pair_names) > 10:
+                plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+        else:
+            ax2.text(0.5, 0.5, "No Pair Data Available", ha='center')
 
         # 3. Correlation Analysis
         pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
@@ -425,18 +441,18 @@ class PortfolioVisualizer:
             ax4.axis('off')
             ax4.set_title("⚠️ Top Concentration Risks", loc='center', color=self.colors['loss'])
             
-            cell_text = []
+            cell_text_corr = []
             for _, row in top_corr.iterrows():
-                val_color = self.colors['loss'] if row['Corr'] > 0.7 else self.colors['primary']
-                cell_text.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
+                # Highlight high correlations
+                cell_text_corr.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
             
-            if not cell_text:
-                cell_text = [["No significant correlations", "-"]]
+            if not cell_text_corr:
+                cell_text_corr = [["No significant correlations", "-"]]
 
-            table = ax4.table(cellText=cell_text, colLabels=["Pair Combination", "Correlation"], 
+            table_corr = ax4.table(cellText=cell_text_corr, colLabels=["Pair Combination", "Correlation"], 
                               loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
-            table.auto_set_font_size(False)
-            table.set_fontsize(11)
+            table_corr.auto_set_font_size(False)
+            table_corr.set_fontsize(11)
             
         else:
             ax3 = fig.add_subplot(gs[2, :2])
@@ -445,19 +461,20 @@ class PortfolioVisualizer:
 
         # 4. Max Drawdown Distribution
         ax5 = fig.add_subplot(gs[2, 2])
-        pair_dds = [p['max_drawdown']*100 for p in pair_summaries]
+        pair_dds = [p.get('max_drawdown', 0.0) * 100 for p in pair_summaries]
         if pair_dds:
             sns.histplot(pair_dds, bins=10, color=self.colors['drawdown'], kde=True, ax=ax5, alpha=0.6)
+            ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
+            ax5.set_xlabel("Drawdown %")
         else:
             ax5.text(0.5, 0.5, "No Drawdown Data", ha='center')
-        ax5.set_title("Risk Profile (Max Drawdown Dist.)", loc='left')
-        ax5.set_xlabel("Drawdown %")
+            ax5.axis('off')
 
         # 5. Global Stats Table
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
-        # Use our newly calculated aggregated metrics
+        # Define Metrics (Including requested VaR, CVaR, and Active Pairs)
         flat_metrics = [
             ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
@@ -465,11 +482,14 @@ class PortfolioVisualizer:
             ("Sortino Ratio", f"{agg_sortino:.2f}"),
             ("Win Rate", f"{global_win_rate*100:.2f}%"),
             ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
-            ("VaR (95%)", f"{metrics.get('var_95', 0.0):.4f}"),
-            ("Active Pairs", f"{len(pair_names)}")
+            ("VaR (95%)", f"{var_95:.4%}"),
+            ("CVaR (95%)", f"{cvar_95:.4%}"), # Added CVaR
+            ("Active Pairs", f"{len(pair_names)}"),
+            ("Trades", f"{total_global_trades}")
         ]
         
-        col_count = 4
+        # Dynamic Grid Layout for Table (5 cols x 2 rows = 10 items)
+        col_count = 5 
         row_count = 2
         cell_text = [ [] for _ in range(row_count) ]
         
@@ -477,12 +497,15 @@ class PortfolioVisualizer:
             r = i % row_count
             cell_text[r].extend([label, val])
 
+        # Table creation
         table = ax6.table(cellText=cell_text, loc='center', cellLoc='center', bbox=[0.05, 0.2, 0.9, 0.6])
         table.auto_set_font_size(False)
         table.set_fontsize(13)
         
+        # Table Styling
         for (row, col), cell in table.get_celld().items():
             cell.set_edgecolor('white')
+            # Alternate styling for Label vs Value columns
             if col % 2 == 0:
                 cell.set_facecolor('#f7f9f9')
                 cell.set_text_props(weight='bold', color=self.colors['primary'])
