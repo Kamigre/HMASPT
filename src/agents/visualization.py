@@ -55,6 +55,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score and Drawdown analysis.
+        FIXED: Anchors equity curve to 100 and uses Environment's internal trade counter.
         """
         if len(traces) == 0:
             return
@@ -66,17 +67,36 @@ class PortfolioVisualizer:
         required_cols = {
             'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
             'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
-            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0
+            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'num_trades': 0
         }
         for col, val in required_cols.items():
             if col not in df.columns: df[col] = val
 
-        steps = df['local_step']
+        # 1. FIX: Anchor Equity Curve to 100 at Step 0
+        # We create specific list for plotting that prepends the starting state
+        start_step = df['local_step'].iloc[0] - 1
+        plot_steps = [start_step] + df['local_step'].tolist()
+        
+        # Equity calculation: 100 * (1 + cum_return)
+        # Prepend 100.0 so the graph starts cleanly
+        raw_equity = (100 * (1 + df['cum_return'])).tolist()
+        plot_equity = [100.0] + raw_equity
+        
+        # Also pad the fill_between arrays to match length
+        # We need a dummy '0' return for the start for color logic match, though strictly not needed for x/y plot
+        
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
-        trades_entry = df[df['trade_occurred'] == True] 
         forced_exit = df[df['forced_close'] == True]
+
+        # 2. FIX: Trade Counting
+        # Use the cumulative counter from the environment info, rather than summing boolean flags
+        if 'num_trades' in df.columns and not df['num_trades'].empty:
+            total_entries = int(df['num_trades'].max())
+        else:
+            # Fallback if column missing
+            total_entries = len(df[df['trade_occurred'] == True])
 
         # --- Win Rate Logic (Per Pair) ---
         closed_trades_mask = df['realized_pnl_this_step'] != 0
@@ -93,7 +113,6 @@ class PortfolioVisualizer:
             
         total_pnl = df['realized_pnl'].iloc[-1]
         final_ret = df['cum_return'].iloc[-1]
-        total_entries = len(trades_entry)
 
         # --- Plotting ---
         fig = plt.figure(figsize=(20, 14))
@@ -105,15 +124,16 @@ class PortfolioVisualizer:
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
                      fontsize=22, weight='bold', color=status_color, y=0.96)
 
-        # 1. Equity Curve
+        # 1. Equity Curve (Uses Corrected Arrays)
         ax1 = fig.add_subplot(gs[0, :3])
-        ax1.plot(steps, 100 * (1 + df['cum_return']), color=self.colors['primary'], lw=2.5, label='Portfolio Value')
+        ax1.plot(plot_steps, plot_equity, color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         
-        # Fill
-        ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
+        # Fill - Note: we align fill with original DF steps for simplicity as 
+        # creating a conditional color fill with prepended lists is complex in matplotlib
+        ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
-        ax1.fill_between(steps, 100, 100 * (1 + df['cum_return']), 
+        ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
                          where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
 
         if not forced_exit.empty:
@@ -135,7 +155,7 @@ class PortfolioVisualizer:
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
             ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
             ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
-            ("Trades Executed", f"{total_entries}", self.colors['primary']) 
+            ("Trades Executed", f"{total_entries}", self.colors['primary']) # Corrected Variable
         ]
         
         y_pos = 0.9
@@ -149,6 +169,8 @@ class PortfolioVisualizer:
 
         # 3. Z-Score & Position
         ax3 = fig.add_subplot(gs[1, :])
+        
+        steps = df['local_step'] # Standard steps for other plots
         
         if 'z_score' in df.columns:
             zscore = df['z_score']
@@ -253,6 +275,7 @@ class PortfolioVisualizer:
         """
         Create aggregated portfolio dashboard with improved Correlation analysis AND
         Correctly calculated Portfolio-Wide Maximum Drawdown using Robust Logic.
+        FIXED: Anchors Portfolio Equity Curve to 100.
         """
         metrics = final_summary['metrics']
         pair_summaries = metrics['pair_summaries']
@@ -287,9 +310,6 @@ class PortfolioVisualizer:
         df_all = df_all.sort_values(by=time_col)
 
         # --- 1. AGGREGATE PORTFOLIO CURVE (HOMOGENIZED LOGIC) ---
-        # We must use the EXACT same logic as evaluate_portfolio to ensure Sharpe/DD match.
-        # Using simple Sum(PortfolioValue) is WRONG for capital injection scenarios.
-        
         equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
         equity_matrix_ffill = equity_matrix.ffill()
         
@@ -306,7 +326,14 @@ class PortfolioVisualizer:
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         
         # Construct Curve (Base 100)
-        portfolio_equity_curve = 100 * (1 + global_returns_series).cumprod()
+        # FIX: Manual prepend of 100 start
+        cum_ret_series = (1 + global_returns_series).cumprod()
+        portfolio_equity_curve = 100 * cum_ret_series
+        
+        # We manually insert a start point for the PLOT logic
+        plot_index = [portfolio_equity_curve.index[0] - 1] + portfolio_equity_curve.index.tolist()
+        plot_values = [100.0] + portfolio_equity_curve.tolist()
+        
         portfolio_return_pct = portfolio_equity_curve - 100
 
         # --- 2. CALCULATE METRICS FROM AGGREGATED DATA ---
@@ -334,9 +361,12 @@ class PortfolioVisualizer:
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
                      fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
-        # 1. Main Equity Curve
+        # 1. Main Equity Curve (FIXED PLOTTING ARRAYS)
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        ax1.plot(plot_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        
+        # Fill needs to align with original series for simpler logic, or reconstructed
+        # We'll just fill using the Series index to avoid complex timestamp handling for the prepended point
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
                           color=self.colors['primary'], alpha=0.1)
         ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
@@ -565,44 +595,3 @@ class PortfolioVisualizer:
                 return (avg_excess_return / downside_std) * np.sqrt(252)
             else:
                 return 0.0
-
-def generate_all_visualizations(all_traces: List[Dict], 
-                                 skipped_pairs: List[Dict],
-                                 final_summary: Dict,
-                                 output_dir: str = "reports"):
-    """
-    Generate complete visual report for portfolio and all pairs.
-    """
-    print("\n" + "="*70)
-    print("GENERATING VISUAL REPORTS")
-    print("="*70)
-    
-    visualizer = PortfolioVisualizer(output_dir)
-    
-    # Group traces by pair
-    traces_by_pair = {}
-    for t in all_traces:
-        pair = t['pair']
-        if pair not in traces_by_pair:
-            traces_by_pair[pair] = []
-        traces_by_pair[pair].append(t)
-    
-    # Generate individual pair reports
-    print("\n📊 Generating pair-level reports...")
-    for pair_name, traces in traces_by_pair.items():
-        skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
-        was_skipped = skip_info is not None
-        
-        visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
-        visualizer.visualize_pair_behavior(traces, pair_name)
-    
-    # Generate portfolio aggregate
-    print("\n📊 Generating portfolio aggregate report...")
-    visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
-    
-    # Generate Executive Summary Text Card
-    if 'explanation' in final_summary:
-        print("\n📄 Generating executive summary card...")
-        visualizer.visualize_executive_summary(final_summary['explanation'])
-    
-    print(f"\n✅ All reports saved to: {output_dir}/")
