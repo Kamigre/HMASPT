@@ -305,7 +305,7 @@ class SupervisorAgent:
         - Aggregates 'portfolio_value' across all pairs to determine true dollar PnL.
         - Calculates returns based on (Global Dollar PnL / Total Invested Capital).
         - Generates an Equity Curve anchored strictly at 100.0.
-        - Matches the logic used in 'visualize_portfolio' for consistency.
+        - Populates individual pair summaries.
         """
         
         # --- 1. DATA PREPARATION ---
@@ -324,7 +324,10 @@ class SupervisorAgent:
         
         if df_all.empty:
             return {
-                "metrics": {"total_pnl": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0, "equity_curve": []},
+                "metrics": {
+                    "total_pnl": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0, 
+                    "equity_curve": [], "pair_summaries": []
+                },
                 "actions": [],
                 "explanation": "No data available."
             }
@@ -386,7 +389,49 @@ class SupervisorAgent:
         # Extract returns list for Sharpe/Sortino
         portfolio_returns = global_returns_series.tolist()
 
-        # --- 4. CALCULATE GLOBAL METRICS ---
+        # --- 4. CALCULATE PAIR SUMMARIES ---
+        
+        pair_summaries = []
+        unique_pairs = df_all['pair'].unique()
+
+        for pair in unique_pairs:
+            pair_trace = df_all[df_all['pair'] == pair].sort_values(by=time_col)
+            if pair_trace.empty:
+                continue
+
+            # Determine returns for this specific pair
+            if 'daily_return' in pair_trace.columns:
+                pair_rets = pair_trace['daily_return'].tolist()
+            else:
+                pair_rets = pair_trace['portfolio_value'].pct_change().fillna(0.0).tolist()
+            
+            # PnL (Last realized PnL value)
+            pair_pnl = pair_trace['realized_pnl'].iloc[-1] if 'realized_pnl' in pair_trace.columns else 0.0
+            
+            # Drawdown (Pair specific)
+            pair_curve = np.cumprod([1 + r for r in pair_rets])
+            pair_peak = np.maximum.accumulate(pair_curve)
+            pair_dd = (pair_curve - pair_peak) / pair_peak
+            pair_max_dd = abs(np.min(pair_dd)) if len(pair_dd) > 0 else 0.0
+
+            # Win Rate (Pair specific)
+            pair_win_rate = 0.0
+            if 'realized_pnl_this_step' in pair_trace.columns:
+                 closed = pair_trace[pair_trace['realized_pnl_this_step'] != 0]
+                 if len(closed) > 0:
+                     pair_win_rate = (closed['realized_pnl_this_step'] > 0).sum() / len(closed)
+
+            pair_summaries.append({
+                "pair": pair,
+                "total_pnl": float(pair_pnl),
+                "sharpe": self._calculate_sharpe(pair_rets),
+                "sortino": self._calculate_sortino(pair_rets),
+                "max_drawdown": float(pair_max_dd),
+                "win_rate": pair_win_rate,
+                "steps": len(pair_trace)
+            })
+
+        # --- 5. CALCULATE GLOBAL METRICS ---
         
         # Max Drawdown (Calculated on the anchored curve)
         normalized_equity_curve = pd.Series(equity_values)
@@ -398,7 +443,7 @@ class SupervisorAgent:
         sharpe = self._calculate_sharpe(portfolio_returns)
         sortino = self._calculate_sortino(portfolio_returns)
         
-        # Win Rate (Trade-based logic remains)
+        # Win Rate (Global Trades)
         win_rate = 0.0
         if 'realized_pnl_this_step' in df_all.columns:
             closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
@@ -406,9 +451,7 @@ class SupervisorAgent:
                 wins = (closed_trades['realized_pnl_this_step'] > 0).sum()
                 win_rate = wins / len(closed_trades)
 
-        # Total PnL Calculation (CORRECTED)
-        # We sum the 'global_dollar_pnl' series, which represents the aggregate dollar change 
-        # of the entire portfolio at every timestep. This captures the PnL of ALL pairs.
+        # Total PnL Calculation (Sum of Global Dollar PnL Series)
         total_pnl = float(global_dollar_pnl.sum())
 
         # Compile Metrics
@@ -421,7 +464,7 @@ class SupervisorAgent:
             "cum_return": (normalized_equity_curve.iloc[-1] - 100) / 100,
             "win_rate": win_rate,
             "total_steps": len(df_all),
-            "pair_summaries": [] # (Populate as needed via separate logic if required)
+            "pair_summaries": pair_summaries
         }
         
         # Export curve data matching Visualizer
