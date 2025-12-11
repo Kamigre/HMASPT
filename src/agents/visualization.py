@@ -34,7 +34,6 @@ class PortfolioVisualizer:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "pairs"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "behavior"), exist_ok=True)
         
         # Institutional Color Palette
         self.colors = {
@@ -54,8 +53,8 @@ class PortfolioVisualizer:
     
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
-        Create detailed visualization for a single pair including Z-Score and Drawdown analysis.
-        FIXED: Anchors equity curve to 100 and uses Environment's internal trade counter.
+        Create detailed visualization for a single pair including Z-Score, Drawdown,
+        AND **Price Co-movement vs. Position**.
         """
         if len(traces) == 0:
             return
@@ -67,34 +66,28 @@ class PortfolioVisualizer:
         required_cols = {
             'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
             'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
-            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'num_trades': 0
+            'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'num_trades': 0,
+            'price_x': np.nan, 'price_y': np.nan # Ensure price columns exist for plotting
         }
         for col, val in required_cols.items():
             if col not in df.columns: df[col] = val
 
         # 1. FIX: Anchor Equity Curve to 100 at Step 0
-        # We create specific list for plotting that prepends the starting state
         start_step = df['local_step'].iloc[0] - 1
         plot_steps = [start_step] + df['local_step'].tolist()
         
-        # Equity calculation: 100 * (1 + cum_return)
-        # Prepend 100.0 so the graph starts cleanly
         raw_equity = (100 * (1 + df['cum_return'])).tolist()
         plot_equity = [100.0] + raw_equity
         
-        # Prepare other columns for alignment
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
         forced_exit = df[df['forced_close'] == True]
 
         # 2. FIX: Trade Counting
-        # Use the cumulative counter from the environment info, rather than summing boolean flags
         if 'num_trades' in df.columns and not df['num_trades'].empty:
-            # The last row should have the highest cumulative count
             total_entries = int(df['num_trades'].max())
         else:
-            # Fallback if column missing
             total_entries = len(df[df['trade_occurred'] == True])
 
         # --- Win Rate Logic (Per Pair) ---
@@ -114,21 +107,23 @@ class PortfolioVisualizer:
         final_ret = df['cum_return'].iloc[-1]
 
         # --- Plotting ---
-        fig = plt.figure(figsize=(20, 14))
-        gs = gridspec.GridSpec(4, 4, figure=fig, hspace=0.4, wspace=0.3)
+        # Changed GridSpec from 4 rows to 5 rows to accommodate the new plot
+        fig = plt.figure(figsize=(20, 18)) # Increased height for 5 plots
+        gs = gridspec.GridSpec(5, 4, figure=fig, hspace=0.5, wspace=0.3)
         
         # Title
         status_color = self.colors['loss'] if was_skipped else self.colors['primary']
         status_text = f" | STOPPED: {skip_info['reason']}" if was_skipped and skip_info else ""
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
-                     fontsize=22, weight='bold', color=status_color, y=0.96)
+                     fontsize=22, weight='bold', color=status_color, y=0.98)
+        
+        steps = df['local_step'] # Standard steps for time-series plots
 
-        # 1. Equity Curve (Uses Corrected Arrays)
+        # 1. Equity Curve (gs[0, :3])
         ax1 = fig.add_subplot(gs[0, :3])
         ax1.plot(plot_steps, plot_equity, color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         
-        # Fill - Note: we align fill with original DF steps for simplicity 
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
@@ -143,7 +138,7 @@ class PortfolioVisualizer:
         ax1.legend(loc='upper left', frameon=True)
         ax1.grid(True, alpha=0.3)
 
-        # 2. Scorecard
+        # 2. Scorecard (gs[0, 3])
         ax2 = fig.add_subplot(gs[0, 3])
         ax2.axis('off')
         
@@ -154,7 +149,7 @@ class PortfolioVisualizer:
             ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
             ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
             ("Sortino", f"{self._calculate_sortino(df['daily_return']):.2f}", self.colors['primary']),
-            ("Trades Executed", f"{total_entries}", self.colors['primary']) # Corrected Variable
+            ("Trades Executed", f"{total_entries}", self.colors['primary'])
         ]
         
         y_pos = 0.9
@@ -166,10 +161,8 @@ class PortfolioVisualizer:
             ax2.plot([0.1, 0.9], [y_pos-0.05, y_pos-0.05], color='#ecf0f1', lw=1.5)
             y_pos -= 0.15
 
-        # 3. Z-Score & Position
+        # 3. Z-Score & Position (gs[1, :])
         ax3 = fig.add_subplot(gs[1, :])
-        
-        steps = df['local_step'] # Standard steps for other plots
         
         if 'z_score' in df.columns:
             zscore = df['z_score']
@@ -189,31 +182,59 @@ class PortfolioVisualizer:
         ax3b.set_ylabel('Position')
         ax3b.grid(False)
         ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
+        plt.setp(ax3.get_xticklabels(), visible=False) # Hide X labels to connect with next plot
 
-        # 4. Drawdown
-        ax4 = fig.add_subplot(gs[2, :2])
-        ax4.fill_between(steps, 0, -df['drawdown_pct'], color=self.colors['drawdown'], alpha=0.3)
-        ax4.plot(steps, -df['drawdown_pct'], color=self.colors['drawdown'], lw=1.5)
-        ax4.set_title('Underwater Plot (Drawdown %)', loc='left')
-        ax4.set_ylabel('Drawdown %')
-        ax4.grid(True, alpha=0.3)
+        # --- 4. NEW PLOT: Price Co-movement vs. Position (gs[2, :]) ---
+        ax4 = fig.add_subplot(gs[2, :], sharex=ax3) # Share X axis with Z-Score plot
+        
+        if 'price_x' in df.columns and 'price_y' in df.columns and not df[['price_x', 'price_y']].isnull().all().any():
+            df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
+            df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
+            
+            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"Asset X (Norm)")
+            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"Asset Y (Norm)")
+            
+            ax4.set_ylabel("Normalized Price")
+            ax4.legend(loc='upper left', ncol=2, fontsize=10)
+            ax4.grid(True, alpha=0.3)
 
-        # 5. Daily Returns
-        ax5 = fig.add_subplot(gs[2, 2:])
+            # Secondary Y-axis for Position Execution
+            ax4b = ax4.twinx()
+            ax4b.step(steps, df['position'], color=self.colors['accent'], lw=1.5, where='post', alpha=0.6, label='Position Size')
+            ax4b.set_ylabel('Position', color=self.colors['accent'])
+            ax4b.tick_params(axis='y', labelcolor=self.colors['accent'])
+            ax4b.grid(False)
+            
+            ax4.set_title("Normalized Price Co-movement and Position", loc='left')
+        else:
+            ax4.text(0.5, 0.5, "Price Data Unavailable for Co-movement Analysis", ha='center', va='center', fontsize=14, color=self.colors['neutral'])
+            ax4.axis('off')
+        
+        # 5. Drawdown (gs[3, :2]) (Pushed down one row)
+        ax5 = fig.add_subplot(gs[3, :2])
+        ax5.fill_between(steps, 0, -df['drawdown_pct'], color=self.colors['drawdown'], alpha=0.3)
+        ax5.plot(steps, -df['drawdown_pct'], color=self.colors['drawdown'], lw=1.5)
+        ax5.set_title('Underwater Plot (Drawdown %)', loc='left')
+        ax5.set_ylabel('Drawdown %')
+        ax5.grid(True, alpha=0.3)
+
+        # 6. Daily Returns (gs[3, 2:]) (Pushed down one row)
+        ax6 = fig.add_subplot(gs[3, 2:])
         if not df[df['daily_return'] != 0].empty:
-            sns.histplot(df[df['daily_return'] != 0]['daily_return'], kde=True, ax=ax5, color=self.colors['primary'], alpha=0.6)
-        ax5.axvline(0, color='black', linestyle='--', alpha=0.5)
-        ax5.set_title('Daily Returns Distribution', loc='left')
-        ax5.set_xlabel('Return')
+            sns.histplot(df[df['daily_return'] != 0]['daily_return'], kde=True, ax=ax6, color=self.colors['primary'], alpha=0.6)
+        ax6.axvline(0, color='black', linestyle='--', alpha=0.5)
+        ax6.set_title('Daily Returns Distribution', loc='left')
+        ax6.set_xlabel('Return')
 
-        # 6. Cumulative P&L
-        ax6 = fig.add_subplot(gs[3, :])
+        # 7. Cumulative P&L (gs[4, :]) (Pushed down one row)
+        ax7 = fig.add_subplot(gs[4, :])
         cum_pnl = df['realized_pnl']
-        ax6.plot(steps, cum_pnl, color=self.colors['primary'], lw=2)
-        ax6.fill_between(steps, 0, cum_pnl, where=(cum_pnl>=0), color=self.colors['fill_profit'], alpha=0.2)
-        ax6.fill_between(steps, 0, cum_pnl, where=(cum_pnl<0), color=self.colors['fill_loss'], alpha=0.2)
-        ax6.set_title('Cumulative Realized P&L ($)', loc='left')
-        ax6.grid(True, alpha=0.3)
+        ax7.plot(steps, cum_pnl, color=self.colors['primary'], lw=2)
+        ax7.fill_between(steps, 0, cum_pnl, where=(cum_pnl>=0), color=self.colors['fill_profit'], alpha=0.2)
+        ax7.fill_between(steps, 0, cum_pnl, where=(cum_pnl<0), color=self.colors['fill_loss'], alpha=0.2)
+        ax7.set_title('Cumulative Realized P&L ($)', loc='left')
+        ax7.set_xlabel("Trading Steps")
+        ax7.grid(True, alpha=0.3)
 
         # Save
         filename = f"{pair_name.replace('-', '_')}_analysis.png"
@@ -221,77 +242,6 @@ class PortfolioVisualizer:
         plt.savefig(filepath)
         plt.close()
         print(f"    📊 Saved pair analysis: {filepath}")
-
-    def visualize_pair_behavior(self, traces: List[Dict], pair_name: str):
-        """
-        Creates a 'Behavior Analysis' report comparing Price Action vs Strategy Returns
-        and adds Position Execution for better trade context.
-        """
-        if not traces: return
-        df = pd.DataFrame(traces)
-        
-        if 'price_x' not in df.columns or 'price_y' not in df.columns or 'position' not in df.columns:
-            print(f"⚠️ Cannot generate behavior report for {pair_name}: Missing raw price or position data.")
-            return
-
-        df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
-        df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
-        
-        fig = plt.figure(figsize=(16, 10))
-        # Increase the size of the top plot (price) relative to the bottom (returns/position)
-        gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1.5], hspace=0.15)
-        
-        # --- TOP PLOT: Normalized Price Action ---
-        ax1 = fig.add_subplot(gs[0])
-        ax1.plot(df['local_step'], df['norm_x'], color=self.colors['asset_x'], lw=2, label=f"Asset X (Normalized)")
-        ax1.plot(df['local_step'], df['norm_y'], color=self.colors['asset_y'], lw=2, label=f"Asset Y (Normalized)")
-        
-        ax1.fill_between(df['local_step'], df['norm_x'], df['norm_y'], color='gray', alpha=0.1, label="Spread Divergence")
-        
-        ax1.set_ylabel("Normalized Price (Start=1.0)")
-        ax1.set_title(f"{pair_name}: Price Co-movement Analysis", loc='left', fontsize=16, weight='bold', color=self.colors['primary'])
-        ax1.legend(loc='upper left')
-        ax1.grid(True, alpha=0.3)
-        plt.setp(ax1.get_xticklabels(), visible=False)
-
-        # --- BOTTOM PLOT: Cumulative Return & Position Execution ---
-        ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        cum_ret_pct = df['cum_return'] * 100
-        ax2.plot(df['local_step'], cum_ret_pct, color=self.colors['primary'], lw=2, label="Strategy Return %")
-        
-        # Fill for Returns
-        ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct >= 0), color=self.colors['fill_profit'], alpha=0.2)
-        ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct < 0), color=self.colors['fill_loss'], alpha=0.2)
-        
-        ax2.axhline(0, color='black', linestyle='--', alpha=0.5)
-        ax2.set_ylabel("Cumulative Return (%)", color=self.colors['primary'])
-        ax2.tick_params(axis='y', labelcolor=self.colors['primary'])
-        
-        # --- ADD SECONDARY AXIS for Position Execution ---
-        ax2b = ax2.twinx()
-        
-        # Plot position using a step plot for clarity
-        ax2b.step(df['local_step'], df['position'], color=self.colors['accent'], lw=1.5, where='post', label='Position Size')
-        ax2b.axhline(0, color=self.colors['neutral'], linestyle=':', lw=1)
-        
-        ax2b.set_ylabel('Position Execution', color=self.colors['accent'], labelpad=15)
-        ax2b.tick_params(axis='y', labelcolor=self.colors['accent'])
-        ax2b.set_ylim(df['position'].min() * 1.1 - 0.1, df['position'].max() * 1.1 + 0.1) # Set sensible limits
-        ax2b.grid(False) # Turn off the secondary grid
-        
-        # Combine legends
-        lines, labels = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2b.get_legend_handles_labels()
-        ax2.legend(lines + lines2, labels + labels2, loc='upper left')
-        
-        ax2.set_xlabel("Trading Steps")
-        ax2.grid(True, alpha=0.3)
-
-        filename = f"behavior_{pair_name.replace('-', '_')}.png"
-        filepath = os.path.join(self.output_dir, "behavior", filename)
-        plt.savefig(filepath)
-        plt.close()
-        print(f"    📉 Saved behavior analysis (with position): {filepath}")
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
@@ -646,7 +596,6 @@ def generate_all_visualizations(all_traces: List[Dict],
         was_skipped = skip_info is not None
         
         visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
-        visualizer.visualize_pair_behavior(traces, pair_name)
     
     # Generate portfolio aggregate
     print("\n📊 Generating portfolio aggregate report...")
