@@ -305,7 +305,7 @@ class SupervisorAgent:
         - Aggregates 'portfolio_value' across all pairs to determine true dollar PnL.
         - Calculates returns based on (Global Dollar PnL / Total Invested Capital).
         - Generates an Equity Curve anchored strictly at 100.0.
-        - Populates individual pair summaries.
+        - Populates individual pair summaries (INCLUDES CUM_RETURN).
         """
         
         # --- 1. DATA PREPARATION ---
@@ -421,9 +421,15 @@ class SupervisorAgent:
                  if len(closed) > 0:
                      pair_win_rate = (closed['realized_pnl_this_step'] > 0).sum() / len(closed)
 
+            # Cumulative Return (Pair specific)
+            initial_val = pair_trace['portfolio_value'].iloc[0]
+            final_val = pair_trace['portfolio_value'].iloc[-1]
+            pair_cum_return = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
+
             pair_summaries.append({
                 "pair": pair,
                 "total_pnl": float(pair_pnl),
+                "cum_return": float(pair_cum_return),
                 "sharpe": self._calculate_sharpe(pair_rets),
                 "sortino": self._calculate_sortino(pair_rets),
                 "max_drawdown": float(pair_max_dd),
