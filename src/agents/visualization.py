@@ -54,7 +54,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score, Drawdown,
-        AND **Price Co-movement vs. Position**.
+        AND Price Co-movement vs. Position, now with Ticker Names.
         """
         if len(traces) == 0:
             return
@@ -67,7 +67,7 @@ class PortfolioVisualizer:
             'forced_close': False, 'trade_occurred': False, 'daily_return': 0.0,
             'realized_pnl': 0.0, 'max_drawdown': 0.0, 'cum_return': 0.0, 'position': 0.0,
             'realized_pnl_this_step': 0.0, 'transaction_costs': 0.0, 'num_trades': 0,
-            'price_x': np.nan, 'price_y': np.nan # Ensure price columns exist for plotting
+            'price_x': np.nan, 'price_y': np.nan 
         }
         for col, val in required_cols.items():
             if col not in df.columns: df[col] = val
@@ -105,6 +105,12 @@ class PortfolioVisualizer:
             
         total_pnl = df['realized_pnl'].iloc[-1]
         final_ret = df['cum_return'].iloc[-1]
+
+        # --- Extract Ticker Names ---
+        if '-' in pair_name:
+            ticker_x, ticker_y = pair_name.split('-', 1)
+        else:
+            ticker_x, ticker_y = "Asset X", "Asset Y"
 
         # --- Plotting ---
         # Changed GridSpec from 4 rows to 5 rows to accommodate the new plot
@@ -182,17 +188,18 @@ class PortfolioVisualizer:
         ax3b.set_ylabel('Position')
         ax3b.grid(False)
         ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
-        plt.setp(ax3.get_xticklabels(), visible=False) # Hide X labels to connect with next plot
+        plt.setp(ax3.get_xticklabels(), visible=False)
 
         # --- 4. NEW PLOT: Price Co-movement vs. Position (gs[2, :]) ---
-        ax4 = fig.add_subplot(gs[2, :], sharex=ax3) # Share X axis with Z-Score plot
+        ax4 = fig.add_subplot(gs[2, :], sharex=ax3) 
         
         if 'price_x' in df.columns and 'price_y' in df.columns and not df[['price_x', 'price_y']].isnull().all().any():
             df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
             df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
             
-            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"Asset X (Norm)")
-            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"Asset Y (Norm)")
+            # Use extracted ticker names for labels
+            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"{ticker_x} (Norm)")
+            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"{ticker_y} (Norm)")
             
             ax4.set_ylabel("Normalized Price")
             ax4.legend(loc='upper left', ncol=2, fontsize=10)
@@ -205,12 +212,12 @@ class PortfolioVisualizer:
             ax4b.tick_params(axis='y', labelcolor=self.colors['accent'])
             ax4b.grid(False)
             
-            ax4.set_title("Normalized Price Co-movement and Position", loc='left')
+            ax4.set_title(f"Normalized Price Co-movement ({ticker_x} vs {ticker_y}) and Position", loc='left')
         else:
             ax4.text(0.5, 0.5, "Price Data Unavailable for Co-movement Analysis", ha='center', va='center', fontsize=14, color=self.colors['neutral'])
             ax4.axis('off')
         
-        # 5. Drawdown (gs[3, :2]) (Pushed down one row)
+        # 5. Drawdown (gs[3, :2])
         ax5 = fig.add_subplot(gs[3, :2])
         ax5.fill_between(steps, 0, -df['drawdown_pct'], color=self.colors['drawdown'], alpha=0.3)
         ax5.plot(steps, -df['drawdown_pct'], color=self.colors['drawdown'], lw=1.5)
@@ -218,7 +225,7 @@ class PortfolioVisualizer:
         ax5.set_ylabel('Drawdown %')
         ax5.grid(True, alpha=0.3)
 
-        # 6. Daily Returns (gs[3, 2:]) (Pushed down one row)
+        # 6. Daily Returns (gs[3, 2:])
         ax6 = fig.add_subplot(gs[3, 2:])
         if not df[df['daily_return'] != 0].empty:
             sns.histplot(df[df['daily_return'] != 0]['daily_return'], kde=True, ax=ax6, color=self.colors['primary'], alpha=0.6)
@@ -226,7 +233,7 @@ class PortfolioVisualizer:
         ax6.set_title('Daily Returns Distribution', loc='left')
         ax6.set_xlabel('Return')
 
-        # 7. Cumulative P&L (gs[4, :]) (Pushed down one row)
+        # 7. Cumulative P&L (gs[4, :])
         ax7 = fig.add_subplot(gs[4, :])
         cum_pnl = df['realized_pnl']
         ax7.plot(steps, cum_pnl, color=self.colors['primary'], lw=2)
