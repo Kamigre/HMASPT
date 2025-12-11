@@ -716,6 +716,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         final_trace['unrealized_pnl'] = 0
+                        final_trace['num_trades'] = 0
                         final_trace['realized_pnl'] = round(previous_cumulative_realized + forced_pnl - forced_cost, 2)
                         final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
                         final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
