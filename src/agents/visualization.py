@@ -82,9 +82,7 @@ class PortfolioVisualizer:
         raw_equity = (100 * (1 + df['cum_return'])).tolist()
         plot_equity = [100.0] + raw_equity
         
-        # Also pad the fill_between arrays to match length
-        # We need a dummy '0' return for the start for color logic match, though strictly not needed for x/y plot
-        
+        # Prepare other columns for alignment
         df['cum_return_pct'] = df['cum_return'] * 100
         df['drawdown_pct'] = df['max_drawdown'] * 100
         
@@ -93,6 +91,7 @@ class PortfolioVisualizer:
         # 2. FIX: Trade Counting
         # Use the cumulative counter from the environment info, rather than summing boolean flags
         if 'num_trades' in df.columns and not df['num_trades'].empty:
+            # The last row should have the highest cumulative count
             total_entries = int(df['num_trades'].max())
         else:
             # Fallback if column missing
@@ -129,8 +128,7 @@ class PortfolioVisualizer:
         ax1.plot(plot_steps, plot_equity, color=self.colors['primary'], lw=2.5, label='Portfolio Value')
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         
-        # Fill - Note: we align fill with original DF steps for simplicity as 
-        # creating a conditional color fill with prepended lists is complex in matplotlib
+        # Fill - Note: we align fill with original DF steps for simplicity 
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
                          where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
@@ -331,6 +329,7 @@ class PortfolioVisualizer:
         portfolio_equity_curve = 100 * cum_ret_series
         
         # We manually insert a start point for the PLOT logic
+        # Assuming index is numeric steps or datetime, we just need a visual anchor
         plot_index = [portfolio_equity_curve.index[0] - 1] + portfolio_equity_curve.index.tolist()
         plot_values = [100.0] + portfolio_equity_curve.tolist()
         
@@ -365,8 +364,7 @@ class PortfolioVisualizer:
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(plot_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
         
-        # Fill needs to align with original series for simpler logic, or reconstructed
-        # We'll just fill using the Series index to avoid complex timestamp handling for the prepended point
+        # Fill needs to align with original series for simpler logic
         ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
                           color=self.colors['primary'], alpha=0.1)
         ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
@@ -595,3 +593,44 @@ class PortfolioVisualizer:
                 return (avg_excess_return / downside_std) * np.sqrt(252)
             else:
                 return 0.0
+
+def generate_all_visualizations(all_traces: List[Dict], 
+                                 skipped_pairs: List[Dict],
+                                 final_summary: Dict,
+                                 output_dir: str = "reports"):
+    """
+    Generate complete visual report for portfolio and all pairs.
+    """
+    print("\n" + "="*70)
+    print("GENERATING VISUAL REPORTS")
+    print("="*70)
+    
+    visualizer = PortfolioVisualizer(output_dir)
+    
+    # Group traces by pair
+    traces_by_pair = {}
+    for t in all_traces:
+        pair = t['pair']
+        if pair not in traces_by_pair:
+            traces_by_pair[pair] = []
+        traces_by_pair[pair].append(t)
+    
+    # Generate individual pair reports
+    print("\n📊 Generating pair-level reports...")
+    for pair_name, traces in traces_by_pair.items():
+        skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
+        was_skipped = skip_info is not None
+        
+        visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
+        visualizer.visualize_pair_behavior(traces, pair_name)
+    
+    # Generate portfolio aggregate
+    print("\n📊 Generating portfolio aggregate report...")
+    visualizer.visualize_portfolio(all_traces, skipped_pairs, final_summary)
+    
+    # Generate Executive Summary Text Card
+    if 'explanation' in final_summary:
+        print("\n📄 Generating executive summary card...")
+        visualizer.visualize_executive_summary(final_summary['explanation'])
+    
+    print(f"\n✅ All reports saved to: {output_dir}/")
