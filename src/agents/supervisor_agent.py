@@ -299,8 +299,13 @@ class SupervisorAgent:
     
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Evaluate complete portfolio performance using Equal-Weight Aggregation.
-        Ensures the Equity Curve strictly starts at 100 for accurate Drawdown calculation.
+        Evaluate complete portfolio performance using Global Dollar Aggregation.
+        
+        UPDATED LOGIC:
+        - Aggregates 'portfolio_value' across all pairs to determine true dollar PnL.
+        - Calculates returns based on (Global Dollar PnL / Total Invested Capital).
+        - Generates an Equity Curve anchored strictly at 100.0.
+        - Matches the logic used in 'visualize_portfolio' for consistency.
         """
         
         # --- 1. DATA PREPARATION ---
@@ -328,45 +333,71 @@ class SupervisorAgent:
         time_col = 'local_step' if 'local_step' in df_all.columns else 'timestamp'
         if time_col not in df_all.columns and 'step' in df_all.columns:
             time_col = 'step'
-        
-        # Ensure daily_return exists
-        if 'daily_return' not in df_all.columns:
-             # Fallback or error handling
-             df_all['daily_return'] = 0.0
+            
+        # Ensure timestamp format if dealing with dates (consistency with visualizer)
+        if time_col == 'timestamp':
+            df_all[time_col] = pd.to_datetime(df_all[time_col])
 
         df_all = df_all.sort_values(by=time_col)
         
-        # --- 2. EQUAL-WEIGHT PORTFOLIO CALCULATION ---
-        # Pivot to get returns for all pairs at each step
-        returns_pivot = df_all.pivot_table(index=time_col, columns='pair', values='daily_return', aggfunc='mean')
-        returns_pivot = returns_pivot.fillna(0.0)
+        # Ensure 'portfolio_value' exists (crucial for this logic)
+        if 'portfolio_value' not in df_all.columns:
+            # Fallback if trace doesn't have portfolio_value: estimate via cumulative PnL
+            df_all['portfolio_value'] = df_all.get('realized_pnl', 0.0).cumsum() + 1000 # Dummy initial capital fallback
+
+        # --- 2. GLOBAL DOLLAR AGGREGATION (MATCHING VISUALIZER) ---
         
-        # Portfolio Daily Return (Equal Weight)
-        portfolio_returns = returns_pivot.mean(axis=1).tolist()
+        # Pivot to get Portfolio Value for all pairs at each step
+        # This tracks the actual capital allocated + PnL per pair
+        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
         
-        # --- 3. CONSTRUCT EQUITY CURVE (STARTING AT 100) ---
-        # We explicitly start the curve at 100.0 before any returns are applied
-        equity_values = [100.0]
-        current_equity = 100.0
+        # Forward fill to handle asynchronous updates (keep last known value for pairs not updating this step)
+        equity_matrix_ffill = equity_matrix.ffill()
         
-        for r in portfolio_returns:
-            current_equity *= (1 + r)
-            equity_values.append(current_equity)
-            
-        normalized_equity_curve = pd.Series(equity_values)
+        # Dollar PnL Change (Global)
+        dollar_pnl_matrix = equity_matrix_ffill.diff()
+        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
+        # Invested Capital (Shifted to represent capital at START of period)
+        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
+        prev_capital = total_capital_series.shift(1)
+        
+        # Global Returns Calculation
+        # Return = (Sum of Dollar PnL) / (Total Capital at Previous Step)
+        global_returns_series = global_dollar_pnl / prev_capital
+        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        
+        # --- 3. CONSTRUCT EQUITY CURVE (ANCHORED AT 100) ---
+        
+        # Calculate Cumulative Return Series
+        cum_ret_series = (1 + global_returns_series).cumprod()
+        portfolio_equity_curve = 100 * cum_ret_series
+        
+        # Explicitly prepend the start point (100.0) to match visualizer plotting logic
+        # Convert to list for JSON serialization
+        equity_values = [100.0] + portfolio_equity_curve.tolist()
+        
+        # Generate corresponding labels/dates
+        # We add a "Start" label for the 100.0 anchor
+        idx_list = portfolio_equity_curve.index.astype(str).tolist()
+        equity_dates = ["Start"] + idx_list
+
+        # Extract returns list for Sharpe/Sortino
+        portfolio_returns = global_returns_series.tolist()
+
         # --- 4. CALCULATE GLOBAL METRICS ---
         
-        # Max Drawdown (Calculated on the curve that includes the 100.0 start)
+        # Max Drawdown (Calculated on the anchored curve)
+        normalized_equity_curve = pd.Series(equity_values)
         running_max = normalized_equity_curve.cummax()
         dd_series = (normalized_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
         
-        # Sharpe & Sortino (Based on the daily returns list)
+        # Sharpe & Sortino (Based on the aggregated global returns)
         sharpe = self._calculate_sharpe(portfolio_returns)
         sortino = self._calculate_sortino(portfolio_returns)
         
-        # Win Rate
+        # Win Rate (Trade-based logic remains)
         win_rate = 0.0
         if 'realized_pnl_this_step' in df_all.columns:
             closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
@@ -374,9 +405,13 @@ class SupervisorAgent:
                 wins = (closed_trades['realized_pnl_this_step'] > 0).sum()
                 win_rate = wins / len(closed_trades)
 
+        # Total PnL (Latest total - Initial total)
+        # Note: We use the sum of realized PnL column for absolute truth, or the equity diff
+        total_pnl = df_all['realized_pnl'].iloc[-1] if 'realized_pnl' in df_all.columns else 0.0
+
         # Compile Metrics
         metrics = {
-            "total_pnl": df_all['realized_pnl'].iloc[-1] if 'realized_pnl' in df_all.columns else 0.0,
+            "total_pnl": total_pnl,
             "sharpe_ratio": sharpe,
             "sortino_ratio": sortino,
             "max_drawdown": portfolio_max_dd, 
@@ -384,13 +419,12 @@ class SupervisorAgent:
             "cum_return": (normalized_equity_curve.iloc[-1] - 100) / 100,
             "win_rate": win_rate,
             "total_steps": len(df_all),
-            "pair_summaries": [] # (Populate as needed similar to previous logic)
+            "pair_summaries": [] # (Populate as needed via separate logic if required)
         }
         
-        # Export curve data (Explicitly includes the 100.0 start)
-        metrics["equity_curve"] = normalized_equity_curve.tolist()
-        # Create a date/step index that matches the length (0 to N)
-        metrics["equity_curve_dates"] = ["Start"] + returns_pivot.index.astype(str).tolist()
+        # Export curve data matching Visualizer
+        metrics["equity_curve"] = equity_values
+        metrics["equity_curve_dates"] = equity_dates
 
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
