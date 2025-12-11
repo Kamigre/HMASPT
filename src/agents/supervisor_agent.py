@@ -299,12 +299,26 @@ class SupervisorAgent:
     
     def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Evaluate complete portfolio performance using robust 'Delta PnL' aggregation.
-        This PREVENTS 'Capital Injection' bugs where new pairs appearing look like profit.
+        Evaluate complete portfolio performance using Equal-Weight Aggregation of daily returns.
+        
+        Logic:
+        1. Extracts 'daily_return' directly from strategy logs (The Source of Truth).
+        2. Aligns all strategies by their time step.
+        3. Fills missing data with 0.0 (Cash assumption).
+        4. Calculates Portfolio Return as the mean of active strategies (Equal Weight).
         """
         
         # --- 1. DATA PREPARATION ---
-        df_all = pd.DataFrame(operator_traces)
+        # Flatten the 'details' dictionary into the main columns if necessary
+        processed_data = []
+        for trace in operator_traces:
+            base = trace.copy()
+            details = base.pop('details', {})
+            # Merge details into the top level for easier DataFrame processing
+            combined = {**base, **details} 
+            processed_data.append(combined)
+
+        df_all = pd.DataFrame(processed_data)
         
         # Handle empty data
         if df_all.empty:
@@ -312,140 +326,127 @@ class SupervisorAgent:
                 "metrics": {
                     "total_pnl": 0.0, "sharpe_ratio": 0.0, "sortino_ratio": 0.0,
                     "max_drawdown": 0.0, "win_rate": 0.0, "cum_return": 0.0,
-                    "equity_curve": [], "dates": [], "pair_summaries": []
+                    "equity_curve": [], "equity_curve_dates": [], "pair_summaries": []
                 },
                 "actions": [],
                 "explanation": "No data available."
             }
         
-        # Normalize time column
-        time_col = 'timestamp' if 'timestamp' in df_all.columns else 'step'
-        if time_col not in df_all.columns and 'local_step' in df_all.columns:
-            time_col = 'local_step'
-        
+        # Select the most reliable time column for alignment (prefer local_step for simulations)
+        time_col = 'local_step' if 'local_step' in df_all.columns else 'timestamp'
+        if time_col not in df_all.columns and 'step' in df_all.columns:
+            time_col = 'step'
+
+        # Ensure we have the critical 'daily_return' column
+        if 'daily_return' not in df_all.columns:
+            # Fallback: Try to calculate it if portfolio_value exists
+            if 'portfolio_value' in df_all.columns:
+                df_all['daily_return'] = df_all.groupby('pair')['portfolio_value'].pct_change().fillna(0.0)
+            else:
+                raise ValueError("Traces must contain 'daily_return' or 'portfolio_value' in details.")
+
         # Ensure time is sorted
-        df_all[time_col] = pd.to_datetime(df_all[time_col]) if time_col == 'timestamp' else df_all[time_col]
         df_all = df_all.sort_values(by=time_col)
         
-        # --- 2. ROBUST EQUITY CURVE CALCULATION (The Source of Truth) ---
-        # Pivot: Index=Time, Columns=Pair, Values=Portfolio Value
-        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+        # --- 2. EQUAL-WEIGHT PORTFOLIO CALCULATION ---
         
-        # Forward fill: If a pair creates no new trace, it holds its last value.
-        equity_matrix_ffill = equity_matrix.ffill()
+        # Pivot: Index=Time, Columns=Pair, Values=Daily Return
+        # We use mean aggregation just in case of duplicate steps, though usually unique.
+        returns_pivot = df_all.pivot_table(index=time_col, columns='pair', values='daily_return', aggfunc='mean')
         
-        # Calculate Dollar PnL per step (Change in value)
-        # diff() ensures that the first appearance of a pair (NaN -> Value) results in NaN change, not Profit.
-        dollar_pnl_matrix = equity_matrix_ffill.diff()
+        # Fill missing values with 0.0 
+        # (Implies that if a strategy hasn't started or has stopped, that portion of capital sits in cash)
+        returns_pivot = returns_pivot.fillna(0.0)
         
-        # Sum dollar PnL across all pairs for each step
-        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
-        
-        # Calculate Total Invested Capital per step (Sum of active pairs)
-        # We fill NaN with 0 here just for the summation of capital
-        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
-        
-        # Calculate Percentage Returns
-        # Return = Global Dollar PnL / Previous Step's Total Capital
-        # We shift capital by 1 to represent "Assets at beginning of period"
-        prev_capital = total_capital_series.shift(1)
-        
-        # Avoid division by zero and handle infinity
-        global_returns_series = global_dollar_pnl / prev_capital
-        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        
-        # Clean returns list for metrics
-        global_returns = global_returns_series.tolist()
+        # Calculate Portfolio Daily Return (Equal Weight)
+        # We take the mean across the row. This assumes an equal capital allocation to each strategy.
+        portfolio_returns_series = returns_pivot.mean(axis=1)
         
         # Reconstruct the "Normalized" Equity Curve (Start at 100)
-        cum_returns = (1 + global_returns_series).cumprod()
-        normalized_equity_curve = 100 * cum_returns
+        portfolio_cum_returns = (1 + portfolio_returns_series).cumprod()
+        normalized_equity_curve = 100 * portfolio_cum_returns
+        
+        # Convert series to list for metrics
+        global_returns = portfolio_returns_series.tolist()
         
         # --- 3. PROCESS PAIR SUMMARIES ---
         pair_summaries = []
         total_portfolio_realized_pnl = 0.0
-        pairs = equity_matrix.columns.tolist()
+        pairs = returns_pivot.columns.tolist()
 
         for pair in pairs:
-            pair_df = df_all[df_all['pair'] == pair]
-            if pair_df.empty: continue
-
-            # Returns for this specific pair
-            pair_vals = pair_df['portfolio_value'].sort_index()
-            pair_ret = pair_vals.pct_change().dropna().tolist()
-
-            # PnL & Metrics
-            final_trace = pair_df.iloc[-1]
-            pair_total_pnl = final_trace.get("realized_pnl", 0.0)
-            total_portfolio_realized_pnl += pair_total_pnl
+            # Extract data for this specific pair
+            pair_trace = df_all[df_all['pair'] == pair]
+            if pair_trace.empty: continue
             
-            # Pair-specific Drawdown
-            p_vals = pair_df['portfolio_value']
-            p_max = p_vals.cummax()
-            p_dd = (p_vals - p_max) / p_max
-            pair_max_dd = abs(p_dd.min()) if not p_dd.empty else 0.0
-
-            initial_val = pair_df.iloc[0]['portfolio_value']
-            final_val = pair_df.iloc[-1]['portfolio_value']
-            c_ret = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
+            # Pair Metrics
+            pair_daily_rets = pair_trace['daily_return'].tolist()
+            
+            # PnL (Summation of realized pnl column if it exists)
+            pair_pnl = pair_trace['realized_pnl'].iloc[-1] if 'realized_pnl' in pair_trace.columns else 0.0
+            total_portfolio_realized_pnl += pair_pnl
+            
+            # Cumulative Return for this pair specifically
+            pair_cum_ret = (np.prod([1 + r for r in pair_daily_rets]) - 1)
+            
+            # Pair Drawdown
+            pair_curve = np.cumprod([1 + r for r in pair_daily_rets])
+            pair_peak = np.maximum.accumulate(pair_curve)
+            pair_dd = (pair_curve - pair_peak) / pair_peak
+            pair_max_dd = abs(np.min(pair_dd)) if len(pair_dd) > 0 else 0.0
 
             pair_summaries.append({
                 "pair": pair,
-                "total_pnl": pair_total_pnl,
-                "cum_return": c_ret,
-                "sharpe": self._calculate_sharpe(pair_ret),
-                "sortino": self._calculate_sortino(pair_ret),
+                "total_pnl": pair_pnl,
+                "cum_return": pair_cum_ret,
+                "sharpe": self._calculate_sharpe(pair_daily_rets),
+                "sortino": self._calculate_sortino(pair_daily_rets),
                 "max_drawdown": pair_max_dd,
-                "steps": len(pair_df)
+                "steps": len(pair_trace)
             })
 
         # --- 4. CALCULATE GLOBAL METRICS ---
         
-        # Max Drawdown (Based on the normalized curve)
+        # Max Drawdown (Based on the normalized portfolio curve)
         running_max = normalized_equity_curve.cummax()
         dd_series = (normalized_equity_curve - running_max) / running_max
         portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
         
-        # Basic Metrics
+        # Win Rate (Aggregated from all closed trades found in traces)
+        # We look for steps where a trade occurred and PnL changed
+        win_rate = 0.0
+        if 'realized_pnl_this_step' in df_all.columns:
+            # Filter for steps where realized PnL is non-zero (implies a closed trade)
+            closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
+            if not closed_trades.empty:
+                wins = (closed_trades['realized_pnl_this_step'] > 0).sum()
+                win_rate = wins / len(closed_trades)
+
+        # Compile Metrics
         metrics = {
             "total_pnl": total_portfolio_realized_pnl,
             "sharpe_ratio": self._calculate_sharpe(global_returns),
             "sortino_ratio": self._calculate_sortino(global_returns),
             "max_drawdown": portfolio_max_dd, 
             "avg_return": float(np.mean(global_returns)) if global_returns else 0.0,
+            "cum_return": (normalized_equity_curve.iloc[-1] - 100) / 100 if not normalized_equity_curve.empty else 0.0,
+            "win_rate": win_rate,
             "total_steps": len(df_all),
             "n_pairs": len(pairs),
             "pair_summaries": pair_summaries
         }
         
-        # --- 5. EXPORT CURVE DATA FOR VISUALIZATION ---
-        # We embed the time series data directly so the visualizer can opt to use it directly
+        # --- 5. EXPORT CURVE DATA ---
         metrics["equity_curve"] = normalized_equity_curve.tolist()
-        # Convert timestamps to strings for JSON serializability if needed, or keep as Index
-        metrics["equity_curve_dates"] = normalized_equity_curve.index.tolist()
+        metrics["equity_curve_dates"] = normalized_equity_curve.index.astype(str).tolist()
 
-        # --- 6. WIN RATE & RISK ---
-        if 'realized_pnl_this_step' in df_all.columns:
-            closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
-            if not closed_trades.empty:
-                costs = closed_trades.get('transaction_costs', 0.0)
-                # Count win if Net PnL > 0
-                wins = ((closed_trades['realized_pnl_this_step'] - costs) > 0).sum()
-                metrics["win_rate"] = wins / len(closed_trades)
-            else:
-                metrics["win_rate"] = 0.0
-        else:
-            metrics["win_rate"] = 0.0
-
+        # Risk Metrics (VaR/CVaR)
         if global_returns:
             metrics["var_95"] = float(np.percentile(global_returns, 5))
             tail_losses = [r for r in global_returns if r <= metrics["var_95"]]
             metrics["cvar_95"] = float(np.mean(tail_losses)) if tail_losses else metrics["var_95"]
         else:
             metrics["var_95"] = 0.0; metrics["cvar_95"] = 0.0
-
-        # Final Cumulative Return
-        metrics["cum_return"] = (normalized_equity_curve.iloc[-1] - 100) / 100 if not normalized_equity_curve.empty else 0.0
 
         actions = self._generate_portfolio_actions(metrics)
         explanation = self._generate_explanation(metrics, actions)
