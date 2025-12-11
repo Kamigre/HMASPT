@@ -480,35 +480,37 @@ class SupervisorAgent:
             return self._fallback_explanation(metrics, actions)
         
         prompt = f"""
-                You are the Chief Risk Officer (CRO) at a Quantitative Hedge Fund. 
-                Your mandate is capital preservation and risk-adjusted growth.
+                ### ROLE & OBJECTIVE
+                Act as the Chief Risk Officer (CRO) of a Quantitative Hedge Fund. Your sole mandate is capital preservation and risk-adjusted growth. You are addressing the Investment Committee.
                 
-                Analyze the following Pairs Trading Portfolio results:
-                
-                --- METRICS ---
+                ### INPUT DATA
+                --- PORTFOLIO METRICS ---
                 {json.dumps(metrics, indent=2, default=str)}
                 
-                --- AUTOMATED ACTIONS TRIGGERED ---
+                --- AUTOMATED SYSTEM ACTIONS ---
                 {json.dumps(actions, indent=2)}
                 
-                Produce a strict, institutional-grade Executive Risk Memo. 
-                Avoid generic pleasantries. Focus on data interpretation.
+                ### INSTRUCTIONS
+                Produce a high-level, institutional-grade **Risk Memo**.
+                * **Tone:** Clinical, academic, and extremely concise. No pleasantries, no "I hope this helps," and no email formatting (Subject/Dear Team).
+                * **Format:** Bullet points and bold key figures only.
+                * **Length:** Maximum 400 words.
                 
-                Structure your response into these three specific sections:
+                ### REQUIRED SECTIONS
                 
-                ### 1. Performance Attribution
-                - Evaluate the quality of returns (Sharpe > 2.0 is target).
-                - Analyze the "Quality of Earnings": Compare Win Rate vs. Total PnL. (e.g., If Win Rate is high but PnL is low/negative, are we taking small profits and large losses?)
-                - Comment on the disparity between Average Return and Median Return (skewness).
+                #### 1. Performance Attribution
+                * **Return Efficiency:** Analyze Sharpe and Sortino ratios. Is the risk-adjusted return justifiable?
+                * **Profit Quality:** Contrast Win Rate against Total PnL. explicitly identify if the strategy suffers from "negative skew" (small frequent wins, rare massive losses).
+                * **Distribution:** Evaluate the delta between Average Return and Median Return to determine return skewness.
                 
-                ### 2. Risk Decomposition
-                - Analyze Tail Risk: specific comment on Max Drawdown vs. VaR/CVaR (95%).
-                - Assess "Stalemate Risk": Look at 'avg_steps_per_pair'. Are we holding positions too long for a mean-reversion strategy?
-                - Identify if specific pairs are dragging down the aggregate (Concentration of loss).
+                #### 2. Risk Decomposition
+                * **Tail Risk Analysis:** Contrast Max Drawdown against VaR/CVaR (95%). Is the realized drawdown within modeled expectations?
+                * **Duration/Stalemate Risk:** Analyze 'avg_steps_per_pair'. Is the holding period consistent with a mean-reversion thesis, or are capital costs eroding alpha?
+                * **Concentration:** Identify if losses are systemic or isolated to specific pairs.
                 
-                ### 3. CRO Verdict & Adjustments
-                - Review the AUTOMATED ACTIONS above. Do you concur, or do you recommend a manual override?
-                - Provide a final "Traffic Light" signal: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
+                #### 3. CRO Verdict & Adjustments
+                * **Action Review:** Validate the AUTOMATED ACTIONS listed in the input. State "ENDORSE" or "OVERRIDE" with a single-sentence justification.
+                * **Traffic Light Signal:** Conclude with a single word: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
                 """
         
         try:
