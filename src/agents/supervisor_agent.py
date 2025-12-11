@@ -355,6 +355,7 @@ class SupervisorAgent:
         equity_matrix_ffill = equity_matrix.ffill()
         
         # Dollar PnL Change (Global)
+        # We take the difference step-over-step to find how much money was made/lost globally in this step
         dollar_pnl_matrix = equity_matrix_ffill.diff()
         global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
@@ -405,9 +406,10 @@ class SupervisorAgent:
                 wins = (closed_trades['realized_pnl_this_step'] > 0).sum()
                 win_rate = wins / len(closed_trades)
 
-        # Total PnL (Latest total - Initial total)
-        # Note: We use the sum of realized PnL column for absolute truth, or the equity diff
-        total_pnl = df_all['realized_pnl'].iloc[-1] if 'realized_pnl' in df_all.columns else 0.0
+        # Total PnL Calculation (CORRECTED)
+        # We sum the 'global_dollar_pnl' series, which represents the aggregate dollar change 
+        # of the entire portfolio at every timestep. This captures the PnL of ALL pairs.
+        total_pnl = float(global_dollar_pnl.sum())
 
         # Compile Metrics
         metrics = {
