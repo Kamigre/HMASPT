@@ -9,12 +9,8 @@ from typing import List, Dict, Any, Tuple
 from datetime import datetime
 import textwrap
 
-# Ensure config is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-try:
-    from config import CONFIG
-except ImportError:
-    CONFIG = {"risk_free_rate": 0.04}
+from config import CONFIG
 
 # --- GLOBAL STYLE SETTINGS ---
 sns.set_theme(style="whitegrid", context="talk", font_scale=0.9)
@@ -45,7 +41,7 @@ class PortfolioVisualizer:
             'fill_profit': '#2ecc71',
             'fill_loss': '#e74c3c',
             'neutral': '#95a5a6',
-            'accent': '#f39c12',        # Orange (Warnings)
+            'accent': '#f39c12',        # Original Orange (Warnings)
             'text_bg': '#fdfefe',       # Very light grey for text card
             'asset_x': '#2980b9',       # Blue for Asset X
             'asset_y': '#7f8c8d'        # Grey for Asset Y
@@ -54,7 +50,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score, Drawdown,
-        AND Price Co-movement vs. Position, with Ticker Names and **Consistent Position Styling**.
+        AND Price Co-movement vs. Position. Uses requested background fill style for position.
         """
         if len(traces) == 0:
             return
@@ -185,12 +181,13 @@ class PortfolioVisualizer:
         
         ax3b = ax3.twinx()
         
-        # --- CONSISTENCY FIX 1: Use step plot and accent color for position in Z-Score plot ---
-        ax3b.step(steps, df['position'], color=self.colors['accent'], lw=2, where='post', label='Position Size')
-        ax3b.set_ylabel('Position', color=self.colors['accent'])
-        ax3b.tick_params(axis='y', labelcolor=self.colors['accent'])
+        # --- REVERT POSITION STYLE (Subplot 3): Gray background fill with black text ---
+        ax3b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
+        ax3b.step(steps, df['position'], color='black', lw=0.8, where='post') # Add faint line border
+        ax3b.set_ylabel('Position', color='black') # Black text
+        ax3b.tick_params(axis='y', labelcolor='black') # Black text
         ax3b.grid(False)
-        # --- END CONSISTENCY FIX 1 ---
+        # --- END REVERT POSITION STYLE ---
 
         ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
         plt.setp(ax3.get_xticklabels(), visible=False)
@@ -202,9 +199,9 @@ class PortfolioVisualizer:
             df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
             df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
             
-            # Use extracted ticker names for labels
-            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"{ticker_x} (Norm)")
-            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"{ticker_y} (Norm)")
+            # Update Legend: Remove (Norm)
+            ax4.plot(steps, df['norm_x'], color=self.colors['asset_x'], lw=1.5, label=f"{ticker_x}")
+            ax4.plot(steps, df['norm_y'], color=self.colors['asset_y'], lw=1.5, label=f"{ticker_y}")
             
             ax4.set_ylabel("Normalized Price")
             ax4.legend(loc='upper left', ncol=2, fontsize=10)
@@ -213,14 +210,16 @@ class PortfolioVisualizer:
             # Secondary Y-axis for Position Execution
             ax4b = ax4.twinx()
             
-            # --- CONSISTENCY FIX 2: Use step plot and accent color for position in Price plot ---
-            ax4b.step(steps, df['position'], color=self.colors['accent'], lw=2, where='post', alpha=0.6, label='Position Size')
-            ax4b.set_ylabel('Position', color=self.colors['accent'])
-            ax4b.tick_params(axis='y', labelcolor=self.colors['accent'])
+            # --- REVERT POSITION STYLE (Subplot 4): Gray background fill with black text ---
+            ax4b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
+            ax4b.step(steps, df['position'], color='black', lw=0.8, where='post') # Add faint line border
+            ax4b.set_ylabel('Position', color='black') # Black text
+            ax4b.tick_params(axis='y', labelcolor='black') # Black text
             ax4b.grid(False)
-            # --- END CONSISTENCY FIX 2 ---
+            # --- END REVERT POSITION STYLE ---
             
-            ax4.set_title(f"Normalized Price Co-movement ({ticker_x} vs {ticker_y}) and Position", loc='left')
+            # Update Title: Remove Ticker Names
+            ax4.set_title(f"Normalized Price Co-movement and Position", loc='left')
         else:
             ax4.text(0.5, 0.5, "Price Data Unavailable for Co-movement Analysis", ha='center', va='center', fontsize=14, color=self.colors['neutral'])
             ax4.axis('off')
@@ -370,8 +369,8 @@ class PortfolioVisualizer:
             ret = val - 100
             color = self.colors['profit'] if ret >= 0 else self.colors['loss']
             ax1.annotate(f"{ret:+.2f}%", xy=(portfolio_equity_curve.index[-1], val),
-                         xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
-                         bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
+                          xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
+                          bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
 
         # Use total capital from equity series max for label (Approximate peak AUM)
         est_capital = total_capital_series.max()
@@ -500,88 +499,85 @@ class PortfolioVisualizer:
     
     def visualize_executive_summary(self, explanation_text: str):
         """
-        Creates a dedicated Executive Summary card with the Gemini explanation.
-        Optimized to dynamically resize height so text is never cut off.
+        Writes the Gemini explanation to a plain text file for the Executive Summary.
         """
         if not explanation_text:
             return
 
-        # 1. Formatting and Wrapping text first to calculate size
-        # Increased width to 100 characters for better fit
-        wrapper = textwrap.TextWrapper(width=100, replace_whitespace=False)
-        formatted_text = ""
+        # 1. Format the text for better readability in a text file
+        header = "=== Risk Manager: Executive Summary ==="
+        footer = "=== Generated by AI Supervisor Agent ==="
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Use textwrap to format paragraphs to a sensible width (e.g., 80 characters)
+        wrapper = textwrap.TextWrapper(width=80, replace_whitespace=False)
         
+        formatted_content = []
         paragraphs = explanation_text.split('\n')
         for p in paragraphs:
             if p.strip():
-                formatted_text += "\n".join(wrapper.wrap(p)) + "\n\n"
+                formatted_content.append(wrapper.fill(p))
+            else:
+                formatted_content.append("") # Preserve blank lines
+
+        final_content = [
+            header,
+            f"Report Generated: {timestamp}",
+            "",
+            *formatted_content,
+            "",
+            footer
+        ]
+
+        # 2. Write to a plain text file
+        # Use a file name that is safe for filesystems
+        safe_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"executive_summary_{safe_timestamp}.txt"
+        filepath = os.path.join(self.output_dir, filename)
         
-        # 2. Calculate required height
-        # Estimate: Base height + (Lines * Height per line)
-        num_lines = formatted_text.count('\n')
-        estimated_height = max(10, 4 + (num_lines * 0.4)) # 0.4 inch per line buffer
-
-        # 3. Create Figure with Dynamic Height
-        fig = plt.figure(figsize=(18, estimated_height))
-        fig.patch.set_facecolor(self.colors['text_bg'])
-        ax = fig.add_subplot(111)
-        ax.axis('off')
-
-        # 4. Render Text
-        # Header
-        ax.text(0.05, 0.98, "Risk Manager: Executive Summary", 
-                 fontsize=24, weight='bold', color=self.colors['primary'], va='top', ha='left')
-        
-        # Body (Aligned Top-Left)
-        # We start slightly lower (0.92) to leave room for header
-        ax.text(0.05, 0.92, formatted_text, 
-                 fontsize=16, color='#2c3e50', va='top', ha='left', family='monospace')
-
-        # Footer
-        ax.text(0.5, 0.02, "Generated by AI Supervisor Agent", 
-                 fontsize=12, color=self.colors['neutral'], ha='center', va='bottom')
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(self.output_dir, f"executive_summary_{timestamp}.png")
-        plt.savefig(filepath, facecolor=self.colors['text_bg'])
-        plt.close()
-        print(f"📄 Saved executive summary: {filepath}")
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(final_content))
+            print(f"📄 Saved executive summary (TXT): {filepath}")
+        except IOError as e:
+            print(f"❌ Error writing executive summary text file: {e}")
 
     def _calculate_sharpe(self, returns):
         """Calculates the Annualized Sharpe Ratio."""
         if len(returns) < 2: return 0.0
+        # Assume daily data, scale risk-free rate to daily
         rf = CONFIG.get("risk_free_rate", 0.04) / 252 
         exc = np.array(returns) - rf
         std = np.std(exc, ddof=1)
         return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
 
     def _calculate_sortino(self, returns):
-            """Calculates the Annualized Sortino Ratio (Downside Risk only)."""
-            if len(returns) < 2: return 0.0
-            
-            # 1. Define Risk-Free Rate and Excess Returns
-            rf = CONFIG.get("risk_free_rate", 0.04) / 252 
-            returns_np = np.array(returns)
-            exc = returns_np - rf
-            avg_excess_return = np.mean(exc)
-            
-            # 2. Calculate Downside Deviation
-            # We only care about returns that fell BELOW the target (rf)
-            negative_excess_returns = exc[exc < 0]
-            
-            if len(negative_excess_returns) == 0:
-                # If there is no downside risk (no returns below rf), 
-                # Sortino is theoretically infinite. We cap it or return a high value.
-                return 10.0 if avg_excess_return > 0 else 0.0
+        """Calculates the Annualized Sortino Ratio (Downside Risk only)."""
+        if len(returns) < 2: return 0.0
+        
+        # 1. Define Risk-Free Rate and Excess Returns
+        rf = CONFIG.get("risk_free_rate", 0.04) / 252 
+        returns_np = np.array(returns)
+        exc = returns_np - rf
+        avg_excess_return = np.mean(exc)
+        
+        # 2. Calculate Downside Deviation
+        # We only care about returns that fell BELOW the target (rf)
+        negative_excess_returns = exc[exc < 0]
+        
+        if len(negative_excess_returns) == 0:
+            # If there is no downside risk (no returns below rf), 
+            # Sortino is theoretically infinite. We cap it or return a high value.
+            return 10.0 if avg_excess_return > 0 else 0.0
     
-            # ddof=1 for sample standard deviation
-            downside_std = np.std(negative_excess_returns, ddof=1)
-            
-            # 3. Calculate Ratio & Annualize
-            if downside_std > 1e-8:
-                return (avg_excess_return / downside_std) * np.sqrt(252)
-            else:
-                return 0.0
+        # ddof=1 for sample standard deviation
+        downside_std = np.std(negative_excess_returns, ddof=1)
+        
+        # 3. Calculate Ratio & Annualize
+        if downside_std > 1e-8:
+            return (avg_excess_return / downside_std) * np.sqrt(252)
+        else:
+            return 0.0
 
 def generate_all_visualizations(all_traces: List[Dict], 
                                  skipped_pairs: List[Dict],
