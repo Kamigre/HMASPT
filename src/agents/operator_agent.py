@@ -636,6 +636,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         env.num_trades = 0
         env.trade_history = []
         env.peak_value = env.initial_capital
+        env.cum_return = 0
         if env.position != 0:
             env.position = 0
             env.entry_spread = 0.0
