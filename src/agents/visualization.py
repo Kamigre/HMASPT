@@ -153,7 +153,7 @@ class PortfolioVisualizer:
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
             ("Trade Win Rate", f"{win_rate*100:.1f}%", self.colors['primary']), 
             ("Sharpe", f"{self._calculate_sharpe(df['daily_return']):.2f}", self.colors['primary']),
-            ("Sharpe", f"{self._calculate_sortino(df['daily_return']):.2f}", self.colors['primary']),
+            ("Sortino", f"{self._calculate_sortino(df['daily_return']):.2f}", self.colors['primary']),
             ("Trades Executed", f"{total_entries}", self.colors['primary']) # Corrected Variable
         ]
         
