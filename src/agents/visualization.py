@@ -224,21 +224,24 @@ class PortfolioVisualizer:
 
     def visualize_pair_behavior(self, traces: List[Dict], pair_name: str):
         """
-        Creates a 'Behavior Analysis' report comparing Price Action vs Strategy Returns.
+        Creates a 'Behavior Analysis' report comparing Price Action vs Strategy Returns
+        and adds Position Execution for better trade context.
         """
         if not traces: return
         df = pd.DataFrame(traces)
         
-        if 'price_x' not in df.columns or 'price_y' not in df.columns:
-            print(f"⚠️ Cannot generate behavior report for {pair_name}: Missing raw price data.")
+        if 'price_x' not in df.columns or 'price_y' not in df.columns or 'position' not in df.columns:
+            print(f"⚠️ Cannot generate behavior report for {pair_name}: Missing raw price or position data.")
             return
 
         df['norm_x'] = df['price_x'] / df['price_x'].iloc[0]
         df['norm_y'] = df['price_y'] / df['price_y'].iloc[0]
         
         fig = plt.figure(figsize=(16, 10))
-        gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1], hspace=0.15)
+        # Increase the size of the top plot (price) relative to the bottom (returns/position)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1.5], hspace=0.15)
         
+        # --- TOP PLOT: Normalized Price Action ---
         ax1 = fig.add_subplot(gs[0])
         ax1.plot(df['local_step'], df['norm_x'], color=self.colors['asset_x'], lw=2, label=f"Asset X (Normalized)")
         ax1.plot(df['local_step'], df['norm_y'], color=self.colors['asset_y'], lw=2, label=f"Asset Y (Normalized)")
@@ -251,24 +254,44 @@ class PortfolioVisualizer:
         ax1.grid(True, alpha=0.3)
         plt.setp(ax1.get_xticklabels(), visible=False)
 
+        # --- BOTTOM PLOT: Cumulative Return & Position Execution ---
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
         cum_ret_pct = df['cum_return'] * 100
         ax2.plot(df['local_step'], cum_ret_pct, color=self.colors['primary'], lw=2, label="Strategy Return %")
         
+        # Fill for Returns
         ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct >= 0), color=self.colors['fill_profit'], alpha=0.2)
         ax2.fill_between(df['local_step'], 0, cum_ret_pct, where=(cum_ret_pct < 0), color=self.colors['fill_loss'], alpha=0.2)
         
         ax2.axhline(0, color='black', linestyle='--', alpha=0.5)
-        ax2.set_ylabel("Cumulative Return (%)")
+        ax2.set_ylabel("Cumulative Return (%)", color=self.colors['primary'])
+        ax2.tick_params(axis='y', labelcolor=self.colors['primary'])
+        
+        # --- ADD SECONDARY AXIS for Position Execution ---
+        ax2b = ax2.twinx()
+        
+        # Plot position using a step plot for clarity
+        ax2b.step(df['local_step'], df['position'], color=self.colors['accent'], lw=1.5, where='post', label='Position Size')
+        ax2b.axhline(0, color=self.colors['neutral'], linestyle=':', lw=1)
+        
+        ax2b.set_ylabel('Position Execution', color=self.colors['accent'], labelpad=15)
+        ax2b.tick_params(axis='y', labelcolor=self.colors['accent'])
+        ax2b.set_ylim(df['position'].min() * 1.1 - 0.1, df['position'].max() * 1.1 + 0.1) # Set sensible limits
+        ax2b.grid(False) # Turn off the secondary grid
+        
+        # Combine legends
+        lines, labels = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2b.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc='upper left')
+        
         ax2.set_xlabel("Trading Steps")
-        ax2.legend(loc='upper left')
         ax2.grid(True, alpha=0.3)
 
         filename = f"behavior_{pair_name.replace('-', '_')}.png"
         filepath = os.path.join(self.output_dir, "behavior", filename)
         plt.savefig(filepath)
         plt.close()
-        print(f"    📉 Saved behavior analysis: {filepath}")
+        print(f"    📉 Saved behavior analysis (with position): {filepath}")
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
