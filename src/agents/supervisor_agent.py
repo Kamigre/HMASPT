@@ -181,7 +181,7 @@ class SupervisorAgent:
         
         # 1. Structural Break (Z-Score > 3.0)
         spread_history = [t['current_spread'] for t in operator_traces]
-        if len(spread_history) > 20:
+        if len(spread_history) > 10:
             spread_series = pd.Series(spread_history)
             rolling_mean = spread_series.rolling(window=20).mean().iloc[-1]
             rolling_std = spread_series.rolling(window=20).std().iloc[-1]
