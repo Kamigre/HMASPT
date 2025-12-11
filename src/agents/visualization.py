@@ -54,7 +54,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score, Drawdown,
-        AND Price Co-movement vs. Position, now with Ticker Names.
+        AND Price Co-movement vs. Position, with Ticker Names and **Consistent Position Styling**.
         """
         if len(traces) == 0:
             return
@@ -113,8 +113,8 @@ class PortfolioVisualizer:
             ticker_x, ticker_y = "Asset X", "Asset Y"
 
         # --- Plotting ---
-        # Changed GridSpec from 4 rows to 5 rows to accommodate the new plot
-        fig = plt.figure(figsize=(20, 18)) # Increased height for 5 plots
+        # 5 rows for: Equity, Z-Score, Price/Position, Drawdown/Returns, P&L
+        fig = plt.figure(figsize=(20, 18)) 
         gs = gridspec.GridSpec(5, 4, figure=fig, hspace=0.5, wspace=0.3)
         
         # Title
@@ -123,7 +123,7 @@ class PortfolioVisualizer:
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
                      fontsize=22, weight='bold', color=status_color, y=0.98)
         
-        steps = df['local_step'] # Standard steps for time-series plots
+        steps = df['local_step']
 
         # 1. Equity Curve (gs[0, :3])
         ax1 = fig.add_subplot(gs[0, :3])
@@ -184,9 +184,14 @@ class PortfolioVisualizer:
         ax3.set_ylabel('Z-Score')
         
         ax3b = ax3.twinx()
-        ax3b.fill_between(steps, df['position'], color='black', alpha=0.1, step='post', label='Position Size')
-        ax3b.set_ylabel('Position')
+        
+        # --- CONSISTENCY FIX 1: Use step plot and accent color for position in Z-Score plot ---
+        ax3b.step(steps, df['position'], color=self.colors['accent'], lw=2, where='post', label='Position Size')
+        ax3b.set_ylabel('Position', color=self.colors['accent'])
+        ax3b.tick_params(axis='y', labelcolor=self.colors['accent'])
         ax3b.grid(False)
+        # --- END CONSISTENCY FIX 1 ---
+
         ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
         plt.setp(ax3.get_xticklabels(), visible=False)
 
@@ -207,10 +212,13 @@ class PortfolioVisualizer:
 
             # Secondary Y-axis for Position Execution
             ax4b = ax4.twinx()
-            ax4b.step(steps, df['position'], color=self.colors['accent'], lw=1.5, where='post', alpha=0.6, label='Position Size')
+            
+            # --- CONSISTENCY FIX 2: Use step plot and accent color for position in Price plot ---
+            ax4b.step(steps, df['position'], color=self.colors['accent'], lw=2, where='post', alpha=0.6, label='Position Size')
             ax4b.set_ylabel('Position', color=self.colors['accent'])
             ax4b.tick_params(axis='y', labelcolor=self.colors['accent'])
             ax4b.grid(False)
+            # --- END CONSISTENCY FIX 2 ---
             
             ax4.set_title(f"Normalized Price Co-movement ({ticker_x} vs {ticker_y}) and Position", loc='left')
         else:
