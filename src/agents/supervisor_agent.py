@@ -238,7 +238,7 @@ class SupervisorAgent:
             violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 10%"
         
         # Efficiency Threshold: Bad Sharpe after 15 days
-        elif metrics['sharpe'] < -1.5 and days_in_pos > 15: 
+        elif metrics['sharpe'] < 0 and days_in_pos > 15: 
             violation = True
             violation_reason = f"Sharpe {metrics['sharpe']:.2f} (Inefficient Risk)"
 
