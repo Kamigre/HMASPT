@@ -189,7 +189,7 @@ class PortfolioVisualizer:
         ax3b.grid(False)
         # --- END REVERT POSITION STYLE ---
 
-        ax3.set_title('Z-Score Signal vs. Position Execution', loc='left')
+        ax3.set_title('Z-Score Signal vs. Position', loc='left')
         plt.setp(ax3.get_xticklabels(), visible=False)
 
         # --- 4. NEW PLOT: Price Co-movement vs. Position (gs[2, :]) ---
@@ -219,7 +219,7 @@ class PortfolioVisualizer:
             # --- END REVERT POSITION STYLE ---
             
             # Update Title: Remove Ticker Names
-            ax4.set_title(f"Normalized Price Co-movement and Position", loc='left')
+            ax4.set_title(f"Normalized Price Co-movement vs. Position", loc='left')
         else:
             ax4.text(0.5, 0.5, "Price Data Unavailable for Co-movement Analysis", ha='center', va='center', fontsize=14, color=self.colors['neutral'])
             ax4.axis('off')
