@@ -671,6 +671,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 "current_spread": round(float(info.get("current_spread", 0.0)), 2),
                 "z_score": round(float(info.get("z_score", 0.0)), 2), 
                 "days_in_position": int(info.get("days_in_position", 0)),
+                "num_trades": int(info.get("num_trades", 0)),
                 "price_x": round(float(info.get("price_x", 0.0)), 2),
                 "price_y": round(float(info.get("price_y", 0.0)), 2)
             }
