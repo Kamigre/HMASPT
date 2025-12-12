@@ -1,609 +1,852 @@
 import os
 import json
+import time
 import datetime
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
-import google.generativeai as genai
-from statsmodels.tsa.stattools import adfuller
-
-# Local imports
+import gymnasium as gym
+from gymnasium import spaces
+from sb3_contrib import RecurrentPPO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import CONFIG
+from agents.message_bus import JSONLogger
 
-try:
-    from config import CONFIG
-    from agents.message_bus import JSONLogger
-    from utils import half_life as compute_half_life, compute_spread
-except ImportError:
-    CONFIG = {"risk_free_rate": 0.04}
-    JSONLogger = None
-    compute_half_life = lambda x: 10
-    compute_spread = lambda x, y: x - y
 
+class PairTradingEnv(gym.Env):
+
+    def __init__(self, series_x: pd.Series, series_y: pd.Series, 
+                 lookback: int = 30,
+                 initial_capital: float = 10000,
+                 position_scale: int = 100,
+                 transaction_cost_rate: float = 0.0005,
+                 test_mode: bool = False):
+        
+        super().__init__()
+        
+        # Align series
+        self.data = pd.concat([series_x, series_y], axis=1).dropna()
+        self.lookback = lookback
+        self.test_mode = test_mode
+        self.initial_capital = initial_capital
+        self.position_scale = position_scale
+        self.transaction_cost_rate = transaction_cost_rate
+        
+        # Action: 3 discrete actions (short, flat, long)
+        self.action_space = spaces.Discrete(3)
+        
+        # Observation space: 14 features
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
+        )
+        
+        # Precompute spread and features
+        self._precompute_features()
+        
+        self.reset()
+
+    def _compute_rsi(self, series, period=14):
+        """Helper to calculate RSI of the spread"""
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / (loss + 1e-8)
+        return 100 - (100 / (1 + rs))
+
+    def _precompute_features(self):
+        """Compute spread and advanced features"""
+        x = self.data.iloc[:, 0]
+        y = self.data.iloc[:, 1]
+        
+        # Raw spread
+        self.spread = x - y
+        
+        # 1. Z-scores (Mean Reversion Signals)
+        self.zscore_short = (
+            (self.spread - self.spread.rolling(self.lookback).mean()) / 
+            (self.spread.rolling(self.lookback).std() + 1e-8)
+        )
+        
+        self.zscore_long = (
+            (self.spread - self.spread.rolling(self.lookback * 2).mean()) / 
+            (self.spread.rolling(self.lookback * 2).std() + 1e-8)
+        )
+        
+        # 2. Volatility Features (Risk Detection)
+        self.vol_short = self.spread.rolling(self.lookback).std()
+        self.vol_long = self.spread.rolling(self.lookback * 3).std()
+        
+        # Volatility Ratio
+        self.vol_ratio = self.vol_short / (self.vol_long + 1e-8)
+        
+        # 3. Momentum Features (Trend Detection)
+        self.rsi = self._compute_rsi(self.spread, period=14)
+        
+        # Convert to numpy and fill NaNs
+        self.spread_np = np.nan_to_num(self.spread.to_numpy(), nan=0.0)
+        self.zscore_short_np = np.nan_to_num(self.zscore_short.to_numpy(), nan=0.0)
+        self.zscore_long_np = np.nan_to_num(self.zscore_long.to_numpy(), nan=0.0)
+        self.vol_np = np.nan_to_num(self.vol_short.to_numpy(), nan=1.0)
+        self.vol_ratio_np = np.nan_to_num(self.vol_ratio.to_numpy(), nan=1.0)
+        self.rsi_np = np.nan_to_num(self.rsi.to_numpy(), nan=50.0)
+        
+        # Store prices for logging
+        self.price_x_np = x.to_numpy()
+        self.price_y_np = y.to_numpy()
+
+    def _get_observation(self, idx: int) -> np.ndarray:
+        """Build NORMALIZED observation vector"""
+        if idx < 0 or idx >= len(self.spread_np):
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        
+        norm_unrealized = self.unrealized_pnl / self.initial_capital
+        norm_realized = self.realized_pnl / self.initial_capital
+        
+        obs = np.array([
+            self.zscore_short_np[idx],
+            self.zscore_long_np[idx],
+            self.vol_np[idx],
+            self.spread_np[idx],
+            
+            # NEW FEATURES
+            self.rsi_np[idx] / 100.0,
+            self.vol_ratio_np[idx],
+            
+            float(self.position / self.position_scale),  
+            float(self.entry_spread) if self.position != 0 else 0.0,
+            
+            # NORMALIZED FINANCIALS
+            float(norm_unrealized),
+            float(norm_realized),
+            
+            float(self.cash / self.initial_capital - 1),  
+            float(self.portfolio_value / self.initial_capital - 1),  
+            
+            float(self.days_in_position) / 252.0,
+            float(self.num_trades) / 100.0,
+        ], dtype=np.float32)
+        
+        return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        """Reset environment to initial state"""
+        super().reset(seed=seed)
+        
+        self.idx = self.lookback if not self.test_mode else 0
+        self.position = 0
+        self.entry_spread = 0.0 
+        self.days_in_position = 0
+        
+        # Financial tracking
+        self.cash = self.initial_capital
+        self.realized_pnl = 0.0 
+        self.unrealized_pnl = 0.0 
+        self.portfolio_value = self.initial_capital
+        
+        # Performance tracking
+        self.peak_value = self.initial_capital
+        self.num_trades = 0
+        self.trade_history = []
+        
+        # For return calculation
+        self.prev_portfolio_value = self.initial_capital
+        
+        return self._get_observation(self.idx), {}
+
+    def step(self, action: int):
+        """
+        Execute one trading step with IMPROVED Reward Calculation.
+        """
+        current_idx = self.idx
+        
+        # 1. Determine if this is the last available step
+        is_last_step = (current_idx >= len(self.spread_np) - 1)
+        
+        # 2. Determine Action
+        if is_last_step:
+            target_position = 0 # FORCE EXIT
+        else:
+            base_position = int(action) - 1
+            target_position = base_position * self.position_scale
+
+        # 3. Setup Data
+        current_spread = float(self.spread_np[current_idx])
+        current_zscore = float(self.zscore_short_np[current_idx])
+        
+        if is_last_step:
+            next_spread = current_spread 
+            next_idx = current_idx 
+        else:
+            next_idx = current_idx + 1
+            next_spread = float(self.spread_np[next_idx])
+            
+        # 4. Execute Trade & Update Financials
+        position_change = target_position - self.position
+        trade_occurred = (position_change != 0)
+        
+        realized_pnl_this_step = 0.0
+        transaction_costs = 0.0
+        
+        if trade_occurred:
+            # Calculate Realized P&L
+            if self.position != 0:
+                spread_change = current_spread - self.entry_spread
+                
+                # Check if we are closing or flipping
+                if target_position == 0 or np.sign(target_position) != np.sign(self.position):
+                    closed_size = abs(self.position)
+                else:
+                    closed_size = abs(position_change)
+                    
+                # Standard PnL Calculation
+                realized_pnl_this_step = (self.position / abs(self.position)) * closed_size * spread_change
+
+            # Transaction Costs
+            trade_size = abs(position_change)
+            notional = trade_size * abs(current_spread)
+            transaction_costs = notional * self.transaction_cost_rate
+            self.num_trades += 1
+            
+            # Reset/Update Entry Price
+            if target_position != 0 and np.sign(target_position) != np.sign(self.position):
+                # Flipping or Opening New
+                self.entry_spread = current_spread
+                self.days_in_position = 0
+            elif target_position == 0:
+                # Flat
+                self.entry_spread = 0.0
+                self.days_in_position = 0
+                
+            # Log history
+            if self.position != 0:
+                  self.trade_history.append({
+                    'entry_spread': self.entry_spread,
+                    'exit_spread': current_spread,
+                    'position': self.position,
+                    'pnl': realized_pnl_this_step,
+                    'holding_days': self.days_in_position,
+                    'forced_close': is_last_step
+                })
+        else:
+            # Holding existing position
+            self.days_in_position += 1
+            
+        # Update State
+        self.position = target_position
+        self.realized_pnl += realized_pnl_this_step - transaction_costs
+        self.cash = self.initial_capital + self.realized_pnl
+        
+        if self.position != 0:
+            self.unrealized_pnl = self.position * (next_spread - self.entry_spread)
+        else:
+            self.unrealized_pnl = 0.0
+            
+        self.portfolio_value = self.cash + self.unrealized_pnl
+        
+        # 5. Returns
+        if not hasattr(self, 'prev_portfolio_value'):
+            self.prev_portfolio_value = self.initial_capital
+
+        # Calculate log returns for better stability, or standard % returns
+        daily_return = (self.portfolio_value - self.prev_portfolio_value) / max(self.prev_portfolio_value, 1e-8)
+        self.prev_portfolio_value = self.portfolio_value
+
+        # 6. Metrics
+        prev_peak = self.peak_value
+        self.peak_value = max(self.peak_value, self.portfolio_value)
+        drawdown = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-8)
+        
+        # ===============================
+        # 7. SIMPLIFIED REWARD FUNCTION
+        # ===============================
+        
+        reward = 0.0
+        
+        # --- Return-based reward -----------------------------------
+        # Risk-adjusted return: reward profits, penalize losses slightly more
+        if daily_return >= 0:
+            reward += daily_return
+        else:
+            reward += 1.2 * daily_return   # loss aversion
+        
+        # --- Z-score alignment (tiny shaping) ------------------------
+        norm_pos = self.position / self.position_scale
+        
+        # anti-alignment = penalize
+        if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
+            reward -= 0.25
+        
+        # pro-alignment = encourage
+        if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
+            reward += 0.25
+        
+        # --- Clip for stability --------------------------------------
+        reward = float(np.clip(reward, -1.0, 1.0))
+        
+        # D) Clip for Stability (Crucial for outliers like 0.33)
+        # ------------------------------------------------------------------
+        # tanh compresses the massive 33% return (Value 16.5) to 1.0
+        # while keeping the 1% return (Value 0.5) at ~0.46 (linear).
+        reward = float(np.tanh(reward))
+        
+        # 8. Index
+        if not is_last_step:
+            self.idx = next_idx
+        
+        # 9. Obs
+        obs = self._get_observation(self.idx)
+        
+        # 10. Info
+        info = {
+            'portfolio_value': round(float(self.portfolio_value), 2),
+            'cash': round(float(self.cash), 2),
+            'realized_pnl': round(float(self.realized_pnl), 2),
+            'unrealized_pnl': round(float(self.unrealized_pnl), 2),
+            'realized_pnl_this_step': round(float(realized_pnl_this_step), 2),
+            'transaction_costs': round(float(transaction_costs), 2),
+            'position': int(self.position),
+            'entry_spread': round(float(self.entry_spread), 2),
+            'current_spread': round(float(current_spread), 2),
+            'z_score': round(float(current_zscore), 2), 
+            'days_in_position': int(self.days_in_position),
+            'daily_return': round(float(daily_return), 4), # Kept at 4 as daily returns are small
+            'drawdown': round(float(drawdown), 2),
+            'num_trades': int(self.num_trades),
+            'trade_occurred': bool(trade_occurred),
+            'cum_return': round(float(self.portfolio_value / self.initial_capital - 1), 2),
+            'forced_close': is_last_step and trade_occurred,
+            'price_x': round(float(self.price_x_np[current_idx]), 2),
+            'price_y': round(float(self.price_y_np[current_idx]), 2)
+        }
+        
+        terminated = is_last_step
+        
+        return obs, float(reward), terminated, False, info
+        
 @dataclass
-class SupervisorAgent:
+class OperatorAgent:
     
     logger: Optional[JSONLogger] = None
-    df: pd.DataFrame = None 
-    storage_dir: str = "./storage"
-    gemini_api_key: Optional[str] = None
-    model: str = "gemini-2.5-flash"
-    temperature: float = 0.1
-    use_gemini: bool = True
-    
-    # Check frequency: Every 3 days
-    check_frequency: int = 3 
-    
-    monitoring_state: Dict[str, Any] = field(default_factory=dict)
+    storage_dir: str = "models/"
 
     def __post_init__(self):
         os.makedirs(self.storage_dir, exist_ok=True)
-        # Gemini setup
-        if self.use_gemini:
-            try:
-                api_key = self.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-                if api_key:
-                    genai.configure(api_key=api_key)
-                    self.client = genai.GenerativeModel(model_name=self.model)
-                else:
-                    self.use_gemini = False
-            except Exception:
-                self.use_gemini = False
+        self.active = True
+        self.transaction_cost = CONFIG.get("transaction_cost", 0.0005)
+        self.current_step = 0
+        self.traces_buffer = []
+        self.max_buffer_size = 1000
 
-    def _log(self, event: str, details: Dict[str, Any]):
+    def get_current_step(self):
+        return self.current_step
+
+    def get_traces_since_step(self, start_step):
+        return [t for t in self.traces_buffer if t.get('step', 0) >= start_step]
+
+    def add_trace(self, trace):
+        self.traces_buffer.append(trace)
+        if len(self.traces_buffer) > self.max_buffer_size:
+            self.traces_buffer = self.traces_buffer[-self.max_buffer_size:]
+
+    def clear_traces_before_step(self, step):
+        self.traces_buffer = [t for t in self.traces_buffer if t.get('step', 0) >= step]
+
+    def apply_command(self, command):
+        cmd_type = command.get("command")
+        if cmd_type == "pause":
+            self.active = False
+            if self.logger:
+                self.logger.log("operator", "paused", {})
+        elif cmd_type == "resume":
+            self.active = True
+            if self.logger:
+                self.logger.log("operator", "resumed", {})
+
+    def load_model(self, model_path):
+        return RecurrentPPO.load(model_path)
+
+    def train_on_pair(self, prices: pd.DataFrame, x: str, y: str, 
+                      lookback: int = None, timesteps: int = None, 
+                      shock_prob: float = None, shock_scale: float = None,
+                      use_curriculum: bool = False):
+
+        # Get seed from CONFIG
+        seed = CONFIG.get("random_seed", 42)
+                            
+        if not self.active:
+            return None
+
+        if lookback is None:
+            lookback = CONFIG.get("rl_lookback", 30) 
+            
+        if timesteps is None:
+            timesteps = CONFIG.get("rl_timesteps", 500000)
+
+        series_x = prices[x]
+        series_y = prices[y]
+
+        print(f"\n{'='*70}")
+        print(f"Training pair: {x} - {y} (LSTM POLICY)")
+        print(f"  Data length: {len(series_x)} days")
+        print(f"  Timesteps: {timesteps:,}")
+        print(f"  Time Window (Lookback): {lookback} (Paper optimal: 30)")
+        print(f"  LSTM Hidden Size: 512 (Paper optimal)")
+        print(f"{'='*70}")
+
+        print("\n🚀 Training with Recurrent PPO (LSTM)...")
+        env = PairTradingEnv(
+            series_x, series_y, lookback, position_scale=100, 
+            transaction_cost_rate=0.0005, test_mode=False
+        )
+        
+        # Seed the environment
+        env.reset(seed=seed)
+
+        policy_kwargs = dict(
+            lstm_hidden_size=512,
+            n_lstm_layers=1
+        )
+
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            env,
+            learning_rate=0.001,
+            n_steps=4096,
+            batch_size=256,
+            n_epochs=10,
+            gamma=0.99,
+            ent_coef=0.04,
+            verbose=1,
+            device="auto",
+            seed=seed,
+            policy_kwargs=policy_kwargs 
+        )
+
+        model.learn(total_timesteps=timesteps)
+
+        # Save model
+        model_path = os.path.join(self.storage_dir, f"operator_model_{x}_{y}.zip")
+        model.save(model_path)
+        print(f"\n✅ Model saved to {model_path}")
+
+        # Evaluate on training data
+        print("\n📊 Evaluating on training data...")
+        env_eval = PairTradingEnv(
+              series_x, series_y, lookback, position_scale=100,
+              transaction_cost_rate = 0.0005, test_mode=False
+        )
+        
+        obs, _ = env_eval.reset()
+        done = False
+        daily_returns = []
+        positions = []
+
+        # Initialize LSTM states
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
+
+        while not done:
+            action, lstm_states = model.predict(
+                obs, 
+                state=lstm_states, 
+                episode_start=episode_starts,
+                deterministic=True
+            )
+            obs, reward, done, _, info = env_eval.step(action)
+            episode_starts = np.array([done])
+            
+            daily_returns.append(info.get('daily_return', 0))
+            positions.append(info.get('position', 0))
+
+        # Calculate metrics
+        rets = np.array(daily_returns)
+        rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
+        excess_rets = rets - rf_daily
+
+        sharpe = 0.0
+        if len(excess_rets) > 1 and np.std(excess_rets, ddof=1) > 1e-8:
+            sharpe = np.mean(excess_rets) / np.std(excess_rets, ddof=1) * np.sqrt(252)
+        
+        downside = excess_rets[excess_rets < 0]
+        sortino = 0.0
+        if len(downside) > 1 and np.std(downside, ddof=1) > 1e-8:
+            sortino = np.mean(excess_rets) / np.std(downside, ddof=1) * np.sqrt(252)
+
+        final_return = (env_eval.portfolio_value / env_eval.initial_capital - 1) * 100
+
+        # Position analysis
+        unique_positions = np.unique(positions)
+        print(f"\n📈 Training Results:")
+        print(f"  Final Return: {final_return:.2f}%")
+        print(f"  Sharpe Ratio: {sharpe:.3f}")
+        print(f"  Sortino Ratio: {sortino:.3f}")
+        print(f"  Positions used: {unique_positions}")
+
+        for pos in unique_positions:
+            count = np.sum(np.array(positions) == pos)
+            pct = count / len(positions) * 100
+            print(f"    Position {int(pos)}: {pct:.1f}% of time")
+
+        trace = {
+            "pair": (x, y),
+            "cum_return": round(final_return, 2),
+            "max_drawdown": round((env_eval.peak_value - env_eval.portfolio_value) / env_eval.peak_value, 2),
+            "sharpe": round(sharpe, 2),
+            "sortino": round(sortino, 2),
+            "model_path": model_path,
+            "positions_used": unique_positions.tolist()
+        }
+
         if self.logger:
-            self.logger.log("supervisor", event, details)
+            self.logger.log("operator", "pair_trained", trace)
 
-    # ===================================================================
-    # 1. PAIR VALIDATION (Pre-Trading Check)
-    # ===================================================================
+        return trace
+
+    def save_detailed_trace(self, trace: Dict[str, Any], filepath: str = "traces/operator_detailed.json"):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "a") as f:
+            f.write(json.dumps(trace, default=str) + "\n")
+
+
+def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame, 
+                        pairs: list, max_workers: int = None):
+
+    if max_workers is None:
+        max_workers = CONFIG.get("max_workers", 2)
+
+    all_traces = []
+
+    def train(pair):
+        x, y = pair
+        return operator.train_on_pair(prices, x, y)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(train, pair) for pair in pairs]
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Operator Training"):
+            result = f.result()
+            if result:
+                all_traces.append(result)
+
+    save_path = os.path.join(operator.storage_dir, "all_operator_traces.json")
+    with open(save_path, "w") as f:
+        json.dump(all_traces, f, indent=2, default=str)
+
+    if operator.logger:
+        operator.logger.log("operator", "batch_training_complete", {"n_pairs": len(all_traces)})
     
-    def validate_pairs(
-        self, 
-        df_pairs: pd.DataFrame, 
-        validation_window: Tuple[pd.Timestamp, pd.Timestamp],
-        half_life_max: float = 60,
-        min_crossings_per_year: int = 12
-    ) -> pd.DataFrame:
-        
-        start, end = validation_window
-        validated = []
-
-        # Pivot price data for fast access
-        if self.df is None or self.df.empty:
-            print("⚠️ Supervisor has no data for validation.")
-            return df_pairs
-
-        prices = self.df.pivot(
-            index="date",
-            columns="ticker",
-            values="adj_close"
-        ).sort_index()
-
-        print(f"\n🔍 Validating {len(df_pairs)} pairs...")
-        
-        for idx, row in df_pairs.iterrows():
-            x, y = row["x"], row["y"]
-
-            if x not in prices.columns or y not in prices.columns:
-                continue
-
-            series_x = prices[x].loc[start:end].dropna()
-            series_y = prices[y].loc[start:end].dropna()
-
-            if min(len(series_x), len(series_y)) < 60:
-                continue
-
-            spread = compute_spread(series_x, series_y)
-            if spread is None or len(spread) == 0:
-                continue
-
-            # Check stationarity (ADF Test)
-            try:
-                adf_res = adfuller(spread.dropna())
-                adf_p = adf_res[1]
-            except:
-                adf_p = 1.0
-
-            # Check mean reversion speed (Half-Life)
-            hl = compute_half_life(spread.values)
-            
-            # Check Crossing Frequency
-            centered = spread - spread.mean()
-            crossings = (centered.shift(1) * centered < 0).sum()
-            days = (series_x.index[-1] - series_x.index[0]).days
-            crossings_per_year = float(crossings) / max(days / 252.0, 1e-9)
-
-            # Decision Logic
-            pass_criteria = (adf_p < 0.05) and (float(hl) < half_life_max) and (crossings_per_year >= min_crossings_per_year)
-
-            validated.append({
-                "x": x, "y": y,
-                "score": float(row.get("score", np.nan)),
-                "adf_p": float(adf_p),
-                "half_life": float(hl),
-                "crossings_per_year": crossings_per_year,
-                "pass": bool(pass_criteria)
-            })
-
-        result_df = pd.DataFrame(validated)
-        n_passed = result_df["pass"].sum() if len(result_df) > 0 else 0
-        
-        self._log("pairs_validated", {
-            "n_total": len(df_pairs),
-            "n_validated": len(result_df),
-            "n_passed": int(n_passed)
-        })
-        
-        print(f"✅ Validation complete: {n_passed}/{len(result_df)} pairs passed")
-        return result_df
-
-    # ===================================================================
-    # 2. OPERATOR MONITORING
-    # ===================================================================
+    print("\n" + "="*70)
+    print("TRAINING SUMMARY")
+    print("="*70)
+    for trace in all_traces:
+        print(f"{trace['pair'][0]}-{trace['pair'][1]}: "
+              f"Return={trace['cum_return']:.2f}%, Sharpe={trace['sharpe']:.2f}")
+    print("="*70)
     
-    def check_operator_performance(
-        self, 
-        operator_traces: List[Dict[str, Any]],
-        pair: Tuple[str, str],
-        phase: str = "holdout"
-    ) -> Dict[str, Any]:
+    return all_traces
+                            
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
+    """
+    Run holdout testing with supervisor monitoring.
+    Features FORCE LIQUIDATION on stop, ensuring metrics reflect the exit costs.
+    """
+    
+    # Check supervisor config
+    if "supervisor_rules" in CONFIG and "holdout" in CONFIG["supervisor_rules"]:
+        check_interval = CONFIG["supervisor_rules"]["holdout"].get("check_interval", 20)
+    else:
+        check_interval = 20
         
-        # 1. Config & Data Check
-        rules = CONFIG.get("supervisor_rules", {}).get(phase, {}) if "supervisor_rules" in CONFIG else {}
-        min_obs = rules.get("min_observations", 10)
-        
-        if len(operator_traces) < min_obs:
-            return {"action": "continue", "severity": "info", "reason": "insufficient_data", "metrics": {}}
+    operator.traces_buffer = []
+    operator.current_step = 0
 
-        pair_key = f"{pair[0]}-{pair[1]}"
-        latest_trace = operator_traces[-1]
-        days_in_pos = latest_trace.get('days_in_position', 0)
-        
-        # 2. State Initialization & Grace Period
-        if pair_key not in self.monitoring_state:
-            self.monitoring_state[pair_key] = {'strikes': 0, 'grace_period': True}
+    global_step = 0
+    all_traces = []
+    skipped_pairs = []
+    pair_summaries = []
 
-        # 3-day burn-in grace period
-        if days_in_pos <= 3:
-            self.monitoring_state[pair_key]['strikes'] = 0
-            self.monitoring_state[pair_key]['grace_period'] = True
-        else:
-            self.monitoring_state[pair_key]['grace_period'] = False
+    lookback = CONFIG.get("rl_lookback", 30)
+    
+    for pair in pairs:
+        print(f"\n{'='*70}")
+        print(f"Testing pair: {pair[0]} - {pair[1]}")
+        print(f"{'='*70}")
 
-        metrics = self._compute_live_metrics(operator_traces)
+        # 1. Data Validation
+        if pair[0] not in holdout_prices.columns or pair[1] not in holdout_prices.columns:
+            print(f"⚠️ Warning: Tickers {pair} not found in holdout data - skipping")
+            continue
+
+        series_x = holdout_prices[pair[0]].dropna()
+        series_y = holdout_prices[pair[1]].dropna()
+        aligned = pd.concat([series_x, series_y], axis=1).dropna()
+
+        if len(aligned) < lookback + warmup_steps + 1:
+            print(f"⚠️ Insufficient data ({len(aligned)} steps). Needs {lookback + warmup_steps + 1}")
+            continue
+
+        # 2. Model Loading
+        model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
+        if not os.path.exists(model_path):
+            print(f"⚠️ Model not found - skipping")
+            continue
+
+        model = operator.load_model(model_path)
+
+        # 3. Environment Setup
+        env = PairTradingEnv(
+            series_x=aligned.iloc[:, 0], 
+            series_y=aligned.iloc[:, 1], 
+            lookback=lookback, 
+            initial_capital=10000,
+            transaction_cost_rate=0.0005, 
+            test_mode=True
+        )
+
+        episode_traces = []
+        local_step = 0
+        obs, info = env.reset() 
+
+        # --- WARM-UP PHASE ---
+        print(f" ⏳ Warming up model state on {warmup_steps} steps...")
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
+        warmup_completed = True
         
-        # ============================================================
-        # A. IMMEDIATE KILL (Structural Breaks) - CHECK EVERY DAY
-        # ============================================================
+        for i in range(warmup_steps):
+            if env.idx >= len(env.spread_np) - 1:
+                warmup_completed = False
+                break 
+            action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
+            obs, _, done, _, _ = env.step(action)
+            episode_starts = np.array([done])
+            if done: warmup_completed = False; break
         
-        # 1. Structural Break (Z-Score > 3.0)
-        spread_history = [t['current_spread'] for t in operator_traces]
-        if len(spread_history) > 10:
-            spread_series = pd.Series(spread_history)
-            rolling_mean = spread_series.rolling(window=20).mean().iloc[-1]
-            rolling_std = spread_series.rolling(window=20).std().iloc[-1]
+        if not warmup_completed: continue
+
+        # --- FINANCIAL RESET ---
+        env.cash = env.initial_capital
+        env.portfolio_value = env.initial_capital
+        env.realized_pnl = 0.0 
+        env.unrealized_pnl = 0.0 
+        env.num_trades = 0
+        env.trade_history = []
+        env.peak_value = env.initial_capital
+        env.cum_return = 0
+        if env.position != 0:
+            env.position = 0
+            env.entry_spread = 0.0
+            env.days_in_position = 0
+
+        # --- MAIN TRADING LOOP ---
+        terminated = False
+        stop_triggered = False
+        intervention_reason = ""
+        intervention_severity = ""
+        
+        while not terminated:
             
-            if rolling_std > 1e-8:
-                current_z = abs(latest_trace['current_spread'] - rolling_mean) / rolling_std
-                
-                if current_z > 3.0:
-                    self._log("intervention_triggered", {"pair": pair, "reason": "structural_break_zscore", "z": current_z})
-                    return {
-                        'action': 'stop',
-                        'severity': 'critical',
-                        'reason': f'Structural Break: Z-Score {current_z:.2f} > 3.0',
-                        'metrics': metrics
-                    }
+            action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
+            obs, reward, terminated, _, info = env.step(action)
+            episode_starts = np.array([terminated])
 
-        # 2. Hard Drawdown Kill (> 15%)
-        # Explicit kill switch regardless of strikes
-        if metrics['drawdown'] > 0.15:
-             return {
-                'action': 'stop',
-                'severity': 'critical',
-                'reason': f'Hard Stop: Drawdown {metrics["drawdown"]:.1%} > 15%',
-                'metrics': metrics
+            # Standard Trace
+            trace = {
+                "pair": f"{pair[0]}-{pair[1]}",
+                "step": global_step,
+                "local_step": local_step,
+                "realized_pnl": round(float(info.get("realized_pnl", 0.0)), 2),
+                "unrealized_pnl": round(float(info.get("unrealized_pnl", 0.0)), 2),
+                "portfolio_value": round(float(info.get("portfolio_value", 0.0)), 2),
+                "cum_return": round(float(info.get("cum_return", 0.0)), 2),
+                "position": round(float(info.get("position", 0)), 2),
+                "max_drawdown": round(float(info.get("drawdown", 0)), 2),
+                "realized_pnl_this_step": round(float(info.get("realized_pnl_this_step", 0.0)), 2),
+                "transaction_costs": round(float(info.get("transaction_costs", 0.0)), 2),
+                "daily_return": round(float(info.get("daily_return", 0.0)), 4), 
+                "current_spread": round(float(info.get("current_spread", 0.0)), 2),
+                "z_score": round(float(info.get("z_score", 0.0)), 2), 
+                "days_in_position": int(info.get("days_in_position", 0)),
+                "num_trades": int(info.get("num_trades", 0)),
+                "price_x": round(float(info.get("price_x", 0.0)), 2),
+                "price_y": round(float(info.get("price_y", 0.0)), 2)
             }
 
-        # ============================================================
-        # B. PERIODIC REVIEW (Strikes System)
-        # ============================================================
-        
-        is_check_day = (days_in_pos > 0) and (days_in_pos % self.check_frequency == 0)
-        
-        if not is_check_day:
-            return {'action': 'continue', 'severity': 'info', 'reason': 'off_cycle', 'metrics': metrics}
+            episode_traces.append(trace)
+            all_traces.append(trace)
+            operator.add_trace(trace)
 
-        # Stalemate Check (30 days)
-        if days_in_pos > 30:
-            unrealized_pnl = latest_trace.get('unrealized_pnl', 0.0)
-            if unrealized_pnl <= 0:
-                 return {
-                    'action': 'stop', 
-                    'severity': 'warning',
-                    'reason': f'Stalemate ({days_in_pos} days) & Negative PnL. Capital rotation.',
-                    'metrics': metrics
-                }
-
-        # VIOLATION LOGIC
-        violation = False
-        violation_reason = ""
-        
-        # Warning Threshold: 10% Drawdown
-        if metrics['drawdown'] > 0.1: 
-            violation = True
-            violation_reason = f"Drawdown {metrics['drawdown']:.1%} > 10%"
-        
-        # Efficiency Threshold: Bad Sharpe after 15 days
-        elif metrics['sharpe'] < 0 and days_in_pos > 15: 
-            violation = True
-            violation_reason = f"Sharpe {metrics['sharpe']:.2f} (Inefficient Risk)"
-
-        # TWO-STRIKE SYSTEM
-        if violation:
-            if self.monitoring_state[pair_key]['grace_period']:
-                return {'action': 'continue', 'severity': 'info', 'reason': 'Grace Period', 'metrics': metrics}
-            
-            self.monitoring_state[pair_key]['strikes'] += 1
-            strikes = self.monitoring_state[pair_key]['strikes']
-            
-            if strikes == 1:
-                # STRIKE 1: WARN ONLY (No resizing)
-                return {
-                    'action': 'warn',
-                    'severity': 'warning',
-                    'reason': f'Strike 1/2: {violation_reason}. Monitoring closely.',
-                    'metrics': metrics
-                }
-            elif strikes >= 2:
-                # STRIKE 2: STOP
-                return {
-                    'action': 'stop',
-                    'severity': 'critical',
-                    'reason': f'Strike 2/2: {violation_reason}. Validation Failed.',
-                    'metrics': metrics
-                }
-        else:
-            # Heal strikes if performance recovers (drawdown < 2.5% - half of warning)
-            if self.monitoring_state[pair_key]['strikes'] > 0 and metrics['drawdown'] < 0.025:
-                self.monitoring_state[pair_key]['strikes'] -= 1
+            # --- SUPERVISOR MONITORING ---
+            if local_step > 0 and local_step % check_interval == 0:
+                decision = supervisor.check_operator_performance(episode_traces, pair, phase="holdout")
                 
-        return {
-            'action': 'continue',
-            'severity': 'info',
-            'reason': 'Performance nominal',
-            'metrics': metrics
-        }
-        
-    def _compute_live_metrics(self, traces):
-        returns = [t.get("daily_return", 0) for t in traces]
-        portfolio_values = [t.get("portfolio_value", 0) for t in traces]
-        
-        current_pv = portfolio_values[-1] if portfolio_values else 0
-        peak_pv = max(portfolio_values) if portfolio_values else 1
-        
-        drawdown = (peak_pv - current_pv) / max(peak_pv, 1e-8)
-        
-        return {
-            'drawdown': drawdown,
-            'sharpe': self._calculate_sharpe(returns),
-            'total_steps': len(traces)
-        }
+                if decision["action"] == "stop":
+                    intervention_severity = decision.get("severity", "critical")
+                    intervention_reason = decision['reason']
+                    print(f"\n⛔ SUPERVISOR INTERVENTION [{intervention_severity.upper()}]: Stopping pair early")
+                    print(f"    Reason: {intervention_reason}")
 
-    # ===================================================================
-    # 3. FINAL EVALUATION (Post-Trading Aggregation)
-    # ===================================================================
-    
-    def evaluate_portfolio(self, operator_traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Evaluate complete portfolio performance using Global Dollar Aggregation.
-        
-        UPDATED LOGIC:
-        - Aggregates 'portfolio_value' across all pairs to determine true dollar PnL.
-        - Calculates returns based on (Global Dollar PnL / Total Invested Capital).
-        - Generates an Equity Curve anchored strictly at 100.0.
-        - Populates individual pair summaries (INCLUDES CUM_RETURN).
-        """
-        
-        # --- 1. DATA PREPARATION ---
-        processed_data = []
-        for trace in operator_traces:
-            # Filter for trade/step events, ignoring training events with list-type pairs
-            if isinstance(trace.get('details', {}).get('pair'), list):
-                continue
+                    # ========================================================
+                    # FORCE LIQUIDATION: REALIZE THE LOSS/PROFIT
+                    # ========================================================
+                    if env.position != 0:
+                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
+                        
+                        # Capture the CUMULATIVE realized PnL from the *previous* step (before liquidation)
+                        previous_cumulative_realized = trace['realized_pnl']
+
+                        # Step environment with Action 1 (Flat) to execute the close
+                        obs, reward, terminated, _, info = env.step(1)
+                        
+                        forced_pnl = info.get('realized_pnl_this_step', 0.0)
+                        forced_cost = info.get('transaction_costs', 0.0)
+                        
+                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
+                        
+                        # Create final trace reflecting the close
+                        final_trace = trace.copy()
+                        final_trace['step'] += 1
+                        final_trace['local_step'] += 1
+                        final_trace['position'] = 0 # Forced Flat
+                        final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
+                        final_trace['transaction_costs'] = round(forced_cost, 2)
+                        final_trace['unrealized_pnl'] = 0
+                        final_trace['num_trades'] = 0
+                        final_trace['realized_pnl'] = round(previous_cumulative_realized + forced_pnl - forced_cost, 2)
+                        final_trace['portfolio_value'] = round(float(info.get("portfolio_value", trace['portfolio_value'])), 2)
+                        final_trace['cum_return'] = round(float(info.get("cum_return", trace['cum_return'])), 2)
+                        final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
+                        final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
+                        final_trace['forced_close'] = True
+                        
+                        # ADDED DETAILS OF STOP HERE
+                        final_trace['intervention_reason'] = intervention_reason 
+                        final_trace['intervention_severity'] = intervention_severity
+                        
+                        # Append this trace so metrics include the forced close
+                        episode_traces.append(final_trace)
+                        all_traces.append(final_trace)
+                        operator.add_trace(final_trace)
+
+                    stop_triggered = True
+                    break # Exit loop
                 
-            base = trace.copy()
-            details = base.pop('details', {})
-            combined = {**base, **details}  
-            processed_data.append(combined)
+                elif decision["action"] == "adjust":
+                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
 
-        df_all = pd.DataFrame(processed_data)
-        
-        if df_all.empty:
-            return {
-                "metrics": {
-                    "total_pnl": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0, 
-                    "equity_curve": [], "pair_summaries": [],
-                    "var_95": 0.0, "cvar_95": 0.0 # Added default values
-                },
-                "actions": [],
-                "explanation": "No data available."
-            }
+            local_step += 1
+            global_step += 1
+            operator.current_step = global_step
+
+        # --- METRICS REPORTING (Including Forced Close) ---
+        if len(episode_traces) > 0:
+            # 1. Recalculate metrics on the FULL trace history (including liquidation)
+            sharpe = calculate_sharpe(episode_traces)
+            sortino = calculate_sortino(episode_traces)
+            final_return = episode_traces[-1]['cum_return'] * 100
+            max_dd = episode_traces[-1]['max_drawdown']
             
-        # Time alignment
-        time_col = 'local_step' if 'local_step' in df_all.columns else 'timestamp'
-        if time_col not in df_all.columns and 'step' in df_all.columns:
-            time_col = 'step'
-            
-        # Ensure timestamp format if dealing with dates (consistency with visualizer)
-        if time_col == 'timestamp':
-            df_all[time_col] = pd.to_datetime(df_all[time_col])
-
-        df_all = df_all.sort_values(by=time_col)
-        
-        # Ensure 'portfolio_value' exists (crucial for this logic)
-        if 'portfolio_value' not in df_all.columns:
-            # Fallback if trace doesn't have portfolio_value: estimate via cumulative PnL
-            df_all['portfolio_value'] = df_all.get('realized_pnl', 0.0).cumsum() + 1000 # Dummy initial capital fallback
-
-        # --- 2. GLOBAL DOLLAR AGGREGATION (MATCHING VISUALIZER) ---
-        
-        # Pivot to get Portfolio Value for all pairs at each step
-        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
-        
-        # Forward fill to handle asynchronous updates
-        equity_matrix_ffill = equity_matrix.ffill()
-        
-        # Dollar PnL Change (Global)
-        dollar_pnl_matrix = equity_matrix_ffill.diff()
-        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
-        
-        # Invested Capital (Shifted to represent capital at START of period)
-        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
-        prev_capital = total_capital_series.shift(1)
-        
-        # Global Returns Calculation
-        global_returns_series = global_dollar_pnl / prev_capital
-        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        
-        # --- 3. CONSTRUCT EQUITY CURVE (ANCHORED AT 100) ---
-        
-        # Calculate Cumulative Return Series
-        cum_ret_series = (1 + global_returns_series).cumprod()
-        portfolio_equity_curve = 100 * cum_ret_series
-        
-        # Explicitly prepend the start point (100.0) to match visualizer plotting logic
-        equity_values = [100.0] + portfolio_equity_curve.tolist()
-        
-        # Generate corresponding labels/dates
-        idx_list = portfolio_equity_curve.index.astype(str).tolist()
-        equity_dates = ["Start"] + idx_list
-
-        # Extract returns list for Sharpe/Sortino
-        portfolio_returns = global_returns_series.tolist()
-
-        # --- 4. CALCULATE PAIR SUMMARIES (No change to this block) ---
-        
-        pair_summaries = []
-        unique_pairs = df_all['pair'].unique()
-
-        for pair in unique_pairs:
-            pair_trace = df_all[df_all['pair'] == pair].sort_values(by=time_col)
-            if pair_trace.empty:
-                continue
-
-            # Determine returns for this specific pair
-            if 'daily_return' in pair_trace.columns:
-                pair_rets = pair_trace['daily_return'].tolist()
+            pnl_events = [t['realized_pnl_this_step'] for t in episode_traces if abs(t['realized_pnl_this_step']) > 0]
+            if len(pnl_events) > 0:
+                wins = len([p for p in pnl_events if p > 0])
+                win_rate = (wins / len(pnl_events)) * 100
             else:
-                pair_rets = pair_trace['portfolio_value'].pct_change().fillna(0.0).tolist()
-            
-            # PnL (Last realized PnL value)
-            pair_pnl = pair_trace['realized_pnl'].iloc[-1] if 'realized_pnl' in pair_trace.columns else 0.0
-            
-            # Drawdown (Pair specific)
-            pair_curve = np.cumprod([1 + r for r in pair_rets])
-            pair_peak = np.maximum.accumulate(pair_curve)
-            pair_dd = (pair_curve - pair_peak) / pair_peak
-            pair_max_dd = abs(np.min(pair_dd)) if len(pair_dd) > 0 else 0.0
+                win_rate = 0.0
 
-            # Win Rate (Pair specific)
-            pair_win_rate = 0.0
-            if 'realized_pnl_this_step' in pair_trace.columns:
-                 closed = pair_trace[pair_trace['realized_pnl_this_step'] != 0]
-                 if len(closed) > 0:
-                      pair_win_rate = (closed['realized_pnl_this_step'] > 0).sum() / len(closed)
+            # 2. Log skipped pair info with the FINAL metrics
+            if stop_triggered:
+                skip_info = {
+                    "pair": f"{pair[0]}-{pair[1]}",
+                    "reason": intervention_reason,
+                    "severity": intervention_severity,
+                    "step_stopped": global_step,
+                    "final_return": round(final_return, 2),
+                    "sharpe": round(sharpe, 2),
+                    "drawdown": round(max_dd, 2)
+                }
+                skipped_pairs.append(skip_info)
+                if operator.logger:
+                    operator.logger.log("supervisor", "intervention", skip_info)
 
-            # Cumulative Return (Pair specific)
-            initial_val = pair_trace['portfolio_value'].iloc[0]
-            final_val = pair_trace['portfolio_value'].iloc[-1]
-            pair_cum_return = (final_val - initial_val) / initial_val if initial_val > 0 else 0.0
+            # 3. Print Detailed Results
+            status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
+            
+            print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
+            print(f"  Status:         {status_str}")
+            print(f"  Final Return:   {final_return:.2f}%")
+            print(f"  Max Drawdown:   {max_dd:.2%}")
+            print(f"  Sharpe Ratio:   {sharpe:.3f}")
+            print(f"  Sortino Ratio:  {sortino:.3f}")
+            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
+            
+            # Position Distribution
+            positions = [t['position'] for t in episode_traces]
+            print(f"  Position Distribution:")
+            for pos, name in [(100, "Long"), (-100, "Short"), (0, "Flat")]:
+                count = np.sum(np.array(positions) == pos)
+                pct = count / len(positions) * 100
+                print(f"    {name:<5}: {pct:.1f}%")
 
             pair_summaries.append({
-                "pair": pair,
-                "total_pnl": float(pair_pnl),
-                "cum_return": float(pair_cum_return),
-                "sharpe": self._calculate_sharpe(pair_rets),
-                "sortino": self._calculate_sortino(pair_rets),
-                "max_drawdown": float(pair_max_dd),
-                "win_rate": pair_win_rate,
-                "steps": len(pair_trace)
+                "pair": f"{pair[0]}-{pair[1]}",
+                "return": round(final_return, 2),
+                "sharpe": round(sharpe, 2),
+                "sortino": round(sortino, 2),
+                "drawdown": round(max_dd, 2),
+                "win_rate": round(win_rate, 2),
+                "status": "STOPPED" if stop_triggered else "COMPLETE"
             })
-
-        # --- 5. CALCULATE GLOBAL METRICS ---
-        
-        # Max Drawdown (Calculated on the anchored curve)
-        normalized_equity_curve = pd.Series(equity_values)
-        running_max = normalized_equity_curve.cummax()
-        dd_series = (normalized_equity_curve - running_max) / running_max
-        portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
-        
-        # Sharpe & Sortino (Based on the aggregated global returns)
-        sharpe = self._calculate_sharpe(portfolio_returns)
-        sortino = self._calculate_sortino(portfolio_returns)
-        
-        # VaR and CVaR Calculation (Matching Visualizer logic)
-        if len(global_returns_series) > 0:
-            # VaR 95% = 5th percentile of returns distribution
-            var_95 = np.percentile(global_returns_series, 5)
             
-            # CVaR 95% = Mean of returns falling below the VaR threshold
-            cvar_returns = global_returns_series[global_returns_series <= var_95]
-            cvar_95 = cvar_returns.mean() if len(cvar_returns) > 0 else var_95
-        else:
-            var_95 = 0.0
-            cvar_95 = 0.0
+    # Final Summary Table
+    print("\n" + "="*90)
+    print("HOLDOUT TESTING COMPLETE: SUMMARY")
+    print("="*90)
+    print(f"{'Pair':<15} | {'Status':<9} | {'Return':<8} | {'Sharpe':<6} | {'Sortino':<7} | {'Max DD':<8} | {'Win Rate':<8}")
+    print("-" * 90)
+    
+    total_ret = 0
+    for s in pair_summaries:
+        status_icon = "🛑" if s['status'] == "STOPPED" else "✅"
+        print(f"{s['pair']:<15} | {status_icon} {s['status'][:3]}.. | {s['return']:>7.2f}% | {s['sharpe']:>6.2f} | {s['sortino']:>7.2f} | {s['drawdown']:>7.1%} | {s['win_rate']:>7.1f}%")
+        total_ret += s['return']
         
-        # Win Rate (Global Trades)
-        win_rate = 0.0
-        if 'realized_pnl_this_step' in df_all.columns:
-            closed_trades = df_all[df_all['realized_pnl_this_step'] != 0]
-            if not closed_trades.empty:
-                wins = (closed_trades['realized_pnl_this_step'] > 0).sum()
-                win_rate = wins / len(closed_trades)
+    avg_ret = total_ret / len(pair_summaries) if pair_summaries else 0.0
+    print("-" * 90)
+    print(f"Average Return: {avg_ret:.2f}% across {len(pair_summaries)} pairs")
+    print("="*90)
+    
+    return all_traces, skipped_pairs
 
-        # Total PnL Calculation (Sum of Global Dollar PnL Series)
-        total_pnl = float(global_dollar_pnl.sum())
+def calculate_sharpe(traces, risk_free_rate=None):
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
+    if len(returns) < 2: return 0.0
+    rf_daily = risk_free_rate / 252.0
+    excess_returns = returns - rf_daily
+    mean_excess = np.mean(excess_returns)
+    std_excess = np.std(excess_returns, ddof=1)
+    if std_excess < 1e-9: return 0.0
+    return (mean_excess / std_excess) * np.sqrt(252)
 
-        # Compile Metrics
-        metrics = {
-            "total_pnl": total_pnl,
-            "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "max_drawdown": portfolio_max_dd,
-            "avg_return": float(np.mean(portfolio_returns)) if portfolio_returns else 0.0,
-            "cum_return": (normalized_equity_curve.iloc[-1] - 100) / 100,
-            "win_rate": win_rate,
-            "total_steps": len(df_all),
-            "var_95": float(var_95),  # ADDED VAR
-            "cvar_95": float(cvar_95), # ADDED CVAR
-            "pair_summaries": pair_summaries
-        }
+def calculate_sortino(traces, risk_free_rate=None):
+    if risk_free_rate is None:
+        risk_free_rate = CONFIG.get("risk_free_rate", 0.04)
+    returns = np.array([t.get('daily_return', 0.0) for t in traces])
+    if len(returns) < 2: return 0.0
+    rf_daily = risk_free_rate / 252.0
+    excess_returns = returns - rf_daily
+    mean_excess = np.mean(excess_returns)
+    
+    # Sortino uses downside deviation of excess returns below 0
+    downside_returns = excess_returns[excess_returns < 0]
+    
+    if len(downside_returns) == 0:
+        return 0.0
         
-        # Export curve data matching Visualizer
-        metrics["equity_curve"] = equity_values
-        metrics["equity_curve_dates"] = equity_dates
-
-        actions = self._generate_portfolio_actions(metrics)
-        explanation = self._generate_explanation(metrics, actions)
-        
-        return {"metrics": metrics, "actions": actions, "explanation": explanation}
-
-    def _generate_portfolio_actions(self, metrics: Dict) -> List[Dict]:
-        """
-        Generates a list of recommended actions based on aggregated portfolio metrics.
-        """
-        actions = []
-
-        # Use 1% as a de-minimis threshold for total PnL
-        min_pnl_threshold = 0.01 * self.df["adj_close"].abs().sum().sum() if self.df is not None and not self.df.empty else 1000
-
-        # --- 1. CRITICAL ACTIONS (Halt/Kill Switch) ---
-        if metrics['max_drawdown'] > 0.30:
-            actions.append({"action": "halt_trading", "reason": "Portfolio Max Drawdown > 30% (Tail Risk Breach)", "severity": "CRITICAL"})
-
-        if metrics['cum_return'] <= 0.0 and metrics['total_steps'] > 100:
-             actions.append({"action": "halt_trading", "reason": "Zero or Negative Cumulative Return after 100+ steps (Ineffective Strategy)", "severity": "CRITICAL"})
-
-        # --- 2. ADJUSTMENT ACTIONS (Risk Reduction/Warning) ---
-        if metrics['sharpe_ratio'] < 0.5:
-            # Low Sharpe suggests poor risk-adjusted returns
-            actions.append({"action": "reduce_risk", "reason": f"Sharpe Ratio ({metrics['sharpe_ratio']:.2f}) < 0.5. Requires capital reallocation.", "severity": "HIGH"})
-        elif metrics['sharpe_ratio'] < 1.0:
-            actions.append({"action": "monitor_closely", "reason": f"Sharpe Ratio ({metrics['sharpe_ratio']:.2f}) < 1.0. Performance is marginal.", "severity": "MEDIUM"})
-
-        if metrics['sortino_ratio'] < 1.0:
-            # Low Sortino suggests poor handling of downside risk
-            actions.append({"action": "review_downside", "reason": f"Sortino Ratio ({metrics['sortino_ratio']:.2f}) < 1.0. Downside risk not efficiently rewarded.", "severity": "MEDIUM"})
-            
-        if metrics['max_drawdown'] > 0.10 and metrics['max_drawdown'] <= 0.30:
-             actions.append({"action": "reduce_risk", "reason": f"Portfolio Drawdown {metrics['max_drawdown']:.2%} is in the warning band (10%-30%).", "severity": "HIGH"})
-
-        # --- 3. POSITIVE ACTIONS (Scale Up/Good Performance) ---
-        if metrics['sharpe_ratio'] >= 1.5 and metrics['max_drawdown'] < 0.05:
-            actions.append({"action": "scale_up", "reason": f"Excellent risk-adjusted returns (Sharpe {metrics['sharpe_ratio']:.2f}). Consider increasing capital allocation.", "severity": "LOW"})
-
-        # --- 4. PAIR-SPECIFIC CONCENTRATION (A high-level check) ---
-        bad_pairs = [p for p in metrics.get('pair_summaries', []) if p['sharpe'] < 0.0 and p['steps'] > 50]
-        if bad_pairs:
-            actions.append({"action": "liquidate_pairs", "reason": f"Negative Sharpe in {len(bad_pairs)} pair(s). Isolate underperformers: {', '.join([p['pair'] for p in bad_pairs])}.", "severity": "HIGH"})
-
-        # Add a default 'Monitor' action if no high-severity actions were generated
-        if not actions:
-             actions.append({"action": "continue", "reason": "All performance metrics are within tolerance bounds.", "severity": "LOW"})
-             
-        # Add total PnL metric for context
-        total_pnl = metrics.get('total_pnl', 0.0)
-        final_actions = [
-             {"action": "METRIC_PNL", "reason": f"Total PnL: ${total_pnl:,.2f}", "severity": "INFO"}
-        ] + actions
-        
-        return final_actions
-        
-    def _calculate_sharpe(self, returns: List[float]) -> float:
-        if len(returns) < 2: return 0.0
-        rf = CONFIG.get("risk_free_rate", 0.04) / 252
-        exc = np.array(returns) - rf
-        std = np.std(exc, ddof=1)
-        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
-
-    def _calculate_sortino(self, returns: List[float]) -> float:
-        if len(returns) < 2: return 0.0
-        rf = CONFIG.get("risk_free_rate", 0.04) / 252
-        exc = np.array(returns) - rf
-        down = exc[exc < 0]
-        std = np.sqrt(np.mean(down**2)) if len(down) > 0 else 0.0
-        return (np.mean(exc) / std) * np.sqrt(252) if std > 1e-8 else 0.0
-
-    def _generate_explanation(self, metrics: Dict, actions: List[Dict]) -> str:
-        if not self.use_gemini:
-            return self._fallback_explanation(metrics, actions)
-        
-        prompt = f"""
-                ### ROLE & OBJECTIVE
-                Act as the Chief Risk Officer (CRO) of a Quantitative Hedge Fund. Your sole mandate is capital preservation and risk-adjusted growth. You are addressing the Investment Committee.
-                
-                ### INPUT DATA
-                --- PORTFOLIO METRICS ---
-                {json.dumps(metrics, indent=2, default=str)}
-                
-                --- AUTOMATED SYSTEM ACTIONS ---
-                {json.dumps(actions, indent=2)}
-                
-                ### INSTRUCTIONS
-                Produce a high-level, institutional-grade **Risk Memo**.
-                * **Tone:** Clinical, academic, and extremely concise. No pleasantries, no "I hope this helps," and no email formatting (Subject/Dear Team).
-                * **Format:** Bullet points and bold key figures only.
-                * **Length:** Maximum 400 words.
-                
-                ### REQUIRED SECTIONS
-                
-                #### 1. Performance Attribution
-                * **Return Efficiency:** Analyze Sharpe and Sortino ratios. Is the risk-adjusted return justifiable?
-                * **Profit Quality:** Contrast Win Rate against Total PnL. explicitly identify if the strategy suffers from "negative skew" (small frequent wins, rare massive losses).
-                * **Distribution:** Evaluate the delta between Average Return and Median Return to determine return skewness.
-                
-                #### 2. Risk Decomposition
-                * **Tail Risk Analysis:** Contrast Max Drawdown against VaR/CVaR (95%). Is the realized drawdown within modeled expectations?
-                * **Duration/Stalemate Risk:** Analyze 'avg_steps_per_pair'. Is the holding period consistent with a mean-reversion thesis, or are capital costs eroding alpha?
-                * **Concentration:** Identify if losses are systemic or isolated to specific pairs.
-                
-                #### 3. CRO Verdict & Adjustments
-                * **Action Review:** Validate the AUTOMATED ACTIONS listed in the input. State "ENDORSE" or "OVERRIDE" with a single-sentence justification.
-                * **Traffic Light Signal:** Conclude with a single word: GREEN (Scale Up), YELLOW (Maintain/Monitor), or RED (De-risk/Halt).
-                """
-        
-        try:
-            response = self.client.generate_content(prompt)
-            return response.text
-        except Exception:
-            return self._fallback_explanation(metrics, actions)
-
-    def _fallback_explanation(self, metrics, actions):
-        return f"Portfolio Sharpe: {metrics['sharpe_ratio']:.2f}. Drawdown: {metrics['max_drawdown']:.2%}. Win Rate: {metrics['win_rate']:.1%}."
-
-    def _basic_check(self, operator_traces, pair):
-        return {"action": "continue", "reason": "basic_check_pass", "metrics": {}}
+    downside_deviation = np.sqrt(np.mean(downside_returns**2))
+    if downside_deviation < 1e-9: return 0.0     
+    return (mean_excess / downside_deviation) * np.sqrt(252)
