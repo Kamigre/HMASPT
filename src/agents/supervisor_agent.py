@@ -317,7 +317,7 @@ class SupervisorAgent:
                 
             base = trace.copy()
             details = base.pop('details', {})
-            combined = {**base, **details} 
+            combined = {**base, **details}  
             processed_data.append(combined)
 
         df_all = pd.DataFrame(processed_data)
@@ -326,12 +326,13 @@ class SupervisorAgent:
             return {
                 "metrics": {
                     "total_pnl": 0.0, "sharpe_ratio": 0.0, "max_drawdown": 0.0, 
-                    "equity_curve": [], "pair_summaries": []
+                    "equity_curve": [], "pair_summaries": [],
+                    "var_95": 0.0, "cvar_95": 0.0 # Added default values
                 },
                 "actions": [],
                 "explanation": "No data available."
             }
-        
+            
         # Time alignment
         time_col = 'local_step' if 'local_step' in df_all.columns else 'timestamp'
         if time_col not in df_all.columns and 'step' in df_all.columns:
@@ -351,14 +352,12 @@ class SupervisorAgent:
         # --- 2. GLOBAL DOLLAR AGGREGATION (MATCHING VISUALIZER) ---
         
         # Pivot to get Portfolio Value for all pairs at each step
-        # This tracks the actual capital allocated + PnL per pair
         equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
         
-        # Forward fill to handle asynchronous updates (keep last known value for pairs not updating this step)
+        # Forward fill to handle asynchronous updates
         equity_matrix_ffill = equity_matrix.ffill()
         
         # Dollar PnL Change (Global)
-        # We take the difference step-over-step to find how much money was made/lost globally in this step
         dollar_pnl_matrix = equity_matrix_ffill.diff()
         global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
         
@@ -367,7 +366,6 @@ class SupervisorAgent:
         prev_capital = total_capital_series.shift(1)
         
         # Global Returns Calculation
-        # Return = (Sum of Dollar PnL) / (Total Capital at Previous Step)
         global_returns_series = global_dollar_pnl / prev_capital
         global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         
@@ -378,18 +376,16 @@ class SupervisorAgent:
         portfolio_equity_curve = 100 * cum_ret_series
         
         # Explicitly prepend the start point (100.0) to match visualizer plotting logic
-        # Convert to list for JSON serialization
         equity_values = [100.0] + portfolio_equity_curve.tolist()
         
         # Generate corresponding labels/dates
-        # We add a "Start" label for the 100.0 anchor
         idx_list = portfolio_equity_curve.index.astype(str).tolist()
         equity_dates = ["Start"] + idx_list
 
         # Extract returns list for Sharpe/Sortino
         portfolio_returns = global_returns_series.tolist()
 
-        # --- 4. CALCULATE PAIR SUMMARIES ---
+        # --- 4. CALCULATE PAIR SUMMARIES (No change to this block) ---
         
         pair_summaries = []
         unique_pairs = df_all['pair'].unique()
@@ -419,7 +415,7 @@ class SupervisorAgent:
             if 'realized_pnl_this_step' in pair_trace.columns:
                  closed = pair_trace[pair_trace['realized_pnl_this_step'] != 0]
                  if len(closed) > 0:
-                     pair_win_rate = (closed['realized_pnl_this_step'] > 0).sum() / len(closed)
+                      pair_win_rate = (closed['realized_pnl_this_step'] > 0).sum() / len(closed)
 
             # Cumulative Return (Pair specific)
             initial_val = pair_trace['portfolio_value'].iloc[0]
@@ -449,6 +445,18 @@ class SupervisorAgent:
         sharpe = self._calculate_sharpe(portfolio_returns)
         sortino = self._calculate_sortino(portfolio_returns)
         
+        # VaR and CVaR Calculation (Matching Visualizer logic)
+        if len(global_returns_series) > 0:
+            # VaR 95% = 5th percentile of returns distribution
+            var_95 = np.percentile(global_returns_series, 5)
+            
+            # CVaR 95% = Mean of returns falling below the VaR threshold
+            cvar_returns = global_returns_series[global_returns_series <= var_95]
+            cvar_95 = cvar_returns.mean() if len(cvar_returns) > 0 else var_95
+        else:
+            var_95 = 0.0
+            cvar_95 = 0.0
+        
         # Win Rate (Global Trades)
         win_rate = 0.0
         if 'realized_pnl_this_step' in df_all.columns:
@@ -465,11 +473,13 @@ class SupervisorAgent:
             "total_pnl": total_pnl,
             "sharpe_ratio": sharpe,
             "sortino_ratio": sortino,
-            "max_drawdown": portfolio_max_dd, 
+            "max_drawdown": portfolio_max_dd,
             "avg_return": float(np.mean(portfolio_returns)) if portfolio_returns else 0.0,
             "cum_return": (normalized_equity_curve.iloc[-1] - 100) / 100,
             "win_rate": win_rate,
             "total_steps": len(df_all),
+            "var_95": float(var_95),  # ADDED VAR
+            "cvar_95": float(cvar_95), # ADDED CVAR
             "pair_summaries": pair_summaries
         }
         
