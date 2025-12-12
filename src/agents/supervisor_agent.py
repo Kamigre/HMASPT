@@ -483,12 +483,55 @@ class SupervisorAgent:
         return {"metrics": metrics, "actions": actions, "explanation": explanation}
 
     def _generate_portfolio_actions(self, metrics: Dict) -> List[Dict]:
+        """
+        Generates a list of recommended actions based on aggregated portfolio metrics.
+        """
         actions = []
+
+        # Use 1% as a de-minimis threshold for total PnL
+        min_pnl_threshold = 0.01 * self.df["adj_close"].abs().sum().sum() if self.df is not None and not self.df.empty else 1000
+
+        # --- 1. CRITICAL ACTIONS (Halt/Kill Switch) ---
         if metrics['max_drawdown'] > 0.30:
-            actions.append({"action": "reduce_risk", "reason": "Portfolio drawdown > 30%", "severity": "high"})
-        if metrics['sharpe_ratio'] < 0:
-            actions.append({"action": "halt_trading", "reason": "Negative Sharpe Ratio", "severity": "high"})
-        return actions
+            actions.append({"action": "halt_trading", "reason": "Portfolio Max Drawdown > 30% (Tail Risk Breach)", "severity": "CRITICAL"})
+
+        if metrics['cum_return'] <= 0.0 and metrics['total_steps'] > 100:
+             actions.append({"action": "halt_trading", "reason": "Zero or Negative Cumulative Return after 100+ steps (Ineffective Strategy)", "severity": "CRITICAL"})
+
+        # --- 2. ADJUSTMENT ACTIONS (Risk Reduction/Warning) ---
+        if metrics['sharpe_ratio'] < 0.5:
+            # Low Sharpe suggests poor risk-adjusted returns
+            actions.append({"action": "reduce_risk", "reason": f"Sharpe Ratio ({metrics['sharpe_ratio']:.2f}) < 0.5. Requires capital reallocation.", "severity": "HIGH"})
+        elif metrics['sharpe_ratio'] < 1.0:
+            actions.append({"action": "monitor_closely", "reason": f"Sharpe Ratio ({metrics['sharpe_ratio']:.2f}) < 1.0. Performance is marginal.", "severity": "MEDIUM"})
+
+        if metrics['sortino_ratio'] < 1.0:
+            # Low Sortino suggests poor handling of downside risk
+            actions.append({"action": "review_downside", "reason": f"Sortino Ratio ({metrics['sortino_ratio']:.2f}) < 1.0. Downside risk not efficiently rewarded.", "severity": "MEDIUM"})
+            
+        if metrics['max_drawdown'] > 0.10 and metrics['max_drawdown'] <= 0.30:
+             actions.append({"action": "reduce_risk", "reason": f"Portfolio Drawdown {metrics['max_drawdown']:.2%} is in the warning band (10%-30%).", "severity": "HIGH"})
+
+        # --- 3. POSITIVE ACTIONS (Scale Up/Good Performance) ---
+        if metrics['sharpe_ratio'] >= 1.5 and metrics['max_drawdown'] < 0.05:
+            actions.append({"action": "scale_up", "reason": f"Excellent risk-adjusted returns (Sharpe {metrics['sharpe_ratio']:.2f}). Consider increasing capital allocation.", "severity": "LOW"})
+
+        # --- 4. PAIR-SPECIFIC CONCENTRATION (A high-level check) ---
+        bad_pairs = [p for p in metrics.get('pair_summaries', []) if p['sharpe'] < 0.0 and p['steps'] > 50]
+        if bad_pairs:
+            actions.append({"action": "liquidate_pairs", "reason": f"Negative Sharpe in {len(bad_pairs)} pair(s). Isolate underperformers: {', '.join([p['pair'] for p in bad_pairs])}.", "severity": "HIGH"})
+
+        # Add a default 'Monitor' action if no high-severity actions were generated
+        if not actions:
+             actions.append({"action": "continue", "reason": "All performance metrics are within tolerance bounds.", "severity": "LOW"})
+             
+        # Add total PnL metric for context
+        total_pnl = metrics.get('total_pnl', 0.0)
+        final_actions = [
+             {"action": "METRIC_PNL", "reason": f"Total PnL: ${total_pnl:,.2f}", "severity": "INFO"}
+        ] + actions
+        
+        return final_actions
         
     def _calculate_sharpe(self, returns: List[float]) -> float:
         if len(returns) < 2: return 0.0
