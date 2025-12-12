@@ -547,8 +547,7 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     print("="*70)
     
     return all_traces
-
-
+                            
 def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
     """
     Run holdout testing with supervisor monitoring.
@@ -688,16 +687,15 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     intervention_severity = decision.get("severity", "critical")
                     intervention_reason = decision['reason']
                     print(f"\n⛔ SUPERVISOR INTERVENTION [{intervention_severity.upper()}]: Stopping pair early")
-                    print(f"    Reason: {intervention_reason}")
+                    print(f"    Reason: {intervention_reason}")
 
                     # ========================================================
                     # FORCE LIQUIDATION: REALIZE THE LOSS/PROFIT
                     # ========================================================
                     if env.position != 0:
-                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
+                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
                         
                         # Capture the CUMULATIVE realized PnL from the *previous* step (before liquidation)
-                        # We use the 'trace' object we just appended, which represents the state BEFORE the force close
                         previous_cumulative_realized = trace['realized_pnl']
 
                         # Step environment with Action 1 (Flat) to execute the close
@@ -706,7 +704,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         forced_pnl = info.get('realized_pnl_this_step', 0.0)
                         forced_cost = info.get('transaction_costs', 0.0)
                         
-                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
+                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
                         
                         # Create final trace reflecting the close
                         final_trace = trace.copy()
@@ -724,6 +722,10 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
                         final_trace['forced_close'] = True
                         
+                        # ADDED DETAILS OF STOP HERE
+                        final_trace['intervention_reason'] = intervention_reason 
+                        final_trace['intervention_severity'] = intervention_severity
+                        
                         # Append this trace so metrics include the forced close
                         episode_traces.append(final_trace)
                         all_traces.append(final_trace)
@@ -733,7 +735,7 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     break # Exit loop
                 
                 elif decision["action"] == "adjust":
-                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
+                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
 
             local_step += 1
             global_step += 1
@@ -773,20 +775,20 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
             
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Status:         {status_str}")
-            print(f"  Final Return:   {final_return:.2f}%")
-            print(f"  Max Drawdown:   {max_dd:.2%}")
-            print(f"  Sharpe Ratio:   {sharpe:.3f}")
-            print(f"  Sortino Ratio:  {sortino:.3f}")
-            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
+            print(f"  Status:         {status_str}")
+            print(f"  Final Return:   {final_return:.2f}%")
+            print(f"  Max Drawdown:   {max_dd:.2%}")
+            print(f"  Sharpe Ratio:   {sharpe:.3f}")
+            print(f"  Sortino Ratio:  {sortino:.3f}")
+            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
             
             # Position Distribution
             positions = [t['position'] for t in episode_traces]
-            print(f"  Position Distribution:")
+            print(f"  Position Distribution:")
             for pos, name in [(100, "Long"), (-100, "Short"), (0, "Flat")]:
                 count = np.sum(np.array(positions) == pos)
                 pct = count / len(positions) * 100
-                print(f"    {name:<5}: {pct:.1f}%")
+                print(f"    {name:<5}: {pct:.1f}%")
 
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
