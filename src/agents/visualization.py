@@ -24,6 +24,9 @@ class PortfolioVisualizer:
     """
     Creates institutional-grade visual reports for pairs trading performance.
     Features homogenized styling, intelligent data summarization, and AI Text Reports.
+    
+    REFRACTORED: Leverages the comprehensive final_summary from SupervisorAgent
+    to avoid redundant portfolio-level aggregation calculations.
     """
     
     def __init__(self, output_dir: str = "reports"):
@@ -50,7 +53,7 @@ class PortfolioVisualizer:
     def visualize_pair(self, traces: List[Dict], pair_name: str, was_skipped: bool = False, skip_info: Dict = None):
         """
         Create detailed visualization for a single pair including Z-Score, Drawdown,
-        AND Price Co-movement vs. Position. Uses requested background fill style for position.
+        AND Price Co-movement vs. Position.
         """
         if len(traces) == 0:
             return
@@ -86,7 +89,7 @@ class PortfolioVisualizer:
         else:
             total_entries = len(df[df['trade_occurred'] == True])
 
-        # --- Win Rate Logic (Per Pair) ---
+        # 3. Win Rate Logic (Per Pair)
         closed_trades_mask = df['realized_pnl_this_step'] != 0
         closed_trades_df = df[closed_trades_mask].copy()
         
@@ -117,7 +120,7 @@ class PortfolioVisualizer:
         status_color = self.colors['loss'] if was_skipped else self.colors['primary']
         status_text = f" | STOPPED: {skip_info['reason']}" if was_skipped and skip_info else ""
         fig.suptitle(f"{pair_name} Performance Analysis{status_text}", 
-                     fontsize=22, weight='bold', color=status_color, y=0.98)
+                             fontsize=22, weight='bold', color=status_color, y=0.98)
         
         steps = df['local_step']
 
@@ -127,13 +130,13 @@ class PortfolioVisualizer:
         ax1.axhline(100, color=self.colors['neutral'], linestyle='--', alpha=0.5)
         
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
+                              where=(df['cum_return'] >= 0), color=self.colors['fill_profit'], alpha=0.15)
         ax1.fill_between(df['local_step'], 100, 100 * (1 + df['cum_return']), 
-                         where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
+                              where=(df['cum_return'] < 0), color=self.colors['fill_loss'], alpha=0.15)
 
         if not forced_exit.empty:
             ax1.scatter(forced_exit['local_step'], 100 * (1 + forced_exit['cum_return']), 
-                        color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
+                                color=self.colors['accent'], s=200, marker='X', label='Forced Exit', zorder=5, edgecolor='white')
 
         ax1.set_ylabel('Equity (Base 100)')
         ax1.set_title('Equity Curve', loc='left')
@@ -144,7 +147,7 @@ class PortfolioVisualizer:
         ax2 = fig.add_subplot(gs[0, 3])
         ax2.axis('off')
         
-        metrics = [
+        metrics_summary = [
             ("Total P&L", f"${total_pnl:,.2f}", self.colors['profit'] if total_pnl > 0 else self.colors['loss']),
             ("Return", f"{final_ret*100:+.2f}%", self.colors['profit'] if final_ret > 0 else self.colors['loss']),
             ("Max Drawdown", f"{df['max_drawdown'].max()*100:.2f}%", self.colors['drawdown']),
@@ -157,7 +160,7 @@ class PortfolioVisualizer:
         y_pos = 0.9
         ax2.text(0.5, 1.0, "Key Metrics", ha='center', fontsize=18, weight='bold', color=self.colors['primary'])
         
-        for label, value, color in metrics:
+        for label, value, color in metrics_summary:
             ax2.text(0.1, y_pos, label, ha='left', fontsize=14, color=self.colors['neutral'])
             ax2.text(0.9, y_pos, value, ha='right', fontsize=15, weight='bold', color=color)
             ax2.plot([0.1, 0.9], [y_pos-0.05, y_pos-0.05], color='#ecf0f1', lw=1.5)
@@ -259,13 +262,13 @@ class PortfolioVisualizer:
 
     def visualize_portfolio(self, all_traces: List[Dict], skipped_pairs: List[Dict], final_summary: Dict):
         """
-        Create aggregated portfolio dashboard with improved Correlation analysis AND
-        Correctly calculated Portfolio-Wide Maximum Drawdown, VaR, and CVaR.
+        Create aggregated portfolio dashboard, leveraging pre-calculated metrics
+        from final_summary.
         """
         metrics = final_summary.get('metrics', {})
         pair_summaries = metrics.get('pair_summaries', [])
         
-        # --- Data Processing ---
+        # --- Data Processing (REQUIRED for Win Rate, Correlation) ---
         df_all = pd.DataFrame(all_traces)
         if df_all.empty:
             print("⚠️ No traces to visualize.")
@@ -274,102 +277,64 @@ class PortfolioVisualizer:
         if 'realized_pnl_this_step' not in df_all.columns: df_all['realized_pnl_this_step'] = 0.0
         if 'transaction_costs' not in df_all.columns: df_all['transaction_costs'] = 0.0
 
-        # --- Global Win Rate Logic ---
+        # --- Global Trade Counting (Still necessary for 'Trades' metric in table) ---
         trade_events = df_all[df_all['realized_pnl_this_step'] != 0].copy()
         trade_events['net_pnl'] = trade_events['realized_pnl_this_step'] - trade_events['transaction_costs']
-        
         total_global_trades = len(trade_events)
-        if total_global_trades > 0:
-            global_wins = (trade_events['net_pnl'] > 0).sum()
-            global_win_rate = global_wins / total_global_trades
-        else:
-            global_win_rate = 0.0
 
         time_col = 'timestamp' if 'timestamp' in df_all.columns else 'local_step'
         if time_col not in df_all.columns and 'step' in df_all.columns:
              time_col = 'step'
         
-        # Ensure time sorting for visualization
+        # Ensure time sorting for correlation calculation
         if time_col == 'timestamp':
             df_all[time_col] = pd.to_datetime(df_all[time_col])
         df_all = df_all.sort_values(by=time_col)
 
-        # --- 1. AGGREGATE PORTFOLIO CURVE (HOMOGENIZED LOGIC) ---
-        equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
-        equity_matrix_ffill = equity_matrix.ffill()
+        # --- 1. METRIC EXTRACTION (Directly from final_summary) ---
         
-        # Dollar PnL Change
-        dollar_pnl_matrix = equity_matrix_ffill.diff()
-        global_dollar_pnl = dollar_pnl_matrix.sum(axis=1).fillna(0.0)
+        # Equity Curve and Index
+        plot_values = metrics.get('equity_curve', [100.0])
+        plot_index_raw = metrics.get('equity_curve_dates', ['Start'])
         
-        # Invested Capital (Shifted)
-        total_capital_series = equity_matrix_ffill.fillna(0.0).sum(axis=1)
-        prev_capital = total_capital_series.shift(1)
-        
-        # Global Returns
-        global_returns_series = global_dollar_pnl / prev_capital
-        global_returns_series = global_returns_series.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        
-        # Construct Curve (Base 100)
-        cum_ret_series = (1 + global_returns_series).cumprod()
-        portfolio_equity_curve = 100 * cum_ret_series
-        
-        # Visual Anchor for Plot
-        plot_index = [portfolio_equity_curve.index[0]] + portfolio_equity_curve.index.tolist()
-        plot_values = [100.0] + portfolio_equity_curve.tolist()
-        
-        portfolio_return_pct = portfolio_equity_curve - 100
-
-        # --- 2. CALCULATE METRICS FROM AGGREGATED DATA ---
-        
-        # 2a. Drawdown
-        running_max = portfolio_equity_curve.cummax()
-        dd_series = (portfolio_equity_curve - running_max) / running_max
-        portfolio_max_dd = abs(dd_series.min()) if not dd_series.empty else 0.0
-        
-        # 2b. Sharpe & Sortino
-        global_returns_list = global_returns_series.tolist()
-        agg_sharpe = self._calculate_sharpe(global_returns_list)
-        agg_sortino = self._calculate_sortino(global_returns_list)
-
-        # 2c. VaR and CVaR (Value at Risk / Conditional Value at Risk)
-        # We calculate this using the historical simulation method (percentiles)
-        if len(global_returns_series) > 0:
-            # VaR 95% = 5th percentile of returns distribution
-            var_95 = np.percentile(global_returns_series, 5)
-            
-            # CVaR 95% = Mean of returns falling below the VaR threshold
-            cvar_returns = global_returns_series[global_returns_series <= var_95]
-            cvar_95 = cvar_returns.mean() if len(cvar_returns) > 0 else var_95
+        # Determine the actual index for plotting (timestamps or steps)
+        if time_col in df_all.columns and len(df_all[time_col]) > 0 and len(plot_index_raw) == len(plot_values):
+            # Construct a plot index that aligns with the steps/dates in the dataframe
+            actual_index = [df_all[time_col].iloc[0] - pd.Timedelta(days=1) if isinstance(df_all[time_col].iloc[0], datetime) else 0] + df_all[time_col].tolist()
         else:
-            var_95 = 0.0
-            cvar_95 = 0.0
-
+            # Fallback to simple integer index if alignment fails
+            actual_index = list(range(len(plot_values)))
+            
+        # Metrics
+        final_pnl = metrics.get('total_pnl', 0.0)
+        final_pct = metrics.get('cum_return', 0.0) * 100
+        agg_sharpe = metrics.get('sharpe_ratio', 0.0)
+        agg_sortino = metrics.get('sortino_ratio', 0.0)
+        portfolio_max_dd = metrics.get('max_drawdown', 0.0)
+        global_win_rate = metrics.get('win_rate', 0.0)
+        var_95 = metrics.get('var_95', 0.0)
+        cvar_95 = metrics.get('cvar_95', 0.0)
         
-
-        print(f"    ℹ️  Global Metrics: Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%, VaR={var_95:.4f}, CVaR={cvar_95:.4f}")
+        print(f"    ℹ️  Global Metrics (From Supervisor): Sharpe={agg_sharpe:.2f}, Sortino={agg_sortino:.2f}, MaxDD={portfolio_max_dd*100:.2f}%, VaR={var_95:.4f}, CVaR={cvar_95:.4f}")
 
         # --- Figure Setup ---
         fig = plt.figure(figsize=(22, 16))
         gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.45, wspace=0.25)
         
-        final_pnl = metrics.get('total_pnl', 0.0)
-        final_pct = portfolio_return_pct.iloc[-1] if not portfolio_return_pct.empty else 0.0
-        
         fig.suptitle(f"Portfolio Executive Dashboard | Net P&L: ${final_pnl:,.2f} | Return: {final_pct:+.2f}%", 
-                     fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
+                             fontsize=24, weight='bold', color=self.colors['primary'], y=0.96)
 
         # 1. Main Equity Curve
         ax1 = fig.add_subplot(gs[0, :])
-        # Only plot if we have data to match dimensions
-        if len(plot_index) == len(plot_values):
-            ax1.plot(plot_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
-        else:
-            # Fallback if manual anchor insertion caused mismatch
-            ax1.plot(portfolio_equity_curve.index, portfolio_equity_curve.values, color=self.colors['primary'], lw=3, label='Portfolio Value')
-
-        ax1.fill_between(portfolio_equity_curve.index, 100, portfolio_equity_curve, 
-                          color=self.colors['primary'], alpha=0.1)
+        
+        # Plot the calculated curve and index
+        ax1.plot(actual_index, plot_values, color=self.colors['primary'], lw=3, label='Portfolio Value')
+        
+        if len(plot_values) > 1 and len(actual_index) == len(plot_values):
+            # Plot the fill from the first non-anchor index onwards
+            ax1.fill_between(actual_index[1:], 100, plot_values[1:], 
+                                 color=self.colors['primary'], alpha=0.1)
+        
         ax1.axhline(100, linestyle='--', color=self.colors['neutral'], alpha=0.8)
         
         ax1_right = ax1.twinx()
@@ -379,15 +344,22 @@ class PortfolioVisualizer:
         ax1_right.set_ylabel("Total Return (%)", rotation=270, labelpad=20, weight='bold', color=self.colors['neutral'])
         ax1_right.grid(False)
 
-        if not portfolio_equity_curve.empty:
-            val = portfolio_equity_curve.iloc[-1]
-            ret = val - 100
+        if final_pct != 0.0:
+            val = plot_values[-1]
+            ret = final_pct
             color = self.colors['profit'] if ret >= 0 else self.colors['loss']
-            ax1.annotate(f"{ret:+.2f}%", xy=(portfolio_equity_curve.index[-1], val),
-                          xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
-                          bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
+            ax1.annotate(f"{ret:+.2f}%", xy=(actual_index[-1], val),
+                              xytext=(10, 0), textcoords='offset points', va='center', weight='bold', color='white',
+                              bbox=dict(boxstyle="round,pad=0.4", fc=color, ec="none"))
 
-        est_capital = total_capital_series.max()
+        # Estimate capital for title label
+        if 'portfolio_value' in df_all.columns:
+            equity_matrix = df_all.pivot_table(index=time_col, columns='pair', values='portfolio_value')
+            total_capital_series = equity_matrix.ffill().fillna(0.0).sum(axis=1)
+            est_capital = total_capital_series.max()
+        else:
+            est_capital = 0.0
+        
         ax1.set_title(f"Aggregated Performance (Peak AUM: ${est_capital:,.0f})", loc='left')
         ax1.set_ylabel("Equity (Base 100)")
         ax1.legend(loc='upper left')
@@ -409,7 +381,7 @@ class PortfolioVisualizer:
         else:
             ax2.text(0.5, 0.5, "No Pair Data Available", ha='center')
 
-        # 3. Correlation Analysis
+        # 3. Correlation Analysis (Requires time-aligned PnL changes from traces)
         pnl_matrix = df_all.pivot_table(index=time_col, columns='pair', values='realized_pnl')
         pnl_matrix = pnl_matrix.ffill().fillna(0.0)
         pnl_changes = pnl_matrix.diff().fillna(0.0)
@@ -443,14 +415,13 @@ class PortfolioVisualizer:
             
             cell_text_corr = []
             for _, row in top_corr.iterrows():
-                # Highlight high correlations
                 cell_text_corr.append([f"{row['Pair A']} vs {row['Pair B']}", f"{row['Corr']:.2f}"])
             
             if not cell_text_corr:
                 cell_text_corr = [["No significant correlations", "-"]]
 
             table_corr = ax4.table(cellText=cell_text_corr, colLabels=["Pair Combination", "Correlation"], 
-                              loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
+                                 loc='center', cellLoc='center', bbox=[0, 0, 1, 0.9])
             table_corr.auto_set_font_size(False)
             table_corr.set_fontsize(11)
             
@@ -474,7 +445,7 @@ class PortfolioVisualizer:
         ax6 = fig.add_subplot(gs[3, :])
         ax6.axis('off')
         
-        # Define Metrics (Including requested VaR, CVaR, and Active Pairs)
+        # Use the extracted metrics
         flat_metrics = [
             ("Total Net P&L", f"${final_pnl:,.2f}"),
             ("Total Return", f"{final_pct:+.2f}%"),
@@ -483,7 +454,7 @@ class PortfolioVisualizer:
             ("Win Rate", f"{global_win_rate*100:.2f}%"),
             ("Portfolio Max DD", f"{portfolio_max_dd*100:.2f}%"),
             ("VaR (95%)", f"{var_95:.4%}"),
-            ("CVaR (95%)", f"{cvar_95:.4%}"), # Added CVaR
+            ("CVaR (95%)", f"{cvar_95:.4%}"),
             ("Active Pairs", f"{len(pair_names)}"),
             ("Trades", f"{total_global_trades}")
         ]
@@ -618,7 +589,8 @@ def generate_all_visualizations(all_traces: List[Dict],
     # Group traces by pair
     traces_by_pair = {}
     for t in all_traces:
-        pair = t['pair']
+        pair = t.get('pair')
+        if not pair or isinstance(pair, list): continue
         if pair not in traces_by_pair:
             traces_by_pair[pair] = []
         traces_by_pair[pair].append(t)
@@ -626,7 +598,7 @@ def generate_all_visualizations(all_traces: List[Dict],
     # Generate individual pair reports
     print("\n📊 Generating pair-level reports...")
     for pair_name, traces in traces_by_pair.items():
-        skip_info = next((s for s in skipped_pairs if s['pair'] == pair_name), None)
+        skip_info = next((s for s in skipped_pairs if s.get('pair') == pair_name), None)
         was_skipped = skip_info is not None
         
         visualizer.visualize_pair(traces, pair_name, was_skipped, skip_info)
