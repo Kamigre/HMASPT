@@ -63,7 +63,7 @@ CONFIG = {
     "rl_lookback": 30,
     "shock_prob": 0.01,
     "shock_scale": 0.4,
-    "max_workers": 1,
+    "max_workers": 2,
     "initial_capital": 10000,
     "risk_free_rate": 0.00,
     
