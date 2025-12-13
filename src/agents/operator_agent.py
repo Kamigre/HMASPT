@@ -588,10 +588,10 @@ def train_operator_on_pairs(operator: OperatorAgent, prices: pd.DataFrame,
     
     return all_traces
                             
-def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_steps=90):
+def run_operator_holdout(operator, holdout_prices, pairs, supervisor, target_test_days=252):
     """
     Run holdout testing with supervisor monitoring.
-    Features FORCE LIQUIDATION on stop, ensuring metrics reflect the exit costs.
+    Dynamically adjusts warmup to ensure exactly 'target_test_days' are tested.
     """
     
     # Check supervisor config
@@ -624,9 +624,22 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         series_y = holdout_prices[pair[1]].dropna()
         aligned = pd.concat([series_x, series_y], axis=1).dropna()
 
-        if len(aligned) < lookback + warmup_steps + 1:
-            print(f"⚠️ Insufficient data ({len(aligned)} steps). Needs {lookback + warmup_steps + 1}")
+        # --- DYNAMIC WARMUP CALCULATION ---
+        # We reserve the last 'target_test_days' for the test. 
+        # The '-1' accounts for the environment's termination index logic.
+        warmup_steps = len(aligned) - target_test_days - 1
+        
+        # Validation
+        if warmup_steps < lookback:
+            print(f"⚠️ Insufficient data for 252-day test.")
+            print(f"   Total Data: {len(aligned)} | Required: {target_test_days + lookback + 1}")
+            print(f"   Max Possible Warmup: {warmup_steps} (Needs {lookback})")
             continue
+            
+        print(f"📊 Timeline Adjustment:")
+        print(f"   Total Data Points: {len(aligned)}")
+        print(f"   Target Test Days:  {target_test_days}")
+        print(f"   Calculated Warmup: {warmup_steps} steps (Preserves exact test duration)")
 
         # 2. Model Loading
         model_path = os.path.join(operator.storage_dir, f"operator_model_{pair[0]}_{pair[1]}.zip")
@@ -665,7 +678,9 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             episode_starts = np.array([done])
             if done: warmup_completed = False; break
         
-        if not warmup_completed: continue
+        if not warmup_completed: 
+            print("⚠️ Warmup failed to complete (Data end reached early)")
+            continue
 
         # --- FINANCIAL RESET ---
         env.cash = env.initial_capital
@@ -676,10 +691,12 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
         env.trade_history = []
         env.peak_value = env.initial_capital
         env.cum_return = 0
+        # Important: We do NOT reset the position here to allow carrying 
+        # a 'warmup' entry into the test, but metrics reset.
         if env.position != 0:
-            env.position = 0
-            env.entry_spread = 0.0
-            env.days_in_position = 0
+            # Optional: Flatten position on start if you want a clean slate
+            # env.position = 0 
+            pass
 
         # --- MAIN TRADING LOOP ---
         terminated = False
@@ -727,30 +744,23 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                     intervention_severity = decision.get("severity", "critical")
                     intervention_reason = decision['reason']
                     print(f"\n⛔ SUPERVISOR INTERVENTION [{intervention_severity.upper()}]: Stopping pair early")
-                    print(f"    Reason: {intervention_reason}")
+                    print(f"    Reason: {intervention_reason}")
 
-                    # ========================================================
-                    # FORCE LIQUIDATION: REALIZE THE LOSS/PROFIT
-                    # ========================================================
+                    # FORCE LIQUIDATION
                     if env.position != 0:
-                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
-                        
-                        # Capture the CUMULATIVE realized PnL from the *previous* step (before liquidation)
+                        print(f"    ⚠️ Force Closing open position ({env.position}) to realize PnL...")
                         previous_cumulative_realized = trace['realized_pnl']
-
-                        # Step environment with Action 1 (Flat) to execute the close
                         obs, reward, terminated, _, info = env.step(1)
                         
                         forced_pnl = info.get('realized_pnl_this_step', 0.0)
                         forced_cost = info.get('transaction_costs', 0.0)
                         
-                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
+                        print(f"    💸 Liquidation Result: PnL {forced_pnl:.2f}, Costs {forced_cost:.4f}")
                         
-                        # Create final trace reflecting the close
                         final_trace = trace.copy()
                         final_trace['step'] += 1
                         final_trace['local_step'] += 1
-                        final_trace['position'] = 0 # Forced Flat
+                        final_trace['position'] = 0 
                         final_trace['realized_pnl_this_step'] = round(forced_pnl, 2)
                         final_trace['transaction_costs'] = round(forced_cost, 2)
                         final_trace['unrealized_pnl'] = 0
@@ -761,29 +771,25 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                         final_trace['max_drawdown'] = round(float(info.get("drawdown", trace['max_drawdown'])), 2)
                         final_trace['daily_return'] = round(float(info.get("daily_return", 0.0)), 4)
                         final_trace['forced_close'] = True
-                        
-                        # ADDED DETAILS OF STOP HERE
                         final_trace['intervention_reason'] = intervention_reason 
                         final_trace['intervention_severity'] = intervention_severity
                         
-                        # Append this trace so metrics include the forced close
                         episode_traces.append(final_trace)
                         all_traces.append(final_trace)
                         operator.add_trace(final_trace)
 
                     stop_triggered = True
-                    break # Exit loop
+                    break 
                 
                 elif decision["action"] == "adjust":
-                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
+                    print(f"\n⚠️  SUPERVISOR WARNING: {decision['reason']}")
 
             local_step += 1
             global_step += 1
             operator.current_step = global_step
 
-        # --- METRICS REPORTING (Including Forced Close) ---
+        # --- METRICS REPORTING ---
         if len(episode_traces) > 0:
-            # 1. Recalculate metrics on the FULL trace history (including liquidation)
             sharpe = calculate_sharpe(episode_traces)
             sortino = calculate_sortino(episode_traces)
             final_return = episode_traces[-1]['cum_return'] * 100
@@ -796,7 +802,6 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
             else:
                 win_rate = 0.0
 
-            # 2. Log skipped pair info with the FINAL metrics
             if stop_triggered:
                 skip_info = {
                     "pair": f"{pair[0]}-{pair[1]}",
@@ -811,25 +816,17 @@ def run_operator_holdout(operator, holdout_prices, pairs, supervisor, warmup_ste
                 if operator.logger:
                     operator.logger.log("supervisor", "intervention", skip_info)
 
-            # 3. Print Detailed Results
             status_str = f"⛔ STOPPED ({intervention_reason})" if stop_triggered else "✅ COMPLETE"
             
             print(f"\n📊 Holdout Results for {pair[0]}-{pair[1]}:")
-            print(f"  Status:         {status_str}")
-            print(f"  Final Return:   {final_return:.2f}%")
-            print(f"  Max Drawdown:   {max_dd:.2%}")
-            print(f"  Sharpe Ratio:   {sharpe:.3f}")
-            print(f"  Sortino Ratio:  {sortino:.3f}")
-            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
+            print(f"  Status:         {status_str}")
+            print(f"  Duration:       {local_step} Days (Target: {target_test_days})")
+            print(f"  Final Return:   {final_return:.2f}%")
+            print(f"  Max Drawdown:   {max_dd:.2%}")
+            print(f"  Sharpe Ratio:   {sharpe:.3f}")
+            print(f"  Sortino Ratio:  {sortino:.3f}")
+            print(f"  Win Rate:       {win_rate:.1f}% ({len(pnl_events)} trades)")
             
-            # Position Distribution
-            positions = [t['position'] for t in episode_traces]
-            print(f"  Position Distribution:")
-            for pos, name in [(100, "Long"), (-100, "Short"), (0, "Flat")]:
-                count = np.sum(np.array(positions) == pos)
-                pct = count / len(positions) * 100
-                print(f"    {name:<5}: {pct:.1f}%")
-
             pair_summaries.append({
                 "pair": f"{pair[0]}-{pair[1]}",
                 "return": round(final_return, 2),
