@@ -106,13 +106,8 @@ class PairTradingEnv(gym.Env):
         # 1. Get Market Context
         price_x = self.price_x_np[idx]
         price_y = self.price_y_np[idx]
-        
-        # robust average price to avoid division by zero
         avg_price = (price_x + price_y) / 2.0
-        if avg_price < 1e-8: avg_price = 1.0 
-        
         current_vol = self.vol_np[idx]
-        if current_vol < 1e-8: current_vol = 1.0
 
         # 2. Normalize Financials
         norm_unrealized = self.unrealized_pnl / self.initial_capital
