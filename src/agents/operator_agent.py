@@ -493,19 +493,28 @@ class OperatorAgent:
             daily_returns.append(info.get('daily_return', 0))
             positions.append(info.get('position', 0))
 
-        # Calculate metrics
+        # --- METRICS CALCULATION (CORRECTED) ---
         rets = np.array(daily_returns)
         rf_daily = CONFIG.get("risk_free_rate", 0.04) / 252
         excess_rets = rets - rf_daily
 
+        # 1. Sharpe Ratio
         sharpe = 0.0
         if len(excess_rets) > 1 and np.std(excess_rets, ddof=1) > 1e-8:
             sharpe = np.mean(excess_rets) / np.std(excess_rets, ddof=1) * np.sqrt(252)
         
-        downside = excess_rets[excess_rets < 0]
+        # 2. Sortino Ratio (Corrected Lower Partial Moment)
         sortino = 0.0
-        if len(downside) > 1 and np.std(downside, ddof=1) > 1e-8:
-            sortino = np.mean(excess_rets) / np.std(downside, ddof=1) * np.sqrt(252)
+        # Create a series where positive returns are 0 (we only care about downside)
+        downside_series = np.minimum(excess_rets, 0)
+        
+        # Calculate Downside Deviation: Root Mean Square of the downside series
+        # We take the mean over ALL days (not just losing days) to account for frequency
+        downside_deviation = np.sqrt(np.mean(np.square(downside_series)))
+        
+        if downside_deviation > 1e-8:
+            # Annualize by multiplying by sqrt(252)
+            sortino = np.mean(excess_rets) / downside_deviation * np.sqrt(252)
 
         final_return = (env_eval.portfolio_value / env_eval.initial_capital - 1) * 100
 
