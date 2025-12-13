@@ -106,8 +106,13 @@ class PairTradingEnv(gym.Env):
         # 1. Get Market Context
         price_x = self.price_x_np[idx]
         price_y = self.price_y_np[idx]
+        
+        # robust average price to avoid division by zero
         avg_price = (price_x + price_y) / 2.0
+        if avg_price < 1e-8: avg_price = 1.0 
+        
         current_vol = self.vol_np[idx]
+        if current_vol < 1e-8: current_vol = 1.0
 
         # 2. Normalize Financials
         norm_unrealized = self.unrealized_pnl / self.initial_capital
@@ -310,6 +315,10 @@ class PairTradingEnv(gym.Env):
         if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
             reward += 0.25
         
+        # --- Clip for stability --------------------------------------
+        reward = float(np.clip(reward, -1.0, 1.0))
+        
+        # D) Clip for Stability (Crucial for outliers like 0.33)
         # ------------------------------------------------------------------
         # tanh compresses the massive 33% return (Value 16.5) to 1.0
         # while keeping the 1% return (Value 0.5) at ~0.46 (linear).
