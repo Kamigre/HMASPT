@@ -310,10 +310,6 @@ class PairTradingEnv(gym.Env):
         if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
             reward += 0.20
         
-        # --- Clip for stability --------------------------------------
-        reward = float(np.clip(reward, -1.0, 1.0))
-        
-        # D) Clip for Stability (Crucial for outliers like 0.33)
         # ------------------------------------------------------------------
         # tanh compresses the massive 33% return (Value 16.5) to 1.0
         # while keeping the 1% return (Value 0.5) at ~0.46 (linear).
