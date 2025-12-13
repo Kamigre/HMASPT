@@ -103,33 +103,64 @@ class PairTradingEnv(gym.Env):
         if idx < 0 or idx >= len(self.spread_np):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
         
+        # 1. Get Market Context
+        price_x = self.price_x_np[idx]
+        price_y = self.price_y_np[idx]
+        
+        # robust average price to avoid division by zero
+        avg_price = (price_x + price_y) / 2.0
+        if avg_price < 1e-8: avg_price = 1.0 
+        
+        current_vol = self.vol_np[idx]
+        if current_vol < 1e-8: current_vol = 1.0
+
+        # 2. Normalize Financials
         norm_unrealized = self.unrealized_pnl / self.initial_capital
         norm_realized = self.realized_pnl / self.initial_capital
         
+        # 3. Calculate Distance from Entry in "Sigmas"
+        # Instead of raw price difference, we measure how many standard deviations
+        # the price has moved since we entered.
+        if self.position != 0:
+            dist_from_entry = (self.spread_np[idx] - self.entry_spread) / current_vol
+        else:
+            dist_from_entry = 0.0
+
         obs = np.array([
-            self.zscore_short_np[idx],
-            self.zscore_long_np[idx],
-            self.vol_np[idx],
-            self.spread_np[idx],
+            # --- MARKET STATE (Standardized) ---
+            self.zscore_short_np[idx],      # Already standardized (~ -3 to 3)
+            self.zscore_long_np[idx],       # Already standardized (~ -3 to 3)
             
-            # NEW FEATURES
-            self.rsi_np[idx] / 100.0,
-            self.vol_ratio_np[idx],
+            # Feature 3: Volatility as % of Price (e.g., 0.01 for 1% vol)
+            self.vol_np[idx] / avg_price, 
             
-            float(self.position / self.position_scale),  
-            float(self.entry_spread) if self.position != 0 else 0.0,
+            # Feature 4: Spread as % of Price (Yield)
+            self.spread_np[idx] / avg_price,
             
-            # NORMALIZED FINANCIALS
+            # --- TECHNICALS ---
+            self.rsi_np[idx] / 100.0,       # Scaled 0 to 1
+            self.vol_ratio_np[idx],         # Ratio (~ 0.5 to 1.5)
+            
+            # --- POSITION STATE ---
+            float(self.position / self.position_scale),  # Scaled -1 to 1
+            
+            # Feature 8: Distance from Entry (in Sigmas)
+            # This replaces raw entry_spread which was unscaled
+            float(dist_from_entry),         
+            
+            # --- ACCOUNT STATE (Already Normalized) ---
             float(norm_unrealized),
             float(norm_realized),
-            
             float(self.cash / self.initial_capital - 1),  
             float(self.portfolio_value / self.initial_capital - 1),  
             
+            # --- TIME & TRADES ---
             float(self.days_in_position) / 252.0,
             float(self.num_trades) / 100.0,
+            
         ], dtype=np.float32)
         
+        # Clip to handle extreme outliers (Flash crashes, etc.)
         return np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
