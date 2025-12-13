@@ -303,7 +303,7 @@ class PairTradingEnv(gym.Env):
             reward += 1.2 * daily_return   # loss aversion
 
         # Transaction penalty
-        if trade_ocurred:
+        if position_change:
             reward -= 0.0005
         
         # --- Clip for stability --------------------------------------
