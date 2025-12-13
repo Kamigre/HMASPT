@@ -304,11 +304,11 @@ class PairTradingEnv(gym.Env):
         
         # anti-alignment = penalize
         if (current_zscore > 1 and norm_pos > 0) or (current_zscore < -1 and norm_pos < 0):
-            reward -= 0.15
+            reward -= 0.20
         
         # pro-alignment = encourage
         if (current_zscore > 1 and norm_pos < 0) or (current_zscore < -1 and norm_pos > 0):
-            reward += 0.15
+            reward += 0.20
         
         # --- Clip for stability --------------------------------------
         reward = float(np.clip(reward, -1.0, 1.0))
@@ -445,7 +445,7 @@ class OperatorAgent:
             batch_size=256,
             n_epochs=10,
             gamma=0.99,
-            ent_coef=0.04,
+            ent_coef=0.02,
             verbose=1,
             device="auto",
             seed=seed,
